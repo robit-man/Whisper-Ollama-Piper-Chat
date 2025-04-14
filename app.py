@@ -1,35 +1,39 @@
 #!/usr/bin/env python
 """
-Voice-activated LLM Chat via Whisper & Piper TTS with Context & Interruption
-----------------------------------------------------------------------------
+Voice-activated LLM Chat via Whisper & Piper TTS with Config and Session Logging
+----------------------------------------------------------------------------------
 This script does the following:
-  1. Auto bootstraps a virtual environment ("whisper_env") if not already running inside one,
+  1. Bootstraps a virtual environment ("whisper_env") if not already running inside one,
      installs required dependencies, and re-launches itself in the venv.
-  2. Checks for the Piper executable and ONNX files. If missing, it detects the OS/architecture and
-     downloads the appropriate Piper release from:
+  2. Checks for the Piper executable and ONNX files. If missing, it determines the correct release
+     (ignoring platform-specific folder names) from
          https://github.com/rhasspy/piper/releases/download/2023.11.14-2/
-     It then extracts Piper into a folder named "piper" (beside this script). It also downloads
-     "glados_piper_medium.onnx.json" and "glados_piper_medium.onnx" if needed.
-  3. Ensures the Ollama CLI is installed. If not, on Linux it installs Ollama via:
-         curl -fsSL https://ollama.com/install.sh | sh
-  4. Continuously listens to your microphone. Every few seconds, if the captured audio’s RMS is
-     above a threshold (i.e. meaningful speech), it is transcribed using Whisper (base model).
-  5. The transcription is added to a per‑session chat history (both user and model messages) which
-     is sent as context to the LLM via the Ollama Python API (default model "gemma3:4b"). If the model
-     is missing, it is pulled via "ollama pull".
-  6. The streaming LLM response is accumulated and split into chunks when a sentence-ending delimiter
-     (comma, period, exclamation, or question mark) is encountered; emojis and asterisks are filtered out.
-  7. Each complete chunk is enqueued to a TTS queue. A TTS worker thread processes queued text by
-     building a JSON payload and launching Piper (via its JSON input mode), piping its raw audio output
-     to aplay for immediate playback.
-  8. When new voice input is detected (i.e. a new transcription occurs while an older TTS session is in
-     progress), the current TTS queue is cleared and any active playback is cancelled for a seamless
-     interruption and context switch.
+     and downloads & extracts it into a folder named "piper" (in the same directory as this script).
+     It also downloads "glados_piper_medium.onnx.json" and "glados_piper_medium.onnx" if they are missing.
+  3. Loads configuration from "config.json" (if it exists) or creates it with default values.
+     The configuration includes:
+         - ollama_model (default "gemma3:4b")
+         - onnx_json (default "glados_piper_medium.onnx.json")
+         - onnx_model (default "glados_piper_medium.onnx")
+         - whisper_model (default "base")
+  4. Creates a new chat session folder under "chat_sessions" named with the startup datetime,
+     and all chat messages are logged to "session.txt" inside that folder.
+  5. Continuously captures microphone input and buffers the audio. Every few seconds (if the RMS
+     indicates meaningful input), the buffered audio is transcribed using Whisper.
+  6. The transcription (appended to a per-session chat history) is sent as context to the default
+     LLM via the Ollama API (with streaming enabled). If the default model does not exist, it is
+     pulled automatically.
+  7. The streaming LLM response is accumulated and split into chunks by sentence-ending delimiters.
+     Emojis and asterisks are removed from each chunk before being enqueued for TTS.
+  8. The TTS worker processes the queue by launching the Piper executable (using the ONNX files)
+     via JSON input, piping its raw audio output directly to aplay.
+  9. If new voice input is detected while there is an active TTS session, the current TTS queue and
+     playback are flushed to allow interruption and seamless transition to the new topic.
      
-Press Ctrl+C to exit.
+Press Ctrl+C at any time to exit.
 """
 
-import sys, os, subprocess, platform, re, json, time, threading, queue
+import sys, os, subprocess, platform, re, json, time, threading, queue, datetime
 
 # ----- VENV BOOTSTRAP CODE -----
 def in_virtualenv():
@@ -54,15 +58,16 @@ if not in_virtualenv():
 # ----- Automatic Piper and ONNX Files Setup -----
 def setup_piper_and_onnx():
     """
-    Checks if the Piper executable and ONNX files are present.
-    If Piper is missing, it determines the appropriate release (ignoring platform-specific folder names)
-    and downloads/extracts it into a folder named "piper" (in the same directory as this script).
-    Also downloads the ONNX files if they are not present.
+    Check if the Piper executable and ONNX files are available.
+    If missing, download the appropriate Piper release from the GitHub releases
+    and extract it into a folder named "piper" (in the same directory as this script).
+    Also download the ONNX files if they are missing.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     piper_folder = os.path.join(script_dir, "piper")
     piper_exe = os.path.join(piper_folder, "piper")
     
+    # Determine the correct release filename based on OS/architecture.
     os_name = platform.system()
     machine = platform.machine()
     release_filename = ""
@@ -89,7 +94,7 @@ def setup_piper_and_onnx():
     else:
         print("Unsupported OS:", os_name)
         sys.exit(1)
-
+    
     if not os.path.isfile(piper_exe):
         print(f"Piper executable not found at {piper_exe}.")
         download_url = f"https://github.com/rhasspy/piper/releases/download/2023.11.14-2/{release_filename}"
@@ -113,7 +118,7 @@ def setup_piper_and_onnx():
     else:
         print("Piper executable found at", piper_exe)
     
-    # Download ONNX files if missing.
+    # Check for ONNX files.
     onnx_json = os.path.join(script_dir, "glados_piper_medium.onnx.json")
     onnx_model = os.path.join(script_dir, "glados_piper_medium.onnx")
     if not os.path.isfile(onnx_json):
@@ -140,44 +145,65 @@ if not os.path.exists(SETUP_MARKER):
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
     subprocess.check_call([sys.executable, "-m", "pip", "install",
         "sounddevice", "numpy", "scipy",
-        "openai-whisper",   # Whisper for transcription
-        "ollama"            # Ollama Python API
+        "openai-whisper",   # For Whisper transcription
+        "ollama"            # For Ollama Python API
     ])
     with open(SETUP_MARKER, "w") as f:
         f.write("Setup complete")
     print("Dependencies installed. Restarting script...")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-# ----- System Check for Ollama CLI and Auto-Pull Model -----
-def ensure_ollama_installed():
-    """Ensure that the Ollama CLI is installed. If not, and if on Linux, install it."""
-    try:
-        subprocess.run(["ollama", "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        print("Ollama CLI is installed.")
-    except Exception:
-        print("Ollama CLI not found. Attempting to install Ollama on Linux...")
-        if platform.system() == "Linux":
-            try:
-                subprocess.check_call("curl -fsSL https://ollama.com/install.sh | sh", shell=True)
-                print("Ollama installed successfully.")
-            except Exception as e:
-                print("Failed to install Ollama:", e)
-        else:
-            print("Automatic Ollama installation is only supported on Linux.")
-ensure_ollama_installed()
+# ----- Configuration Loading -----
+def load_config():
+    """
+    Load configuration from config.json (in the script directory). If not present, create it with default values.
+    Returns a dictionary of configuration values.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_dir, "config.json")
+    defaults = {
+        "ollama_model": "gemma3:4b",
+        "onnx_json": "glados_piper_medium.onnx.json",
+        "onnx_model": "glados_piper_medium.onnx",
+        "whisper_model": "base"
+    }
+    if not os.path.isfile(config_path):
+        with open(config_path, "w") as f:
+            json.dump(defaults, f, indent=4)
+        print("Created default config.json")
+        return defaults
+    else:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        # Ensure any missing keys are set to defaults.
+        for key, val in defaults.items():
+            if key not in config:
+                config[key] = val
+        return config
 
-def pull_model_if_needed(model):
-    """If the model does not exist in Ollama, pull it."""
-    try:
-        # Try to run an ollama command to show the model.
-        subprocess.run(["ollama", "show", model], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except Exception:
-        print(f"Model '{model}' not found. Pulling model via Ollama...")
-        try:
-            subprocess.check_call(["ollama", "pull", model])
-            print(f"Model '{model}' pulled successfully.")
-        except Exception as e:
-            print(f"Failed to pull model '{model}':", e)
+config = load_config()
+DEFAULT_MODEL = config["ollama_model"]
+
+# ----- Chat Session Logging Setup -----
+def setup_chat_session():
+    """
+    Create a new folder for the chat session inside "chat_sessions", named based on the current datetime.
+    Returns the session folder path and opens a log file "session.txt" for appending.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    sessions_folder = os.path.join(script_dir, "chat_sessions")
+    os.makedirs(sessions_folder, exist_ok=True)
+    session_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_folder = os.path.join(sessions_folder, session_name)
+    os.makedirs(session_folder, exist_ok=True)
+    session_log_path = os.path.join(session_folder, "session.txt")
+    session_log = open(session_log_path, "a", encoding="utf-8")
+    print(f"Chat session started: {session_name}")
+    return session_folder, session_log
+
+import datetime
+session_folder, session_log = setup_chat_session()
+chat_history = []  # Global chat history list
 
 # ----- Now import custom packages -----
 from sounddevice import InputStream
@@ -187,18 +213,17 @@ import whisper
 from ollama import chat
 import threading, queue, re, time, json
 
+print("Loading Whisper model ({} model)...".format(config["whisper_model"]))
+whisper_model = whisper.load_model(config["whisper_model"])
+
 # ----- Global Settings and Queues -----
 SAMPLE_RATE = 16000
 BUFFER_SIZE = 1024
-DEFAULT_MODEL = "gemma3:4b"
 
 tts_queue = queue.Queue()    # TTS request queue
 audio_queue = queue.Queue()  # Microphone audio queue
 
-print("Loading Whisper model (base)...")
-whisper_model = whisper.load_model("base")
-
-# Global variable to hold current TTS subprocesses for interruption.
+# Global variable for current TTS process (for interruption).
 current_tts_process = None
 tts_lock = threading.Lock()
 
@@ -227,13 +252,13 @@ def flush_current_tts():
 # ----- TTS Processing: Using Piper via subprocess -----
 def process_tts_request(text):
     """
-    Build a JSON payload from text and call the Piper executable (from "piper/piper")
-    using the local ONNX files. Pipe the raw audio output to aplay for immediate playback.
+    Build a JSON payload from text and call the local Piper executable (from "piper/piper")
+    using the local ONNX files. Pipe raw audio output to aplay for immediate playback.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     piper_exe = os.path.join(script_dir, "piper", "piper")
-    onnx_json = os.path.join(script_dir, "glados_piper_medium.onnx.json")
-    onnx_model = os.path.join(script_dir, "glados_piper_medium.onnx")
+    onnx_json = os.path.join(script_dir, config["onnx_json"])
+    onnx_model = os.path.join(script_dir, config["onnx_model"])
     for path, desc in [(piper_exe, "Piper executable"),
                        (onnx_json, "ONNX JSON file"),
                        (onnx_model, "ONNX model file")]:
@@ -244,7 +269,6 @@ def process_tts_request(text):
     payload_str = json.dumps(payload)
     cmd_piper = [piper_exe, "-m", onnx_model, "--debug", "--json-input", "--output_raw"]
     cmd_aplay = ["aplay", "--buffer-size=777", "-r", "22050", "-f", "S16_LE"]
-
     print(f"\n[TTS] Synthesizing: '{text}'")
     try:
         with tts_lock:
@@ -287,15 +311,12 @@ def start_audio_capture():
     return stream
 
 # ----- Whisper Transcription & LLM Prompt Trigger with Chat History and Interruption -----
-chat_history = []  # Global chat history list.
-
 def voice_to_llm_loop():
     print("Voice-to-LLM loop started. Listening for voice input...")
     while True:
-        time.sleep(5)  # Check interval.
+        time.sleep(5)  # Check interval
         if audio_queue.empty():
             continue
-        # Retrieve audio chunks.
         chunks = []
         while not audio_queue.empty():
             chunks.append(audio_queue.get())
@@ -304,9 +325,8 @@ def voice_to_llm_loop():
             continue
         audio_data = np.concatenate(chunks, axis=0)
         audio_array = audio_data.flatten().astype(np.float32)
-        # Compute RMS to ensure there is enough signal.
         rms = np.sqrt(np.mean(np.square(audio_array)))
-        if rms < 0.01:  # Adjust threshold as needed.
+        if rms < 0.01:
             print("Audio RMS too low. Skipping transcription.")
             continue
         print("Transcribing voice input...")
@@ -320,13 +340,12 @@ def voice_to_llm_loop():
             print("No transcription result.")
             continue
         print(f"Transcribed prompt: {transcription}")
-        # Update chat history with user message.
+        session_log.write(f"User: {transcription}\n")
+        session_log.flush()
         chat_history.append({"role": "user", "content": transcription})
-        # Before sending new prompt, flush any current TTS playback for interruption.
-        flush_current_tts()
-        # Ensure the default model exists; if not, pull it.
+        flush_current_tts()  # Interrupt current TTS playback
         pull_model_if_needed(DEFAULT_MODEL)
-        # Build the full context by sending chat_history.
+        # Pass the entire chat history for context
         try:
             stream = chat(model=DEFAULT_MODEL,
                           messages=chat_history,
@@ -357,13 +376,13 @@ def voice_to_llm_loop():
             if sentence:
                 tts_queue.put(sentence)
         print()
-        # Update chat history with assistant's full response.
         if full_response.strip():
             chat_history.append({"role": "assistant", "content": full_response.strip()})
+            session_log.write(f"Assistant: {full_response.strip()}\n")
+            session_log.flush()
         print("--- Awaiting further voice input ---")
 
 def pull_model_if_needed(model):
-    """Ensure that the LLM model is available; if not, pull it using Ollama."""
     try:
         subprocess.run(["ollama", "show", model], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except Exception:
@@ -375,12 +394,11 @@ def pull_model_if_needed(model):
             print(f"Failed to pull model '{model}':", e)
 
 def clean_text(text):
-    """Remove emojis and asterisks from the text."""
     emoji_pattern = re.compile("["
-        u"\U0001F600-\U0001F64F"  # emoticons
-        u"\U0001F300-\U0001F5FF"  # symbols & pictographs
-        u"\U0001F680-\U0001F6FF"  # transport & map symbols
-        u"\U0001F1E0-\U0001F1FF"  # flags
+        u"\U0001F600-\U0001F64F"
+        u"\U0001F300-\U0001F5FF"
+        u"\U0001F680-\U0001F6FF"
+        u"\U0001F1E0-\U0001F1FF"
                            "]+", flags=re.UNICODE)
     text = emoji_pattern.sub(r'', text)
     return text.replace("*", "")
@@ -401,9 +419,9 @@ def main():
     voice_thread.daemon = True
     voice_thread.start()
     
-    print("\nVoice-activated LLM mode (default model: gemma3:4b) is running.")
+    print("\nVoice-activated LLM mode (default model: {}) is running.".format(DEFAULT_MODEL))
     print("Speak into the microphone; your transcribed prompt (with context) will be sent to the LLM.")
-    print("LLM responses will stream and be spoken via Piper. Press Ctrl+C to exit.")
+    print("LLM responses are streamed and spoken via Piper. Press Ctrl+C to exit.")
     
     try:
         while True:
@@ -416,6 +434,14 @@ def main():
     tts_queue.join()
     tts_thread.join()
     voice_thread.join()
+    session_log.close()
+    
+    # Save chat history to a JSON file.
+    history_path = os.path.join(session_folder, "chat_history.json")
+    with open(history_path, "w", encoding="utf-8") as f:
+        json.dump(chat_history, f, indent=4)
+    
+    print("Chat session saved in folder:", session_folder)
     print("System terminated.")
 
 if __name__ == "__main__":
