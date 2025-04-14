@@ -1,10 +1,10 @@
 # A standalone natural communication stack with local LLM's
 
-## Input: Whisper
-## Cognition: Ollama
-## Output: Piper
+## Input: [Whisper](https://pypi.org/project/openai-whisper/) + [Denoiser](https://github.com/facebookresearch/denoiser)
+## Cognition: [Ollama](https://ollama.com/)
+## Output: [Piper](https://github.com/rhasspy/piper/releases/tag/2023.11.14-2)
 
-Just run ```python3 app.py``` in a folder on your system, 
+Just run ```python3 app.py``` in a folder on your system, it will automatically handle all installation steps, from ollama install if missing, all the way to pulling weights for each stage of transduction of data
 
 it has only been tested on non-arm linux (Ubuntu 24.04)
 
