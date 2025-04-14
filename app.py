@@ -17,6 +17,33 @@ This script now integrates:
 import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib
 from datetime import datetime
 
+# Define ANSI terminal colors for verbose logging
+COLOR_RESET = "\033[0m"
+COLOR_INFO = "\033[94m"       # Blue for general info
+COLOR_SUCCESS = "\033[92m"    # Green for success messages
+COLOR_WARNING = "\033[93m"    # Yellow for warnings
+COLOR_ERROR = "\033[91m"      # Red for error messages
+COLOR_DEBUG = "\033[95m"      # Magenta for debug messages
+COLOR_PROCESS = "\033[96m"    # Cyan for process steps
+
+def log_message(message, category="INFO"):
+    if category.upper() == "INFO":
+         color = COLOR_INFO
+    elif category.upper() == "SUCCESS":
+         color = COLOR_SUCCESS
+    elif category.upper() == "WARNING":
+         color = COLOR_WARNING
+    elif category.upper() == "ERROR":
+         color = COLOR_ERROR
+    elif category.upper() == "DEBUG":
+         color = COLOR_DEBUG
+    elif category.upper() == "PROCESS":
+         color = COLOR_PROCESS
+    else:
+         color = COLOR_RESET
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{color}[{timestamp}] {category.upper()}: {message}{COLOR_RESET}")
+
 # ----- VENV BOOTSTRAP CODE -----
 def in_virtualenv():
     return sys.prefix != sys.base_prefix
@@ -24,13 +51,13 @@ def in_virtualenv():
 def create_and_activate_venv():
     venv_dir = os.path.join(os.getcwd(), "whisper_env")
     if not os.path.isdir(venv_dir):
-        print("Virtual environment 'whisper_env' not found. Creating it...")
+        log_message("Virtual environment 'whisper_env' not found. Creating it...", "PROCESS")
         subprocess.check_call([sys.executable, "-m", "venv", venv_dir])
-        print("Virtual environment created.")
+        log_message("Virtual environment created.", "SUCCESS")
     if not in_virtualenv():
         new_python = (os.path.join(venv_dir, "Scripts", "python.exe") 
                       if os.name == "nt" else os.path.join(venv_dir, "bin", "python"))
-        print("Re-launching script inside the virtual environment...")
+        log_message("Re-launching script inside the virtual environment...", "PROCESS")
         subprocess.check_call([new_python] + sys.argv)
         sys.exit()
 
@@ -46,10 +73,12 @@ def setup_piper_and_onnx():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     piper_folder = os.path.join(script_dir, "piper")
     piper_exe = os.path.join(piper_folder, "piper")
+    log_message(f"Checking for Piper executable at {piper_exe}", "INFO")
     
     os_name = platform.system()
     machine = platform.machine()
     release_filename = ""
+    log_message(f"Detected OS: {os_name} and Architecture: {machine}", "DEBUG")
     if os_name == "Linux":
         if machine == "x86_64":
             release_filename = "piper_linux_x86_64.tar.gz"
@@ -58,7 +87,7 @@ def setup_piper_and_onnx():
         elif machine == "armv7l":
             release_filename = "piper_linux_armv7l.tar.gz"
         else:
-            print("Unsupported Linux architecture:", machine)
+            log_message(f"Unsupported Linux architecture: {machine}", "ERROR")
             sys.exit(1)
     elif os_name == "Darwin":
         if machine in ("arm64", "aarch64"):
@@ -66,61 +95,61 @@ def setup_piper_and_onnx():
         elif machine in ("x86_64", "AMD64"):
             release_filename = "piper_macos_x64.tar.gz"
         else:
-            print("Unsupported macOS architecture:", machine)
+            log_message(f"Unsupported macOS architecture: {machine}", "ERROR")
             sys.exit(1)
     elif os_name == "Windows":
         release_filename = "piper_windows_amd64.zip"
     else:
-        print("Unsupported OS:", os_name)
+        log_message(f"Unsupported OS: {os_name}", "ERROR")
         sys.exit(1)
     
     if not os.path.isfile(piper_exe):
-        print(f"Piper executable not found at {piper_exe}.")
+        log_message(f"Piper executable not found at {piper_exe}.", "WARNING")
         download_url = f"https://github.com/rhasspy/piper/releases/download/2023.11.14-2/{release_filename}"
         archive_path = os.path.join(script_dir, release_filename)
-        print(f"Downloading Piper release from {download_url}...")
+        log_message(f"Downloading Piper release from {download_url}...", "PROCESS")
         try:
             subprocess.check_call(["wget", "-O", archive_path, download_url])
         except Exception as e:
-            print("Error downloading Piper archive:", e)
+            log_message(f"Error downloading Piper archive: {e}", "ERROR")
             sys.exit(1)
-        print("Download complete.")
+        log_message("Download complete.", "SUCCESS")
         os.makedirs(piper_folder, exist_ok=True)
         if release_filename.endswith(".tar.gz"):
             subprocess.check_call(["tar", "-xzvf", archive_path, "-C", piper_folder, "--strip-components=1"])
         elif release_filename.endswith(".zip"):
             subprocess.check_call(["unzip", "-o", archive_path, "-d", piper_folder])
         else:
-            print("Unsupported archive format.")
+            log_message("Unsupported archive format.", "ERROR")
             sys.exit(1)
-        print("Piper extracted to", piper_folder)
+        log_message(f"Piper extracted to {piper_folder}", "SUCCESS")
     else:
-        print("Piper executable found at", piper_exe)
+        log_message(f"Piper executable found at {piper_exe}", "SUCCESS")
     
     # Check for ONNX files.
     onnx_json = os.path.join(script_dir, "glados_piper_medium.onnx.json")
     onnx_model = os.path.join(script_dir, "glados_piper_medium.onnx")
     if not os.path.isfile(onnx_json):
-        print("ONNX JSON file not found. Downloading...")
+        log_message("ONNX JSON file not found. Downloading...", "WARNING")
         url = "https://raw.githubusercontent.com/robit-man/EGG/main/voice/glados_piper_medium.onnx.json"
         subprocess.check_call(["wget", "-O", onnx_json, url])
-        print("Downloaded ONNX JSON file.")
+        log_message("Downloaded ONNX JSON file.", "SUCCESS")
     else:
-        print("ONNX JSON file exists.")
+        log_message("ONNX JSON file exists.", "SUCCESS")
     if not os.path.isfile(onnx_model):
-        print("ONNX model file not found. Downloading...")
+        log_message("ONNX model file not found. Downloading...", "WARNING")
         url = "https://raw.githubusercontent.com/robit-man/EGG/main/voice/glados_piper_medium.onnx"
         subprocess.check_call(["wget", "-O", onnx_model, url])
-        print("Downloaded ONNX model file.")
+        log_message("Downloaded ONNX model file.", "SUCCESS")
     else:
-        print("ONNX model file exists.")
+        log_message("ONNX model file exists.", "SUCCESS")
 
 setup_piper_and_onnx()
 
 # ----- Automatic Dependency Installation -----
 SETUP_MARKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".setup_complete")
 if not os.path.exists(SETUP_MARKER):
-    print("Installing required dependencies...")
+    log_message("Installing required dependencies...", "PROCESS")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
     subprocess.check_call([sys.executable, "-m", "pip", "install",
         "sounddevice", "numpy", "scipy",
@@ -137,7 +166,7 @@ if not os.path.exists(SETUP_MARKER):
     ])
     with open(SETUP_MARKER, "w") as f:
         f.write("Setup complete")
-    print("Dependencies installed. Restarting script...")
+    log_message("Dependencies installed. Restarting script...", "SUCCESS")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 # ----- Configuration Loading -----
@@ -164,15 +193,15 @@ def load_config():
         "options": {},
         "system": "You are a helpful assistant.",
         "conversation_id": "default_convo",
-        "rms_threshold": 0.01,
+        "rms_threshold": 0.005,
         "debug_audio_playback": False,
         "enable_noise_reduction": True,
-        "consensus_threshold": 0.8       # Similarity ratio required for consensus between models
+        "consensus_threshold": 0.005       # Similarity ratio required for consensus between models
     }
     if not os.path.isfile(config_path):
         with open(config_path, "w") as f:
             json.dump(defaults, f, indent=4)
-        print("Created default config.json")
+        log_message("Created default config.json", "SUCCESS")
         return defaults
     else:
         with open(config_path, "r") as f:
@@ -180,6 +209,7 @@ def load_config():
         for key, val in defaults.items():
             if key not in config:
                 config[key] = val
+        log_message("Configuration loaded from config.json", "INFO")
         return config
 
 config = load_config()
@@ -199,7 +229,7 @@ def setup_chat_session():
     os.makedirs(session_folder, exist_ok=True)
     session_log_path = os.path.join(session_folder, "session.txt")
     session_log = open(session_log_path, "a", encoding="utf-8")
-    print(f"Chat session started: {session_name}")
+    log_message(f"Chat session started: {session_name}", "SUCCESS")
     return session_folder, session_log
 
 session_folder, session_log = setup_chat_session()
@@ -221,17 +251,18 @@ from scipy.signal import butter, lfilter  # For EQ enhancement
 import torch
 from denoiser import pretrained  # For speech enhancement via denoiser
 load_dotenv()
+log_message("Environment variables loaded using dotenv", "INFO")
 
 # ----- Load Whisper Models -----
-print("Loading Whisper models...")
+log_message("Loading Whisper models...", "PROCESS")
 whisper_model_base = whisper.load_model(config["whisper_model_base"])
 whisper_model_medium = whisper.load_model(config["whisper_model_medium"])
-print("Both base and medium models loaded.")
+log_message("Both base and medium Whisper models loaded.", "SUCCESS")
 
 # ----- Load Denoiser Model -----
-print("Loading denoiser model (DNS64)...")
+log_message("Loading denoiser model (DNS64)...", "PROCESS")
 denoiser_model = pretrained.dns64()   # Loads a pretrained DNS64 model from denoiser
-print("Denoiser model loaded.")
+log_message("Denoiser model loaded.", "SUCCESS")
 
 # ----- Global Settings and Queues -----
 SAMPLE_RATE = 16000
@@ -240,8 +271,10 @@ tts_queue = queue.Queue()
 audio_queue = queue.Queue()
 current_tts_process = None
 tts_lock = threading.Lock()
+log_message("Global settings and queues initialized.", "DEBUG")
 
 def flush_current_tts():
+    log_message("Flushing current TTS queue and processes...", "DEBUG")
     with tts_lock:
         while not tts_queue.empty():
             try:
@@ -254,12 +287,14 @@ def flush_current_tts():
             pproc, aproc = current_tts_process
             try:
                 pproc.kill()
+                log_message("Killed current Piper process.", "DEBUG")
             except Exception as e:
-                print("Error killing Piper process:", e)
+                log_message(f"Error killing Piper process: {e}", "ERROR")
             try:
                 aproc.kill()
+                log_message("Killed current aplay process.", "DEBUG")
             except Exception as e:
-                print("Error killing aplay process:", e)
+                log_message(f"Error killing aplay process: {e}", "ERROR")
             current_tts_process = None
 
 # ----- TTS Processing -----
@@ -272,19 +307,20 @@ def process_tts_request(text):
                        (onnx_json, "ONNX JSON file"),
                        (onnx_model, "ONNX model file")]:
         if not os.path.isfile(path):
-            print(f"Error: {desc} not found at {path}")
+            log_message(f"Error: {desc} not found at {path}", "ERROR")
             return
     payload = {"text": text, "config": onnx_json, "model": onnx_model}
     payload_str = json.dumps(payload)
     cmd_piper = [piper_exe, "-m", onnx_model, "--debug", "--json-input", "--output_raw"]
     cmd_aplay = ["aplay", "--buffer-size=777", "-r", "22050", "-f", "S16_LE"]
-    print(f"\n[TTS] Synthesizing: '{text}'")
+    log_message(f"[TTS] Synthesizing: '{text}'", "INFO")
     try:
         with tts_lock:
             proc = subprocess.Popen(cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             proc_aplay = subprocess.Popen(cmd_aplay, stdin=proc.stdout)
             global current_tts_process
             current_tts_process = (proc, proc_aplay)
+            log_message("TTS processes started.", "DEBUG")
         proc.stdin.write(payload_str.encode("utf-8"))
         proc.stdin.close()
         proc_aplay.wait()
@@ -293,16 +329,16 @@ def process_tts_request(text):
             current_tts_process = None
         stderr_output = proc.stderr.read().decode("utf-8")
         if stderr_output:
-            print("[Piper STDERR]:")
-            print(stderr_output)
+            log_message("[Piper STDERR]: " + stderr_output, "ERROR")
     except Exception as e:
-        print("Error during TTS processing:")
-        print(e)
+        log_message("Error during TTS processing: " + str(e), "ERROR")
 
 def tts_worker(q):
+    log_message("TTS worker thread started.", "DEBUG")
     while True:
         text = q.get()
         if text is None:
+            log_message("TTS worker received shutdown signal.", "DEBUG")
             break
         process_tts_request(text)
         q.task_done()
@@ -310,13 +346,15 @@ def tts_worker(q):
 # ----- Microphone Audio Capture -----
 def audio_callback(indata, frames, time_info, status):
     if status:
-        print("Audio callback status:", status)
+        log_message("Audio callback status: " + str(status), "WARNING")
     audio_queue.put(indata.copy())
+    log_message("Audio callback received data chunk.", "DEBUG")
 
 def start_audio_capture():
-    print("Starting microphone capture... (Press Ctrl+C to stop)")
+    log_message("Starting microphone capture...", "PROCESS")
     stream = InputStream(callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=BUFFER_SIZE)
     stream.start()
+    log_message("Microphone capture started.", "SUCCESS")
     return stream
 
 # ----- EQ-based Audio Enhancement Helper -----
@@ -330,6 +368,7 @@ def apply_eq_boost(audio, sample_rate, lowcut=300, highcut=3000, gain=2.0):
     max_val = np.max(np.abs(audio_boosted))
     if max_val > 1:
         audio_boosted = audio_boosted / max_val
+    log_message("EQ boost applied to audio.", "DEBUG")
     return audio_boosted.astype(np.float32)
 
 def clean_text(text):
@@ -340,14 +379,16 @@ def clean_text(text):
         u"\U0001F1E0-\U0001F1FF"
                            "]+", flags=re.UNICODE)
     text = emoji_pattern.sub(r'', text)
-    return text.replace("*", "")
+    cleaned = text.replace("*", "")
+    log_message("Cleaned text from emojis and special characters.", "DEBUG")
+    return cleaned
 
 # ----- Consensus Transcription Helper -----
 def consensus_whisper_transcribe_helper(audio_array, language="en", rms_threshold=0.01, consensus_threshold=0.8):
     # First check RMS level to reject low-volume chunks
     rms = np.sqrt(np.mean(np.square(audio_array)))
     if rms < rms_threshold:
-        print("Audio RMS too low (RMS: {:.5f}). Skipping transcription.".format(rms))
+        log_message("Audio RMS too low (RMS: {:.5f}). Skipping transcription.".format(rms), "WARNING")
         return ""
     
     transcription_base = ""
@@ -357,18 +398,22 @@ def consensus_whisper_transcribe_helper(audio_array, language="en", rms_threshol
     def transcribe_with_base():
         nonlocal transcription_base
         try:
+            log_message("Starting base model transcription...", "PROCESS")
             result = whisper_model_base.transcribe(audio_array, language=language)
             transcription_base = result.get("text", "").strip() if isinstance(result, dict) else str(result).strip()
+            log_message("Base transcription completed.", "SUCCESS")
         except Exception as e:
-            print("Error during base transcription:", e)
+            log_message("Error during base transcription: " + str(e), "ERROR")
     
     def transcribe_with_medium():
         nonlocal transcription_medium
         try:
+            log_message("Starting medium model transcription...", "PROCESS")
             result = whisper_model_medium.transcribe(audio_array, language=language)
             transcription_medium = result.get("text", "").strip() if isinstance(result, dict) else str(result).strip()
+            log_message("Medium transcription completed.", "SUCCESS")
         except Exception as e:
-            print("Error during medium transcription:", e)
+            log_message("Error during medium transcription: " + str(e), "ERROR")
     
     # Run both transcriptions concurrently in separate threads.
     thread_base = threading.Thread(target=transcribe_with_base)
@@ -380,26 +425,29 @@ def consensus_whisper_transcribe_helper(audio_array, language="en", rms_threshol
     
     # If either transcription is empty, discard.
     if not transcription_base or not transcription_medium:
-        print("One of the models returned no transcription.")
+        log_message("One of the models returned no transcription.", "WARNING")
         return ""
     
     # Compare the two transcriptions
     similarity = difflib.SequenceMatcher(None, transcription_base, transcription_medium).ratio()
-    print(f"Transcription similarity: {similarity:.2f}")
+    log_message(f"Transcription similarity: {similarity:.2f}", "INFO")
     if similarity >= consensus_threshold:
-        # Accept the transcription (returning the base model's output)
+        log_message("Consensus reached between Whisper models.", "SUCCESS")
         return transcription_base
     else:
-        print("No consensus between base and medium models; ignoring transcription.")
+        log_message("No consensus between base and medium models; ignoring transcription.", "WARNING")
         return ""
 
 # ----- Transcription Validation Helper -----
 def validate_transcription(text):
     if not any(ch.isalpha() for ch in text):
+        log_message("Transcription validation failed: no alphabetic characters.", "WARNING")
         return False
     words = text.split()
     if len(words) < 2:
+        log_message("Transcription validation failed: fewer than 2 words.", "WARNING")
         return False
+    log_message("Transcription validated successfully.", "SUCCESS")
     return True
 
 # ----- Manager & Helper Classes for Tool-Calling Chat System -----
@@ -407,10 +455,12 @@ class ConfigManager:
     def __init__(self, config):
         config["model"] = config["primary_model"]
         self.config = config
+        log_message("ConfigManager initialized with config.", "DEBUG")
 
 class HistoryManager:
     def __init__(self):
         self.history = []
+        log_message("HistoryManager initialized.", "DEBUG")
     def add_entry(self, role, content):
         entry = {
             "role": role,
@@ -418,25 +468,33 @@ class HistoryManager:
             "timestamp": datetime.now().isoformat()
         }
         self.history.append(entry)
+        log_message(f"History entry added for role '{role}'.", "INFO")
 
 class TTSManager:
     def enqueue(self, text):
+        log_message(f"Enqueuing text for TTS: {text}", "INFO")
         tts_queue.put(text)
     def stop(self):
+        log_message("Stopping TTS processes.", "PROCESS")
         flush_current_tts()
     def start(self):
+        log_message("Starting TTS processes.", "PROCESS")
         pass
 
 class MemoryManager:
     def store_message(self, conversation_id, role, message, embedding):
+        log_message("Storing message in MemoryManager.", "DEBUG")
         pass
     def retrieve_similar(self, conversation_id, embedding, top_n=3, mode="conversational"):
+        log_message("Retrieving similar messages from MemoryManager.", "DEBUG")
         return []
     def retrieve_latest_summary(self, conversation_id):
+        log_message("Retrieving latest summary from MemoryManager.", "DEBUG")
         return None
 
 class ModeManager:
     def detect_mode(self, history):
+        log_message("Detecting conversation mode.", "DEBUG")
         return "conversational"
 
 class DisplayState:
@@ -445,7 +503,8 @@ class DisplayState:
         self.current_tokens = ""
         self.current_request = ""
         self.current_tool_calls = ""
-
+        log_message("DisplayState initialized.", "DEBUG")
+        
 display_state = DisplayState()
 
 class Utils:
@@ -458,7 +517,9 @@ class Utils:
             u"\U0001F680-\U0001F6FF"
             u"\U0001F1E0-\U0001F1FF"
             "]+", flags=re.UNICODE)
-        return emoji_pattern.sub(r'', text)
+        result = emoji_pattern.sub(r'', text)
+        log_message("Emojis removed from text.", "DEBUG")
+        return result
     @staticmethod
     def convert_numbers_to_words(text):
         def replace_num(match):
@@ -467,15 +528,22 @@ class Utils:
                 return num2words(int(number_str))
             except ValueError:
                 return number_str
-        return re.sub(r'\b\d+\b', replace_num, text)
+        converted = re.sub(r'\b\d+\b', replace_num, text)
+        log_message("Numbers converted to words in text.", "DEBUG")
+        return converted
     @staticmethod
     def get_current_time():
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message("Current time retrieved.", "DEBUG")
+        return current_time
     @staticmethod
     def cosine_similarity(vec1, vec2):
         if np.linalg.norm(vec1) == 0 or np.linalg.norm(vec2) == 0:
+            log_message("One of the vectors has zero norm in cosine similarity calculation.", "WARNING")
             return 0.0
-        return float(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
+        similarity = float(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
+        log_message("Cosine similarity computed.", "DEBUG")
+        return similarity
     @staticmethod
     def safe_load_json_file(path, default):
         if not path:
@@ -487,45 +555,59 @@ class Utils:
             return default
         try:
             with open(path, 'r') as f:
-                return json.load(f)
+                result = json.load(f)
+            log_message(f"JSON file loaded from {path}.", "DEBUG")
+            return result
         except Exception:
+            log_message(f"Failed to load JSON file from {path}, returning default.", "ERROR")
             return default
     @staticmethod
     def load_format_schema(fmt):
         if not fmt:
             return None
         if fmt.lower() == "json":
+            log_message("JSON format schema detected.", "DEBUG")
             return "json"
         if os.path.exists(fmt):
             try:
                 with open(fmt, 'r') as f:
-                    return json.load(f)
+                    result = json.load(f)
+                log_message("Format schema loaded from file.", "DEBUG")
+                return result
             except Exception:
+                log_message("Error loading format schema from file.", "ERROR")
                 return None
+        log_message("No valid format schema found.", "WARNING")
         return None
     @staticmethod
     def monitor_script(interval=5):
         script_path = os.path.abspath(__file__)
         last_mtime = os.path.getmtime(script_path)
+        log_message("Monitoring script for changes...", "PROCESS")
         while True:
             time.sleep(interval)
             try:
                 new_mtime = os.path.getmtime(script_path)
                 if new_mtime != last_mtime:
+                    log_message("Script change detected. Restarting...", "INFO")
                     os.execv(sys.executable, [sys.executable] + sys.argv)
             except Exception:
                 pass
     @staticmethod
     def embed_text(text):
         try:
+            log_message("Embedding text for context.", "PROCESS")
             response = chat(model="nomic-embed-text", messages=[{"role": "user", "content": text}], stream=False)
             embedding = json.loads(response["message"]["content"])
             vec = np.array(embedding, dtype=float)
             norm = np.linalg.norm(vec)
             if norm == 0:
                 return vec
-            return vec / norm
+            normalized = vec / norm
+            log_message("Text embedding computed and normalized.", "SUCCESS")
+            return normalized
         except Exception as e:
+            log_message("Error during text embedding: " + str(e), "ERROR")
             return np.zeros(768)
 
 class Tools:
@@ -533,17 +615,19 @@ class Tools:
     def parse_tool_call(text):
         pattern = r"```tool_(?:code|call)\s*(.*?)\s*```"
         match = re.search(pattern, text, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        return None
+        result = match.group(1).strip() if match else None
+        log_message("Parsed tool call from text.", "DEBUG")
+        return result
     @staticmethod
     def see_whats_around():
         images_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
         if not os.path.exists(images_dir):
             os.makedirs(images_dir, exist_ok=True)
+            log_message(f"Images directory created at {images_dir}.", "SUCCESS")
         url = "http://127.0.0.1:8080/camera/default_0"
         try:
             import requests
+            log_message(f"Attempting to capture image from {url}.", "PROCESS")
             response = requests.get(url, stream=True, timeout=5)
             if response.status_code == 200:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -552,10 +636,13 @@ class Tools:
                 with open(file_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
+                log_message("Image captured and saved.", "SUCCESS")
                 return file_path
             else:
+                log_message(f"Error: Received status code {response.status_code} while capturing image.", "ERROR")
                 return f"Error: {response.status_code}"
         except Exception as e:
+            log_message(f"Error capturing image: {e}", "ERROR")
             return f"Error: {e}"
     @staticmethod
     def get_battery_voltage():
@@ -563,13 +650,17 @@ class Tools:
             home_dir = os.path.expanduser("~")
             file_path = os.path.join(home_dir, "voltage.txt")
             with open(file_path, "r") as f:
-                return float(f.readline().strip())
+                voltage = float(f.readline().strip())
+            log_message("Battery voltage retrieved.", "SUCCESS")
+            return voltage
         except Exception as e:
+            log_message("Error reading battery voltage: " + str(e), "ERROR")
             raise RuntimeError(f"Error reading battery voltage: {e}")
     @staticmethod
     def brave_search(topic):
         api_key = os.environ.get("BRAVE_API_KEY", "")
         if not api_key:
+            log_message("BRAVE_API_KEY not set for brave search.", "ERROR")
             return "Error: BRAVE_API_KEY not set."
         endpoint = "https://api.search.brave.com/res/v1/web/search"
         headers = {
@@ -580,9 +671,16 @@ class Tools:
         params = {"q": topic, "count": 3}
         try:
             import requests
+            log_message(f"Performing brave search for topic: {topic}", "PROCESS")
             response = requests.get(endpoint, headers=headers, params=params, timeout=5)
-            return response.text if response.status_code == 200 else f"Error {response.status_code}: {response.text}"
+            if response.status_code == 200:
+                log_message("Brave search successful.", "SUCCESS")
+                return response.text
+            else:
+                log_message(f"Error in brave search: {response.status_code}", "ERROR")
+                return f"Error {response.status_code}: {response.text}"
         except Exception as e:
+            log_message("Error in brave search: " + str(e), "ERROR")
             return f"Error: {e}"
     @staticmethod
     def bs4_scrape(url):
@@ -593,33 +691,48 @@ class Tools:
         }
         try:
             import requests
+            log_message(f"Scraping URL: {url}", "PROCESS")
             response = requests.get(url, headers=headers, timeout=5)
             response.raise_for_status()
             soup = BeautifulSoup(response.content, 'html5lib')
+            log_message("Webpage scraped successfully.", "SUCCESS")
             return soup.prettify()
         except Exception as e:
+            log_message("Error during scraping: " + str(e), "ERROR")
             return f"Error during scraping: {e}"
     @staticmethod
     def find_file(filename, search_path="."):
+        log_message(f"Searching for file: {filename} in path: {search_path}", "PROCESS")
         for root, dirs, files in os.walk(search_path):
             if filename in files:
+                log_message(f"File found in directory: {root}", "SUCCESS")
                 return root
+        log_message("File not found.", "WARNING")
         return None
     @staticmethod
     def get_current_location():
         try:
             import requests
+            log_message("Retrieving current location based on IP.", "PROCESS")
             response = requests.get("http://ip-api.com/json", timeout=5)
-            return response.json() if response.status_code == 200 else {"error": f"HTTP error {response.status_code}"}
+            if response.status_code == 200:
+                log_message("Current location retrieved.", "SUCCESS")
+                return response.json()
+            else:
+                log_message("Error retrieving location: HTTP " + str(response.status_code), "ERROR")
+                return {"error": f"HTTP error {response.status_code}"}
         except Exception as e:
+            log_message("Error retrieving location: " + str(e), "ERROR")
             return {"error": str(e)}
     @staticmethod
     def get_system_utilization():
-        return {
+        utilization = {
             "cpu_usage": psutil.cpu_percent(interval=1),
             "memory_usage": psutil.virtual_memory().percent,
             "disk_usage": psutil.disk_usage('/').percent
         }
+        log_message("System utilization retrieved.", "DEBUG")
+        return utilization
     @staticmethod
     def secondary_agent_tool(prompt: str, temperature: float = 0.7) -> str:
         secondary_model = config["secondary_model"]
@@ -630,9 +743,12 @@ class Tools:
             "stream": False
         }
         try:
+            log_message("Calling secondary agent tool.", "PROCESS")
             response = chat(model=secondary_model, messages=payload["messages"], stream=False)
+            log_message("Secondary agent tool responded.", "SUCCESS")
             return response["message"]["content"]
         except Exception as e:
+            log_message("Error in secondary agent: " + str(e), "ERROR")
             return f"Error in secondary agent: {e}"
 
 class ChatManager:
@@ -652,7 +768,8 @@ class ChatManager:
         self.inference_lock = threading.Lock()
         self.current_thread = None
         self.conversation_id = self.config_manager.config.get("conversation_id", "default_convo")
-
+        log_message("ChatManager initialized.", "DEBUG")
+    
     def build_payload(self):
         cfg = self.config_manager.config
         system_prompt = cfg.get("system", "")
@@ -672,10 +789,12 @@ class ChatManager:
             "When a function call is executed, its response will be wrapped in triple backticks with the label `tool_output`."
         )
         system_message = {"role": "system", "content": system_prompt + "\n\n" + tool_instructions}
+        log_message("System message constructed for payload.", "DEBUG")
         if self.history_manager.history:
             last_user_msg = next((msg["content"] for msg in reversed(self.history_manager.history) if msg["role"] == "user"), "")
             _ = Utils.embed_text(last_user_msg)
             mem_context = ""
+            log_message("Memory context extracted from history.", "DEBUG")
         else:
             mem_context = ""
         summary_text = ""
@@ -699,17 +818,20 @@ class ChatManager:
             payload["tools"] = self.tools_data
         if cfg["options"]:
             payload["options"] = cfg["options"]
+        log_message("Payload for chat completion built.", "SUCCESS")
         return payload
 
     def chat_completion_stream(self, processed_text):
         payload = self.build_payload()
         tokens = ""
         try:
+            log_message("Starting streaming chat completion...", "PROCESS")
             stream = chat(model=self.config_manager.config["primary_model"],
                           messages=payload["messages"],
                           stream=self.config_manager.config["stream"])
             for part in stream:
                 if self.stop_flag:
+                    log_message("Stop flag detected during streaming.", "WARNING")
                     yield "", True
                     return
                 content = part["message"]["content"]
@@ -718,18 +840,23 @@ class ChatManager:
                     display_state.current_tokens = tokens
                 yield content, part.get("done", False)
                 if part.get("done", False):
+                    log_message("Streaming chat completion finished.", "SUCCESS")
                     break
-        except Exception:
+        except Exception as e:
+            log_message("Error during streaming chat completion: " + str(e), "ERROR")
             yield "", True
 
     def chat_completion_nonstream(self, processed_text):
         payload = self.build_payload()
         try:
+            log_message("Starting non-streaming chat completion...", "PROCESS")
             response = chat(model=self.config_manager.config["primary_model"],
                             messages=payload["messages"],
                             stream=False)
+            log_message("Non-streaming chat completion finished.", "SUCCESS")
             return response["message"]["content"]
-        except Exception:
+        except Exception as e:
+            log_message("Error during non-streaming chat completion: " + str(e), "ERROR")
             return ""
 
     def process_text(self, text, skip_tts=False):
@@ -738,6 +865,7 @@ class ChatManager:
         tokens = ""
         if self.config_manager.config["stream"]:
             buffer = ""
+            log_message("Processing text in streaming mode.", "DEBUG")
             for content, done in self.chat_completion_stream(processed_text):
                 buffer += content
                 tokens += content
@@ -753,28 +881,34 @@ class ChatManager:
                     sentenceCleaned = clean_text(sentence)
                     if sentence and not skip_tts:
                         threading.Thread(target=self.tts_manager.enqueue, args=(sentenceCleaned,), daemon=True).start()
+                        log_message(f"TTS enqueue triggered for sentence: {sentenceCleaned}", "DEBUG")
                 if done:
                     break
             if buffer.strip():
                 tokens += buffer.strip()
                 with display_state.lock:
                     display_state.current_tokens = tokens
+            log_message("Text processing completed in streaming mode.", "SUCCESS")
             return tokens
         else:
             result = self.chat_completion_nonstream(processed_text)
             tokens = result
             with display_state.lock:
                 display_state.current_tokens = tokens
+            log_message("Text processing completed in non-streaming mode.", "SUCCESS")
             return tokens
 
     def inference_thread(self, user_message, result_holder, skip_tts):
+        log_message("Inference thread started.", "DEBUG")
         result = self.process_text(user_message, skip_tts)
         result_holder.append(result)
+        log_message("Inference thread completed processing.", "SUCCESS")
 
     def run_inference(self, prompt, skip_tts=False):
         result_holder = []
         with self.inference_lock:
             if self.current_thread and self.current_thread.is_alive():
+                log_message("Existing inference thread is still running; stopping it.", "WARNING")
                 self.stop_flag = True
                 self.current_thread.join()
                 self.stop_flag = False
@@ -784,8 +918,10 @@ class ChatManager:
                 target=self.inference_thread,
                 args=(prompt, result_holder, skip_tts)
             )
+            log_message("Starting new inference thread.", "PROCESS")
             self.current_thread.start()
         self.current_thread.join()
+        log_message("Inference thread joined and result obtained.", "SUCCESS")
         return result_holder[0] if result_holder else ""
 
     def run_tool(self, tool_code):
@@ -796,12 +932,16 @@ class ChatManager:
                 if callable(method):
                     allowed_tools[attr] = method
         try:
+            log_message(f"Executing tool call: {tool_code}", "PROCESS")
             result = eval(tool_code, {"__builtins__": {}}, allowed_tools)
+            log_message("Tool call executed successfully.", "SUCCESS")
             return str(result)
         except Exception as e:
+            log_message("Error executing tool: " + str(e), "ERROR")
             return f"Error executing tool: {e}"
 
     def new_request(self, user_message, skip_tts=False):
+        log_message(f"New request received: {user_message}", "INFO")
         self.history_manager.add_entry("user", user_message)
         _ = Utils.embed_text(user_message)
         with display_state.lock:
@@ -811,22 +951,22 @@ class ChatManager:
         tool_code = Tools.parse_tool_call(result)
         if tool_code:
             tool_output = self.run_tool(tool_code)
-            tool_output_cleaned = clean_text(tool_output)
-            print(tool_output_cleaned)
             formatted_output = f"```tool_output\n{tool_output}\n```"
             combined_prompt = f"{user_message}\n{formatted_output}"
             self.history_manager.add_entry("user", combined_prompt)
             _ = Utils.embed_text(combined_prompt)
+            log_message("Tool call detected and processed.", "INFO")
             final_result = self.new_request(combined_prompt, skip_tts=False)
             return final_result
         else:
             self.history_manager.add_entry("assistant", result)
             _ = Utils.embed_text(result)
+            log_message("Assistant response recorded in history.", "SUCCESS")
             return result
 
 # ----- Voice-to-LLM Loop (for microphone input) -----
 def voice_to_llm_loop(chat_manager: ChatManager):
-    print("Voice-to-LLM loop started. Listening for voice input...")
+    log_message("Voice-to-LLM loop started. Listening for voice input...", "INFO")
     while True:
         time.sleep(5)
         if audio_queue.empty():
@@ -837,28 +977,28 @@ def voice_to_llm_loop(chat_manager: ChatManager):
             audio_queue.task_done()
         if not chunks:
             continue
+        log_message("Audio chunks collected for transcription.", "DEBUG")
         audio_data = np.concatenate(chunks, axis=0)
         audio_array = audio_data.flatten().astype(np.float32)
         
         # Apply noise reduction using the denoiser if enabled.
         if config.get("enable_noise_reduction", True):
-            print("Applying denoiser to audio chunk...")
+            log_message("Applying denoiser to audio chunk...", "PROCESS")
             # Convert audio to torch tensor and add batch and channel dimensions
             audio_tensor = torch.tensor(audio_array).float().unsqueeze(0).unsqueeze(0)
             with torch.no_grad():
                 enhanced_tensor = denoiser_model(audio_tensor)
-            # Squeeze back to 1D numpy array
             audio_array = enhanced_tensor.squeeze(0).squeeze(0).cpu().numpy()
+            log_message("Denoiser applied successfully.", "SUCCESS")
         
         # Optionally apply EQ enhancement and playback for debugging.
         audio_to_transcribe = audio_array
         if config.get("debug_audio_playback", False):
             audio_to_transcribe = apply_eq_boost(audio_array, SAMPLE_RATE)
-            print("Playing back the enhanced audio for debugging...")
+            log_message("Playing back the enhanced audio for debugging...", "INFO")
             sd.play(audio_to_transcribe, samplerate=SAMPLE_RATE)
             sd.wait()
         
-        # Run both Whisper models concurrently and get consensus transcription.
         transcription = consensus_whisper_transcribe_helper(
             audio_to_transcribe,
             language="en",
@@ -868,22 +1008,21 @@ def voice_to_llm_loop(chat_manager: ChatManager):
         if not transcription:
             continue
         
-        # Validate transcription.
         if not validate_transcription(transcription):
-            print("Transcription validation failed (likely hallucinated). Skipping.")
+            log_message("Transcription validation failed (likely hallucinated). Skipping.", "WARNING")
             continue
         
-        print(f"Transcribed prompt: {transcription}")
+        log_message(f"Transcribed prompt: {transcription}", "INFO")
         session_log.write(json.dumps({"role": "user", "content": transcription, "timestamp": datetime.now().isoformat()}) + "\n")
         session_log.flush()
         flush_current_tts()
         
-        # Process transcription via ChatManager.
         response = chat_manager.new_request(transcription)
-        print("LLM response:", response)
+        log_message("LLM response received.", "INFO")
+        log_message("LLM response: " + response, "INFO")
         session_log.write(json.dumps({"role": "assistant", "content": response, "timestamp": datetime.now().isoformat()}) + "\n")
         session_log.flush()
-        print("--- Awaiting further voice input ---")
+        log_message("--- Awaiting further voice input ---", "INFO")
 
 # ----- New: Text Input Override Loop -----
 def text_input_loop(chat_manager: ChatManager):
@@ -891,33 +1030,37 @@ def text_input_loop(chat_manager: ChatManager):
     This loop runs in parallel to the voice transcription. It continuously reads text input from the keyboard.
     When the user types a message and hits enter, it is processed as if it were a spoken prompt.
     """
+    log_message("Text input override mode is active.", "INFO")
     print("\nText override mode is active. Type your message and press Enter to send it to the LLM.")
     while True:
         try:
             user_text = input()  # Blocking call in its own thread.
             if not user_text.strip():
                 continue
-            print(f"You typed: {user_text}")
+            log_message(f"You typed: {user_text}", "INFO")
             session_log.write(json.dumps({"role": "user", "content": user_text, "timestamp": datetime.now().isoformat()}) + "\n")
             session_log.flush()
             flush_current_tts()
             response = chat_manager.new_request(user_text)
+            log_message("LLM response received for text input.", "INFO")
             print("LLM response:", response)
             session_log.write(json.dumps({"role": "assistant", "content": response, "timestamp": datetime.now().isoformat()}) + "\n")
             session_log.flush()
         except Exception as e:
-            print("Error in text input loop:", e)
+            log_message("Error in text input loop: " + str(e), "ERROR")
 
 # ----- Main Function -----
 def main():
+    log_message("Main function starting.", "INFO")
     tts_thread = threading.Thread(target=tts_worker, args=(tts_queue,))
     tts_thread.daemon = True
     tts_thread.start()
+    log_message("TTS worker thread launched.", "DEBUG")
     
     try:
         mic_stream = start_audio_capture()
     except Exception as e:
-        print("Error starting microphone capture:", e)
+        log_message("Error starting microphone capture: " + str(e), "ERROR")
         sys.exit(1)
     
     config_manager = ConfigManager(config)
@@ -929,15 +1072,15 @@ def main():
     chat_manager = ChatManager(config_manager, history_manager, tts_manager, tools_data=True,
                                format_schema=None, memory_manager=memory_manager, mode_manager=mode_manager)
     
-    # Start the voice-to-LLM loop thread (for microphone input)
     voice_thread = threading.Thread(target=voice_to_llm_loop, args=(chat_manager,))
     voice_thread.daemon = True
     voice_thread.start()
+    log_message("Voice-to-LLM loop thread started.", "DEBUG")
     
-    # Start the text input override thread
     text_thread = threading.Thread(target=text_input_loop, args=(chat_manager,))
     text_thread.daemon = True
     text_thread.start()
+    log_message("Text input override thread started.", "DEBUG")
     
     print("\nVoice-activated LLM mode (primary model: {}) is running.".format(config["primary_model"]))
     print("Speak into the microphone or type your prompt. LLM responses are streamed and spoken via Piper. Press Ctrl+C to exit.")
@@ -946,6 +1089,7 @@ def main():
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
+        log_message("KeyboardInterrupt detected. Exiting...", "INFO")
         print("\nExiting...")
     
     mic_stream.stop()
@@ -961,6 +1105,8 @@ def main():
     with open(history_path, "w", encoding="utf-8") as f:
         json.dump(history_manager.history, f, indent=4)
     
+    log_message(f"Chat session saved in folder: {session_folder}", "SUCCESS")
+    log_message("System terminated.", "INFO")
     print("Chat session saved in folder:", session_folder)
     print("System terminated.")
 
