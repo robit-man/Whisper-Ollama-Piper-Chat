@@ -19,7 +19,7 @@ sudo apt-get install ffmpeg libav-tools
 
 if you want to enable the brave search functionality through their [free rate-limited api](https://api-dashboard.search.brave.com/app/documentation/web-search/get-started), you must create a .env file parallel to the app.py, and add the api key [you can retreive through signing up with brave search](https://api-dashboard.search.brave.com/register)
 
-```
+```.env
 BRAVE_API_KEY=<brave-search-api-key>
 ```
 where ```<brave-search-api-key>``` is replaced with the retreived api key after creating an account (for agents)
