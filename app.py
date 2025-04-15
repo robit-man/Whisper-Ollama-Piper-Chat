@@ -168,7 +168,7 @@ if not os.path.exists(SETUP_MARKER):
         "noisereduce",      # For noise cancellation (fallback, not used here)
         "denoiser",         # For real-time speech enhancement via denoiser
         "pyautogui",        # For screen capture
-        "pillow",         # For image handling
+        "pillow",           # For image handling
     ])
     with open(SETUP_MARKER, "w") as f:
         f.write("Setup complete")
@@ -352,8 +352,6 @@ def process_tts_request(text):
 
         # Function to adjust volume on raw 16-bit PCM data
         def adjust_volume(data, vol):
-            # data is 16-bit little-endian raw PCM
-            # We'll adjust amplitude in a safe way to prevent overflow
             samples = np.frombuffer(data, dtype=np.int16)
             samples = (samples.astype(np.float32) * vol).clip(-32768, 32767).astype(np.int16)
             return samples.tobytes()
@@ -368,7 +366,6 @@ def process_tts_request(text):
                 chunk = adjust_volume(chunk, volume)
             proc_aplay.stdin.write(chunk)
 
-        # Close aplay stdin now that all audio data is sent
         proc_aplay.stdin.close()
         proc_aplay.wait()
         proc.wait()
@@ -382,7 +379,6 @@ def process_tts_request(text):
 
     except Exception as e:
         log_message("Error during TTS processing: " + str(e), "ERROR")
-
 
 def tts_worker(q):
     log_message("TTS worker thread started.", "DEBUG")
@@ -656,7 +652,6 @@ class Utils:
         try:
             log_message("Embedding text for context.", "PROCESS")
             response = embed(model="nomic-embed-text", input=text)
-            #print(response)
             embedding = response['embeddings']
             vec = np.array(embedding, dtype=float)
             norm = np.linalg.norm(vec)
@@ -669,8 +664,6 @@ class Utils:
             log_message("Error during text embedding: " + str(e), "ERROR")
             return np.zeros(768)
 
-
-
 import os
 import re
 from datetime import datetime
@@ -680,28 +673,6 @@ import psutil
 class Tools:
     @staticmethod
     def parse_tool_call(text):
-        """
-        Parse a tool call from a given text string.
-
-        The expected format in the text is a code block marked with
-        either `tool_code` or `tool_call`, for example:
-
-            ```tool_call capture_screen()```
-
-        This function uses a regular expression to extract the code within
-        the code block and trims any surrounding whitespace.
-
-        Args:
-            text (str): The text containing the tool call.
-
-        Returns:
-            str: The parsed tool call string (e.g., "capture_screen()") or
-                 None if the pattern is not found.
-
-        Example:
-            >>> Tools.parse_tool_call("Some text ```tool_call capture_screen()``` more text")
-            "capture_screen()"
-        """
         pattern = r"```tool_(?:code|call)\s*(.*?)\s*```"
         match = re.search(pattern, text, re.DOTALL)
         result = match.group(1).strip() if match else None
@@ -963,6 +934,49 @@ class Tools:
         except Exception as e:
             log_message("Error in brave search: " + str(e), "ERROR")
             return f"Error: {e}"
+        
+    @staticmethod
+    def search_internet(topic):
+        """
+        Perform a web search using the Brave API for the given topic.
+
+        This function requires that the environment variable BRAVE_API_KEY is set.
+        It uses this API key to query the Brave search API and returns the search results as text.
+
+        Args:
+            topic (str): The search query/topic.
+
+        Returns:
+            str: The raw JSON response text if successful, or an error message if the search fails.
+
+        Usage:
+            - To search for a topic:
+                  brave_search("latest tech news")
+        """
+        api_key = os.environ.get("BRAVE_API_KEY", "")
+        if not api_key:
+            log_message("BRAVE_API_KEY not set for brave search.", "ERROR")
+            return "Error: BRAVE_API_KEY not set."
+        endpoint = "https://api.search.brave.com/res/v1/web/search"
+        headers = {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "x-subscription-token": api_key
+        }
+        params = {"q": topic, "count": 3}
+        try:
+            import requests
+            log_message(f"Performing brave search for topic: {topic}", "PROCESS")
+            response = requests.get(endpoint, headers=headers, params=params, timeout=5)
+            if response.status_code == 200:
+                log_message("Brave search successful.", "SUCCESS")
+                return response.text
+            else:
+                log_message(f"Error in brave search: {response.status_code}", "ERROR")
+                return f"Error {response.status_code}: {response.text}"
+        except Exception as e:
+            log_message("Error in brave search: " + str(e), "ERROR")
+            return f"Error: {e}"
 
     @staticmethod
     def bs4_scrape(url):
@@ -1115,7 +1129,6 @@ class Tools:
             log_message("Error in secondary agent: " + str(e), "ERROR")
             return f"Error in secondary agent: {e}"
 
-
 class ChatManager:
     def __init__(self, config_manager: ConfigManager, history_manager: HistoryManager,
                  tts_manager: TTSManager, tools_data, format_schema,
@@ -1189,9 +1202,10 @@ class ChatManager:
     def chat_completion_stream(self, processed_text):
         payload = self.build_payload()
         tokens = ""
+        model = self.config_manager.config["primary_model"]
         try:
             log_message("Starting streaming chat completion...", "PROCESS")
-            stream = chat(model=self.config_manager.config["primary_model"],
+            stream = chat(model=model,
                           messages=payload["messages"],
                           stream=self.config_manager.config["stream"])
             for part in stream:
@@ -1208,21 +1222,64 @@ class ChatManager:
                     log_message("Streaming chat completion finished.", "SUCCESS")
                     break
         except Exception as e:
-            log_message("Error during streaming chat completion: " + str(e), "ERROR")
-            yield "", True
+            # Automatic pull on missing model
+            if "not found" in str(e).lower():
+                log_message(f"Model {model} not found, pulling it now...", "WARNING")
+                try:
+                    from ollama import pull
+                    pull(model)
+                    log_message(f"Model {model} pulled successfully. Retrying streaming chat completion.", "SUCCESS")
+                    stream = chat(model=model,
+                                  messages=payload["messages"],
+                                  stream=self.config_manager.config["stream"])
+                    for part in stream:
+                        if self.stop_flag:
+                            log_message("Stop flag detected during streaming.", "WARNING")
+                            yield "", True
+                            return
+                        content = part["message"]["content"]
+                        tokens += content
+                        with display_state.lock:
+                            display_state.current_tokens = tokens
+                        yield content, part.get("done", False)
+                        if part.get("done", False):
+                            log_message("Streaming chat completion finished.", "SUCCESS")
+                            break
+                except Exception as e2:
+                    log_message("Error during model pull or retry: " + str(e2), "ERROR")
+                    yield "", True
+            else:
+                log_message("Error during streaming chat completion: " + str(e), "ERROR")
+                yield "", True
 
     def chat_completion_nonstream(self, processed_text):
         payload = self.build_payload()
+        model = self.config_manager.config["primary_model"]
         try:
             log_message("Starting non-streaming chat completion...", "PROCESS")
-            response = chat(model=self.config_manager.config["primary_model"],
+            response = chat(model=model,
                             messages=payload["messages"],
                             stream=False)
             log_message("Non-streaming chat completion finished.", "SUCCESS")
             return response["message"]["content"]
         except Exception as e:
-            log_message("Error during non-streaming chat completion: " + str(e), "ERROR")
-            return ""
+            if "not found" in str(e).lower():
+                log_message(f"Model {model} not found, pulling it now...", "WARNING")
+                try:
+                    from ollama import pull
+                    pull(model)
+                    log_message(f"Model {model} pulled successfully. Retrying non-streaming chat completion.", "SUCCESS")
+                    response = chat(model=model,
+                                    messages=payload["messages"],
+                                    stream=False)
+                    log_message("Non-streaming chat completion finished.", "SUCCESS")
+                    return response["message"]["content"]
+                except Exception as e2:
+                    log_message("Error during model pull or retry: " + str(e2), "ERROR")
+                    return ""
+            else:
+                log_message("Error during non-streaming chat completion: " + str(e), "ERROR")
+                return ""
 
     def process_text(self, text, skip_tts=False):
         processed_text = Utils.convert_numbers_to_words(text)
@@ -1333,10 +1390,11 @@ class ChatManager:
 def voice_to_llm_loop(chat_manager: ChatManager):
     log_message("Voice-to-LLM loop started. Listening for voice input...", "INFO")
     while True:
-        time.sleep(5)
+        # Latency reduction: poll audio queue every 0.1 second
+        time.sleep(1)
         if audio_queue.empty():
             continue
-        chunks = []
+        chunks = [] 
         while not audio_queue.empty():
             chunks.append(audio_queue.get())
             audio_queue.task_done()
@@ -1359,11 +1417,11 @@ def voice_to_llm_loop(chat_manager: ChatManager):
         # Optionally apply EQ enhancement and playback for debugging.
         audio_to_transcribe = audio_array
         if config.get("debug_audio_playback", False):
-                volume = config.get("debug_volume", 1.0)
-                audio_to_transcribe = apply_eq_boost(audio_array, SAMPLE_RATE) * volume
-                log_message("Playing back the enhanced audio for debugging...", "INFO")
-                sd.play(audio_to_transcribe, samplerate=SAMPLE_RATE)
-                sd.wait()
+            volume = config.get("debug_volume", 1.0)
+            audio_to_transcribe = apply_eq_boost(audio_array, SAMPLE_RATE) * volume
+            log_message("Playing back the enhanced audio for debugging...", "INFO")
+            sd.play(audio_to_transcribe, samplerate=SAMPLE_RATE)
+            sd.wait()
         
         transcription = consensus_whisper_transcribe_helper(
             audio_to_transcribe,
@@ -1392,10 +1450,6 @@ def voice_to_llm_loop(chat_manager: ChatManager):
 
 # ----- New: Text Input Override Loop -----
 def text_input_loop(chat_manager: ChatManager):
-    """
-    This loop runs in parallel to the voice transcription. It continuously reads text input from the keyboard.
-    When the user types a message and hits enter, it is processed as if it were a spoken prompt.
-    """
     log_message("Text input override mode is active.", "INFO")
     print("\nText override mode is active. Type your message and press Enter to send it to the LLM.")
     while True:
