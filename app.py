@@ -12,6 +12,10 @@ This script now integrates:
   - Chat history packaging into JSON with timestamps.
   - Additional functionalities including EQ enhancement, debug audio playback, tool calling, etc.
   - A new parallel text override mode: you can simply type your input and hit enter and it will be processed as if it were spoken.
+  - **New! Image inference support:** You can now pass images to the model (e.g. "./image.png").
+  - **New! Screen Capture Tool:** A tool call is available to capture the screen (using pyautogui) and save it as temp_screen.png.
+  - **New! Image Query Conversion:** An internal function converts the user query into a more relevant image-based query, 
+    whose output is then passed to the primary model.
 """
 
 import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib
@@ -161,8 +165,10 @@ if not os.path.exists(SETUP_MARKER):
         "pywifi",           # For WiFi scanning
         "psutil",           # For system utilization
         "num2words",        # For converting numbers to words
-        "noisereduce",       # For noise cancellation (fallback, not used here)
-        "denoiser"          # For real-time speech enhancement via denoiser
+        "noisereduce",      # For noise cancellation (fallback, not used here)
+        "denoiser",         # For real-time speech enhancement via denoiser
+        "pyautogui",        # For screen capture
+        "pillow",         # For image handling
     ])
     with open(SETUP_MARKER, "w") as f:
         f.write("Setup complete")
@@ -174,7 +180,7 @@ def load_config():
     """
     Load configuration from config.json (in the script directory). If not present, create it with default values.
     New keys include settings for primary/secondary models, temperatures, RMS threshold, debug audio playback,
-    noise reduction, and consensus threshold.
+    noise reduction, consensus threshold, and now image support.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(script_dir, "config.json")
@@ -189,14 +195,14 @@ def load_config():
         "whisper_model_medium": "medium",  # Use "medium" model for validation
         "stream": True,
         "raw": False,
-        "images": None,
+        "images": None,        # Now support passing images to the primary model
         "options": {},
         "system": "You are a helpful assistant.",
         "conversation_id": "default_convo",
-        "rms_threshold": 0.005,
+        "rms_threshold": 0.01,
         "debug_audio_playback": False,
         "enable_noise_reduction": True,
-        "consensus_threshold": 0.005       # Similarity ratio required for consensus between models
+        "consensus_threshold": 0.8       # Similarity ratio required for consensus between models
     }
     if not os.path.isfile(config_path):
         with open(config_path, "w") as f:
@@ -234,11 +240,11 @@ def setup_chat_session():
 
 session_folder, session_log = setup_chat_session()
 
-# ----- Import Additional Packages -----
+# ----- Import Additional Packages (after venv initialization and dependency installation) -----
 from sounddevice import InputStream
 from scipy.io.wavfile import write
 import whisper
-from ollama import chat
+from ollama import chat, embed
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 import pywifi
@@ -250,6 +256,8 @@ import numpy as np
 from scipy.signal import butter, lfilter  # For EQ enhancement
 import torch
 from denoiser import pretrained  # For speech enhancement via denoiser
+from PIL import ImageGrab  # Ensure Pillow is installed
+
 load_dotenv()
 log_message("Environment variables loaded using dotenv", "INFO")
 
@@ -299,39 +307,82 @@ def flush_current_tts():
 
 # ----- TTS Processing -----
 def process_tts_request(text):
+    volume = config.get("tts_volume", 1.0)  # <-- new volume config
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     piper_exe = os.path.join(script_dir, "piper", "piper")
     onnx_json = os.path.join(script_dir, config["onnx_json"])
     onnx_model = os.path.join(script_dir, config["onnx_model"])
-    for path, desc in [(piper_exe, "Piper executable"),
-                       (onnx_json, "ONNX JSON file"),
-                       (onnx_model, "ONNX model file")]:
+
+    # Verify that necessary files exist
+    for path, desc in [
+        (piper_exe, "Piper executable"),
+        (onnx_json, "ONNX JSON file"),
+        (onnx_model, "ONNX model file"),
+    ]:
         if not os.path.isfile(path):
             log_message(f"Error: {desc} not found at {path}", "ERROR")
             return
+
     payload = {"text": text, "config": onnx_json, "model": onnx_model}
     payload_str = json.dumps(payload)
+
     cmd_piper = [piper_exe, "-m", onnx_model, "--debug", "--json-input", "--output_raw"]
     cmd_aplay = ["aplay", "--buffer-size=777", "-r", "22050", "-f", "S16_LE"]
+
     log_message(f"[TTS] Synthesizing: '{text}'", "INFO")
+
     try:
         with tts_lock:
-            proc = subprocess.Popen(cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            proc_aplay = subprocess.Popen(cmd_aplay, stdin=proc.stdout)
+            proc = subprocess.Popen(
+                cmd_piper,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            # Intercept Piper stdout to adjust volume before sending to aplay
+            proc_aplay = subprocess.Popen(cmd_aplay, stdin=subprocess.PIPE)
             global current_tts_process
             current_tts_process = (proc, proc_aplay)
             log_message("TTS processes started.", "DEBUG")
+
+        # Send TTS request to Piper
         proc.stdin.write(payload_str.encode("utf-8"))
         proc.stdin.close()
+
+        # Function to adjust volume on raw 16-bit PCM data
+        def adjust_volume(data, vol):
+            # data is 16-bit little-endian raw PCM
+            # We'll adjust amplitude in a safe way to prevent overflow
+            samples = np.frombuffer(data, dtype=np.int16)
+            samples = (samples.astype(np.float32) * vol).clip(-32768, 32767).astype(np.int16)
+            return samples.tobytes()
+
+        # Read Piper's output, adjust volume, and send it to aplay
+        chunk_size = 4096
+        while True:
+            chunk = proc.stdout.read(chunk_size)
+            if not chunk:
+                break
+            if volume != 1.0:
+                chunk = adjust_volume(chunk, volume)
+            proc_aplay.stdin.write(chunk)
+
+        # Close aplay stdin now that all audio data is sent
+        proc_aplay.stdin.close()
         proc_aplay.wait()
         proc.wait()
+
         with tts_lock:
             current_tts_process = None
+
         stderr_output = proc.stderr.read().decode("utf-8")
         if stderr_output:
             log_message("[Piper STDERR]: " + stderr_output, "ERROR")
+
     except Exception as e:
         log_message("Error during TTS processing: " + str(e), "ERROR")
+
 
 def tts_worker(q):
     log_message("TTS worker thread started.", "DEBUG")
@@ -348,7 +399,7 @@ def audio_callback(indata, frames, time_info, status):
     if status:
         log_message("Audio callback status: " + str(status), "WARNING")
     audio_queue.put(indata.copy())
-    log_message("Audio callback received data chunk.", "DEBUG")
+    #log_message("Audio callback received data chunk.", "DEBUG")
 
 def start_audio_capture():
     log_message("Starting microphone capture...", "PROCESS")
@@ -372,15 +423,22 @@ def apply_eq_boost(audio, sample_rate, lowcut=300, highcut=3000, gain=2.0):
     return audio_boosted.astype(np.float32)
 
 def clean_text(text):
+    # Compile a regex pattern to match the emoji ranges
     emoji_pattern = re.compile("["
-        u"\U0001F600-\U0001F64F"
-        u"\U0001F300-\U0001F5FF"
-        u"\U0001F680-\U0001F6FF"
-        u"\U0001F1E0-\U0001F1FF"
+        u"\U0001F600-\U0001F64F"  # emoticons
+        u"\U0001F300-\U0001F5FF"  # symbols & pictographs
+        u"\U0001F680-\U0001F6FF"  # transport & map symbols
+        u"\U0001F1E0-\U0001F1FF"  # flags (iOS)
                            "]+", flags=re.UNICODE)
+    # Remove emojis from the text
     text = emoji_pattern.sub(r'', text)
+    # Remove asterisk symbols
     cleaned = text.replace("*", "")
-    log_message("Cleaned text from emojis and special characters.", "DEBUG")
+    # First remove triple backticks followed by tool_output
+    cleaned = cleaned.replace("```tool_output", "")
+    # Then remove any remaining tool_call and tool_output substrings
+    cleaned = cleaned.replace("tool_call", "").replace("tool_output", "")
+    # Return the cleaned text without any logging or tool calls
     return cleaned
 
 # ----- Consensus Transcription Helper -----
@@ -597,8 +655,9 @@ class Utils:
     def embed_text(text):
         try:
             log_message("Embedding text for context.", "PROCESS")
-            response = chat(model="nomic-embed-text", messages=[{"role": "user", "content": text}], stream=False)
-            embedding = json.loads(response["message"]["content"])
+            response = embed(model="nomic-embed-text", input=text)
+            #print(response)
+            embedding = response['embeddings']
             vec = np.array(embedding, dtype=float)
             norm = np.linalg.norm(vec)
             if norm == 0:
@@ -610,42 +669,247 @@ class Utils:
             log_message("Error during text embedding: " + str(e), "ERROR")
             return np.zeros(768)
 
+
+
+import os
+import re
+from datetime import datetime
+from bs4 import BeautifulSoup
+import psutil
+
 class Tools:
     @staticmethod
     def parse_tool_call(text):
+        """
+        Parse a tool call from a given text string.
+
+        The expected format in the text is a code block marked with
+        either `tool_code` or `tool_call`, for example:
+
+            ```tool_call capture_screen()```
+
+        This function uses a regular expression to extract the code within
+        the code block and trims any surrounding whitespace.
+
+        Args:
+            text (str): The text containing the tool call.
+
+        Returns:
+            str: The parsed tool call string (e.g., "capture_screen()") or
+                 None if the pattern is not found.
+
+        Example:
+            >>> Tools.parse_tool_call("Some text ```tool_call capture_screen()``` more text")
+            "capture_screen()"
+        """
         pattern = r"```tool_(?:code|call)\s*(.*?)\s*```"
         match = re.search(pattern, text, re.DOTALL)
         result = match.group(1).strip() if match else None
         log_message("Parsed tool call from text.", "DEBUG")
         return result
+
     @staticmethod
-    def see_whats_around():
+    def capture_screen():
+        """
+        Capture the current screen using the pyautogui library.
+
+        This function takes no arguments. It utilizes pyautogui's screenshot
+        capability to capture the current state of the screen and saves it as a file
+        called "temp_screen.png" in the same directory as this script.
+
+        Returns:
+            str: The absolute path to the saved screenshot file, or an error message if capture fails.
+
+        Usage:
+            - To capture the screen, simply call:
+                  capture_screen()
+            - The result will be the file path to "temp_screen.png".
+        """
+        try:
+            import pyautogui
+            log_message("Capturing screen using pyautogui...", "PROCESS")
+            screenshot = pyautogui.screenshot()
+            file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_screen.png")
+            screenshot.save(file_path)
+            log_message(f"Screen captured and saved to {file_path}", "SUCCESS")
+            return file_path
+        except Exception as e:
+            log_message("Error capturing screen: " + str(e), "ERROR")
+            return f"Error: {e}"
+
+    @staticmethod
+    def capture_screenshot():
+        """
+        Capture a screenshot using Pillow's ImageGrab and save it uniquely.
+
+        This function uses Pillow's ImageGrab module to capture a screenshot,
+        then it creates (if necessary) a folder called "screen_states" in the same directory
+        as the script, and saves the screenshot with a unique timestamped filename.
+        The function returns a relative path to the saved screenshot.
+
+        Returns:
+            str: The relative file path (e.g., "./screen_states/20230414_152330.png")
+                 or an error message if the screenshot capture fails.
+
+        Usage:
+            - To capture a uniquely named screenshot, simply call:
+                  capture_screenshot()
+            - You may later refer to the returned file path for further processing.
+        """
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        folder = os.path.join(base_dir, "screen_states")
+        if not os.path.exists(folder):
+            os.makedirs(folder)
+            log_message(f"Created folder for screenshots: {folder}", "SUCCESS")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}.png"
+        file_path = os.path.join(folder, filename)
+        try:
+            from PIL import ImageGrab
+            log_message("Capturing screenshot using Pillow's ImageGrab...", "PROCESS")
+            screenshot = ImageGrab.grab()
+            screenshot.save(file_path)
+            log_message(f"Screenshot captured and saved to {file_path}", "SUCCESS")
+            return f"./screen_states/{filename}"
+        except Exception as e:
+            log_message("Error capturing screenshot: " + str(e), "ERROR")
+            return f"Error: {e}"
+
+    @staticmethod
+    def convert_query_for_image(query, image_path):
+        """
+        Convert a user query to an image-specific query using secondary model inference.
+
+        This function takes the user's query and the file path of an image (as context)
+        and constructs a prompt instructing the secondary agent tool to reframe the query so it
+        specifically pertains to the image content. The secondary_agent_tool is then used to
+        generate a more precise query.
+
+        Args:
+            query (str): The original user query.
+            image_path (str): The file path (absolute or relative) to the image file.
+
+        Returns:
+            str: A refined query string that is more directly related to the image content,
+                 or an error message if something fails.
+
+        Usage:
+            - Call with a sample query and image path:
+                  convert_query_for_image("What is in this picture?", "./image.png")
+        """
+        prompt = (f"Given the user query: '{query}', and the context of the image at '{image_path}', "
+                  "convert this query into a more precise information query related to the image content.")
+        log_message(f"Converting user query for image using prompt: {prompt}", "PROCESS")
+        response = Tools.secondary_agent_tool(prompt, temperature=0.5)
+        log_message("Image query conversion response: " + response, "SUCCESS")
+        return response
+
+    @staticmethod
+    def load_image(image_path):
+        """
+        Verify and load an image from the file system.
+
+        This function checks whether the provided image path corresponds to an existing file.
+        If found, it returns the absolute path to the image; otherwise, it returns an error message.
+
+        Args:
+            image_path (str): The path (relative or absolute) to the image file.
+
+        Returns:
+            str: The absolute path to the image file if it exists, or an error message if not.
+
+        Usage:
+            - To load an image:
+                  load_image("./image.png")
+        """
+        full_path = os.path.abspath(image_path)
+        if os.path.isfile(full_path):
+            log_message(f"Image found at {full_path}", "SUCCESS")
+            return full_path
+        else:
+            log_message(f"Image file not found: {full_path}", "ERROR")
+            return f"Error: Image file not found: {full_path}"
+        
+    @staticmethod
+    async def see_whats_around():
+        """
+        Attempt to capture an image from a locally hosted camera endpoint asynchronously.
+
+        This async version uses the httpx library to perform a non-blocking HTTP GET request
+        to the default camera endpoint (http://127.0.0.1:8234/camera/default_0). It retries the
+        request a few times in case of transient network or camera startup delays. If successful,
+        the image is saved under an "images" directory with a timestamped filename. The function
+        returns the path to the saved image. Otherwise, it returns an error message.
+
+        Returns:
+            str: The absolute path to the saved image if successful, or an error message
+                 if all retries fail or if status code != 200.
+
+        Usage:
+            - Await this function in an async context:
+                  file_path = await see_whats_around()
+        """
         images_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
         if not os.path.exists(images_dir):
             os.makedirs(images_dir, exist_ok=True)
             log_message(f"Images directory created at {images_dir}.", "SUCCESS")
-        url = "http://127.0.0.1:8080/camera/default_0"
-        try:
-            import requests
-            log_message(f"Attempting to capture image from {url}.", "PROCESS")
-            response = requests.get(url, stream=True, timeout=5)
-            if response.status_code == 200:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"camera_{timestamp}.jpg"
-                file_path = os.path.join(images_dir, filename)
-                with open(file_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                log_message("Image captured and saved.", "SUCCESS")
-                return file_path
-            else:
-                log_message(f"Error: Received status code {response.status_code} while capturing image.", "ERROR")
-                return f"Error: {response.status_code}"
-        except Exception as e:
-            log_message(f"Error capturing image: {e}", "ERROR")
-            return f"Error: {e}"
+
+        url = "http://127.0.0.1:8234/camera/default_0"
+        import httpx
+        max_retries = 3
+
+        for attempt in range(max_retries):
+            try:
+                log_message(f"[Attempt {attempt+1}/{max_retries}] Attempting to capture image from {url}", "PROCESS")
+
+                async with httpx.AsyncClient(timeout=5) as client:
+                    response = await client.get(url)
+                    if response.status_code == 200:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        filename = f"camera_{timestamp}.jpg"
+                        file_path = os.path.join(images_dir, filename)
+
+                        with open(file_path, "wb") as f:
+                            async for chunk in response.aiter_bytes(chunk_size=8192):
+                                f.write(chunk)
+
+                        log_message(f"Image captured and saved at: {file_path}", "SUCCESS")
+                        return file_path
+                    else:
+                        log_message(
+                            f"Unexpected status code {response.status_code} while capturing image.",
+                            "WARNING"
+                        )
+            except httpx.RequestError as e:
+                log_message(f"Network or request error occurred: {e}", "WARNING")
+
+            # If we got here, either status_code != 200 or an exception occurred
+            log_message("Retrying after short delay...", "INFO")
+            await asyncio.sleep(1)
+
+        # If all attempts fail, return a final error
+        error_msg = "Error: Unable to capture image after multiple attempts."
+        log_message(error_msg, "ERROR")
+        return error_msg
+
     @staticmethod
     def get_battery_voltage():
+        """
+        Retrieve the battery voltage reading from the user's home directory.
+
+        This function assumes that the battery voltage is stored in a file named "voltage.txt" in the user's home directory.
+        It reads the first line of the file, converts it to a float, and returns the value.
+
+        Returns:
+            float: The battery voltage value.
+
+        Raises:
+            RuntimeError: If the file cannot be read or does not contain a valid number.
+
+        Usage:
+            - To get the battery voltage:
+                  get_battery_voltage()
+        """
         try:
             home_dir = os.path.expanduser("~")
             file_path = os.path.join(home_dir, "voltage.txt")
@@ -656,8 +920,25 @@ class Tools:
         except Exception as e:
             log_message("Error reading battery voltage: " + str(e), "ERROR")
             raise RuntimeError(f"Error reading battery voltage: {e}")
+
     @staticmethod
     def brave_search(topic):
+        """
+        Perform a web search using the Brave API for the given topic.
+
+        This function requires that the environment variable BRAVE_API_KEY is set.
+        It uses this API key to query the Brave search API and returns the search results as text.
+
+        Args:
+            topic (str): The search query/topic.
+
+        Returns:
+            str: The raw JSON response text if successful, or an error message if the search fails.
+
+        Usage:
+            - To search for a topic:
+                  brave_search("latest tech news")
+        """
         api_key = os.environ.get("BRAVE_API_KEY", "")
         if not api_key:
             log_message("BRAVE_API_KEY not set for brave search.", "ERROR")
@@ -682,8 +963,25 @@ class Tools:
         except Exception as e:
             log_message("Error in brave search: " + str(e), "ERROR")
             return f"Error: {e}"
+
     @staticmethod
     def bs4_scrape(url):
+        """
+        Scrape and return the prettified HTML content of the specified URL.
+
+        This function uses the Requests library to fetch the webpage content and BeautifulSoup (with html5lib) to parse
+        and prettify the HTML.
+
+        Args:
+            url (str): The URL of the webpage to scrape.
+
+        Returns:
+            str: The prettified HTML content if successful, or an error message if the scraping fails.
+
+        Usage:
+            - To scrape a webpage:
+                  bs4_scrape("https://example.com")
+        """
         headers = {
             'User-Agent': ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -700,8 +998,26 @@ class Tools:
         except Exception as e:
             log_message("Error during scraping: " + str(e), "ERROR")
             return f"Error during scraping: {e}"
+
     @staticmethod
     def find_file(filename, search_path="."):
+        """
+        Search for a file by name starting from the specified search path.
+
+        This function recursively traverses the directories starting at search_path
+        and returns the first directory in which the file is found.
+
+        Args:
+            filename (str): The name of the file to search for.
+            search_path (str): The directory path to start the search from.
+
+        Returns:
+            str: The directory path containing the file if found, or None if not found.
+
+        Usage:
+            - To find a file:
+                  find_file("data.txt", "/home/user")
+        """
         log_message(f"Searching for file: {filename} in path: {search_path}", "PROCESS")
         for root, dirs, files in os.walk(search_path):
             if filename in files:
@@ -709,8 +1025,23 @@ class Tools:
                 return root
         log_message("File not found.", "WARNING")
         return None
+
     @staticmethod
     def get_current_location():
+        """
+        Retrieve the current geographic location based on the IP address.
+
+        This function makes an HTTP request to the ip-api service to get
+        location data in JSON format.
+
+        Returns:
+            dict: A dictionary with the location data if successful,
+                  or an error message under the "error" key if it fails.
+
+        Usage:
+            - To get the current location:
+                  get_current_location()
+        """
         try:
             import requests
             log_message("Retrieving current location based on IP.", "PROCESS")
@@ -724,8 +1055,22 @@ class Tools:
         except Exception as e:
             log_message("Error retrieving location: " + str(e), "ERROR")
             return {"error": str(e)}
+
     @staticmethod
     def get_system_utilization():
+        """
+        Retrieve current system utilization metrics.
+
+        This function gathers and returns CPU usage, memory usage, and disk usage
+        information in a dictionary.
+
+        Returns:
+            dict: A dictionary containing the keys "cpu_usage", "memory_usage", and "disk_usage".
+
+        Usage:
+            - To check system utilization:
+                  get_system_utilization()
+        """
         utilization = {
             "cpu_usage": psutil.cpu_percent(interval=1),
             "memory_usage": psutil.virtual_memory().percent,
@@ -733,8 +1078,27 @@ class Tools:
         }
         log_message("System utilization retrieved.", "DEBUG")
         return utilization
+
     @staticmethod
     def secondary_agent_tool(prompt: str, temperature: float = 0.7) -> str:
+        """
+        Send an inference request to a secondary agent model.
+
+        This function packages the given prompt (and optional temperature)
+        into a payload, sends it as a request to the secondary model (specified in the configuration),
+        and returns the generated response.
+
+        Args:
+            prompt (str): The prompt to send to the secondary model.
+            temperature (float, optional): The sampling temperature. Defaults to 0.7.
+
+        Returns:
+            str: The model's response text, or an error message if the request fails.
+
+        Usage:
+            - For example:
+                  secondary_agent_tool("Describe this image", temperature=0.5)
+        """
         secondary_model = config["secondary_model"]
         payload = {
             "model": secondary_model,
@@ -750,6 +1114,7 @@ class Tools:
         except Exception as e:
             log_message("Error in secondary agent: " + str(e), "ERROR")
             return f"Error in secondary agent: {e}"
+
 
 class ChatManager:
     def __init__(self, config_manager: ConfigManager, history_manager: HistoryManager,
@@ -994,10 +1359,11 @@ def voice_to_llm_loop(chat_manager: ChatManager):
         # Optionally apply EQ enhancement and playback for debugging.
         audio_to_transcribe = audio_array
         if config.get("debug_audio_playback", False):
-            audio_to_transcribe = apply_eq_boost(audio_array, SAMPLE_RATE)
-            log_message("Playing back the enhanced audio for debugging...", "INFO")
-            sd.play(audio_to_transcribe, samplerate=SAMPLE_RATE)
-            sd.wait()
+                volume = config.get("debug_volume", 1.0)
+                audio_to_transcribe = apply_eq_boost(audio_array, SAMPLE_RATE) * volume
+                log_message("Playing back the enhanced audio for debugging...", "INFO")
+                sd.play(audio_to_transcribe, samplerate=SAMPLE_RATE)
+                sd.wait()
         
         transcription = consensus_whisper_transcribe_helper(
             audio_to_transcribe,
