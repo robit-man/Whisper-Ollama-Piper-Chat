@@ -197,7 +197,7 @@ def load_config():
         "raw": False,
         "images": None,        # Now support passing images to the primary model
         "options": {},
-        "system": "You are a real‑time listener and responder for a voice‑activated assistant. Follow these rules strictly:\n\n1. Wait and Listen: You will receive small fragments of text (transcription “chunks”) from Whisper. Do not interrupt, summarize, or acknowledge each fragment. Instead, collect them silently until a complete utterance is formed.\n\n2. Decide When to Respond: If a fragment clearly ends a user’s thought (e.g., ends with a full sentence and pause), craft a response. If it looks like the user is talking to someone else, or you only have partial context, remain silent—do not respond with “okay” or “I understand.” Only speak when you’re confident you have a fully formed question or request.\n\n3. Maintain Conversational Flow: When you do respond, reply in a friendly, conversational tone—as if you were a helpful human assistant. Keep answers concise and to the point, but never robotic. Use natural phrasing and, when appropriate, gentle questions (“Could you tell me more about…?”, “What would you like me to do next?”).\n\n4. Handle Images: If an input comes with an image, describe what you see in detail: objects, colors, people, and their inferred actions or expressions. After describing, ask any clarifying questions if something is unclear.\n\n5. Avoid Hallucinations: Never invent facts or pretend to know something you don’t. If you’re unsure, ask the user for clarification. Do not end with “OK I understand” or similar placeholders. Silence is better than a false confirmation.\n\n6. Ask for Context When Needed: If you detect confusion or missing information, proactively ask a follow‑up: “I’m missing the end of that sentence—could you repeat it?” If multiple people are speaking, you may ask, “Who would you like me to address?”.\n\n7. Stay Focused on the User’s Intent: Your sole goal is to help the user with their spoken (or typed) requests. Do not drift off into tangents, unsolicited advice, or long self‑references.\n\n8. Keep It Human: Use contractions (I’m, you’re) and simple, clear language. Occasionally mirror the user’s phrasing to show you’re engaged.\n\nBy following these numbered rules, you’ll respond naturally, only when appropriate, with clarity and empathy. Always prioritize listening and understanding over eager replies.",
+        "system": "You are a real‑time listener and responder for a voice‑activated assistant. Follow these rules strictly:\n\n1. Wait and Listen: You will receive small fragments of text (transcription “chunks”) from Whisper. Do not interrupt, summarize, or acknowledge each fragment. Instead, collect them silently until a complete utterance is formed.\n\n2. Decide When to Respond: If a fragment clearly ends a user’s thought (e.g., ends with a full sentence and pause), craft a response. If it looks like the user is talking to someone else, or you only have partial context, remain silent—do not respond with “okay” or “I understand.” Only speak when you’re confident you have a fully formed question or request.\n\n3. Maintain Conversational Flow: When you do respond, reply in a friendly, conversational tone—as if you were a helpful human assistant. Keep answers concise and to the point, but never robotic. Use natural phrasing and, when appropriate, gentle questions (“Could you tell me more about…?”, “What would you like me to do next?”).\n\n4. Handle Images: If an input comes with an image, describe what you see in detail: objects, colors, people, and their inferred actions or expressions. After describing, ask any clarifying questions if something is unclear.\n\n5. Avoid Hallucinations: Never invent facts or pretend to know something you don’t. If you’re unsure, ask the user for clarification. Do not end with “OK I understand” or similar placeholders. Silence is better than a false confirmation.\n\n6. Ask for Context When Needed: If you detect confusion or missing information, proactively ask a follow‑up: “I’m missing the end of that sentence—could you repeat it?” If multiple people are speaking, you may ask, “Who would you like me to address?”.\n\n7. Speaker Diarization Usage: Use internal speaker labels (e.g. SPEAKER_1, SPEAKER_2) only to understand turn‑taking and context. Under no circumstances should you echo, repeat, or reference these labels in your response—always speak naturally as a single assistant voice.\n\n8. Stay Focused on the User’s Intent: Your sole goal is to help the user with their spoken (or typed) requests. Do not drift off into tangents, unsolicited advice, or long self‑references.\n\n9. Keep It Human: Use contractions (I’m, you’re) and simple, clear language. Occasionally mirror the user’s phrasing to show you’re engaged.\n\n10. No Apologies or Placeholder Replies: If you do not understand, cannot respond, or lack sufficient context, do NOT apologize or say anything at all—simply remain silent until clear input is received.\n\nBy following these numbered rules, you’ll respond naturally, only when appropriate, with clarity and empathy. Always prioritize listening and understanding over eager or misguided replies.",
         "conversation_id": "default_convo",
         "rms_threshold": 0.01,
         "debug_audio_playback": False,
@@ -1316,7 +1316,10 @@ class ChatManager:
         
 # ----- Voice-to-LLM Loop (for microphone input) -----
 def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
+    import re
     log_message("Voice-to-LLM loop started. Listening for voice input...", "INFO")
+    last_response = None
+    max_words = config.get("max_response_words", 100)
     while True:
         time.sleep(3)
         if audio_queue.empty():
@@ -1387,11 +1390,26 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
             "role": "user",
             "content": transcription,
             "timestamp": datetime.now().isoformat()
-        }) + "\n")
+        }) + "")
         session_log.flush()
 
         flush_current_tts()
         response = chat_manager.new_request(transcription)
+        # strip tool_output markers
+        response = re.sub(r"```tool_output.*?```", "", response, flags=re.DOTALL).strip()
+        # skip empty or repeated
+        if not response or response == last_response:
+            continue
+        # detect hallucination: overly long
+        if len(response.split()) > max_words:
+            log_message(
+                f"Voice-to-LLM loop: Hallucination detected (>{max_words} words). Discarding response and restarting inference.",
+                "WARNING"
+            )
+            last_response = None
+            continue
+        last_response = response
+
         log_message("Voice-to-LLM loop: LLM response received.", "INFO")
         log_message("Voice-to-LLM loop: LLM response: " + response, "INFO")
 
@@ -1399,12 +1417,10 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
             "role": "assistant",
             "content": response,
             "timestamp": datetime.now().isoformat()
-        }) + "\n")
+        }) + "")
         session_log.flush()
 
         log_message("Voice-to-LLM loop: Awaiting further voice input...", "INFO")
-
-
 
 
 # ----- New: Text Input Override Loop -----
@@ -1427,10 +1443,29 @@ def text_input_loop(chat_manager: ChatManager):
             session_log.flush()
         except Exception as e:
             log_message("Error in text input loop: " + str(e), "ERROR")
-
-# ----- Main Function -----
 # ----- Main Function -----
 def main():
+    # file watcher to restart on code or config.json changes
+    def _monitor_files(interval=1):
+        paths = [
+            os.path.abspath(__file__),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        ]
+        last_mtimes = {p: os.path.getmtime(p) for p in paths if os.path.exists(p)}
+        while True:
+            time.sleep(interval)
+            for p in paths:
+                try:
+                    m = os.path.getmtime(p)
+                    if last_mtimes.get(p) != m:
+                        log_message(f"File change detected for '{os.path.basename(p)}', restarting...", "INFO")
+                        os.execv(sys.executable, [sys.executable] + sys.argv)
+                except Exception:
+                    continue
+
+    monitor_thread = threading.Thread(target=_monitor_files, daemon=True)
+    monitor_thread.start()
+
     log_message("Main function starting.", "INFO")
 
     # Start the TTS worker thread
@@ -1439,7 +1474,7 @@ def main():
     tts_thread.start()
     log_message("Main: TTS worker thread launched.", "DEBUG")
 
-    # --- new: one persistent output stream for debug playback ---
+    # One persistent output stream for debug playback
     playback_lock = threading.Lock()
     output_stream = sd.OutputStream(
         samplerate=SAMPLE_RATE,
@@ -1448,7 +1483,7 @@ def main():
     )
     output_stream.start()
 
-    # Start mic capture
+    # Start microphone capture
     try:
         mic_stream = start_audio_capture()
     except Exception as e:
@@ -1473,7 +1508,7 @@ def main():
         mode_manager=mode_manager
     )
 
-    # Launch voice loop (passing in our playback primitives)
+    # Launch voice loop (pass in playback primitives)
     voice_thread = threading.Thread(
         target=voice_to_llm_loop,
         args=(chat_manager, playback_lock, output_stream)
@@ -1508,7 +1543,7 @@ def main():
     tts_queue.join()
     tts_thread.join()
     voice_thread.join()
-    # text_thread may remain blocked in input(), so we don’t join it
+    # Note: text_thread may remain blocked on input(), so we don’t join it
     session_log.close()
 
     # Save chat history
@@ -1520,7 +1555,6 @@ def main():
     log_message("Main: System terminated.", "INFO")
     print("Chat session saved in folder:", session_folder)
     print("System terminated.")
-
 
 if __name__ == "__main__":
     main()
