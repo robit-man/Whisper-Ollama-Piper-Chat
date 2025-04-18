@@ -197,7 +197,7 @@ def load_config():
         "raw": False,
         "images": None,        # Now support passing images to the primary model
         "options": {},
-        "system": "You are a helpful assistant.",
+        "system": "You are a real‑time listener and responder for a voice‑activated assistant. Follow these rules strictly:\n\n1. Wait and Listen: You will receive small fragments of text (transcription “chunks”) from Whisper. Do not interrupt, summarize, or acknowledge each fragment. Instead, collect them silently until a complete utterance is formed.\n\n2. Decide When to Respond: If a fragment clearly ends a user’s thought (e.g., ends with a full sentence and pause), craft a response. If it looks like the user is talking to someone else, or you only have partial context, remain silent—do not respond with “okay” or “I understand.” Only speak when you’re confident you have a fully formed question or request.\n\n3. Maintain Conversational Flow: When you do respond, reply in a friendly, conversational tone—as if you were a helpful human assistant. Keep answers concise and to the point, but never robotic. Use natural phrasing and, when appropriate, gentle questions (“Could you tell me more about…?”, “What would you like me to do next?”).\n\n4. Handle Images: If an input comes with an image, describe what you see in detail: objects, colors, people, and their inferred actions or expressions. After describing, ask any clarifying questions if something is unclear.\n\n5. Avoid Hallucinations: Never invent facts or pretend to know something you don’t. If you’re unsure, ask the user for clarification. Do not end with “OK I understand” or similar placeholders. Silence is better than a false confirmation.\n\n6. Ask for Context When Needed: If you detect confusion or missing information, proactively ask a follow‑up: “I’m missing the end of that sentence—could you repeat it?” If multiple people are speaking, you may ask, “Who would you like me to address?”.\n\n7. Stay Focused on the User’s Intent: Your sole goal is to help the user with their spoken (or typed) requests. Do not drift off into tangents, unsolicited advice, or long self‑references.\n\n8. Keep It Human: Use contractions (I’m, you’re) and simple, clear language. Occasionally mirror the user’s phrasing to show you’re engaged.\n\nBy following these numbered rules, you’ll respond naturally, only when appropriate, with clarity and empathy. Always prioritize listening and understanding over eager replies.",
         "conversation_id": "default_convo",
         "rms_threshold": 0.01,
         "debug_audio_playback": False,
@@ -254,11 +254,14 @@ from num2words import num2words
 import sounddevice as sd  # For debug audio playback
 import numpy as np
 from scipy.signal import butter, lfilter  # For EQ enhancement
+import noisereduce as nr
 import torch
 from denoiser import pretrained  # For speech enhancement via denoiser
 from PIL import ImageGrab  # Ensure Pillow is installed
 
 load_dotenv()
+brave_api_key = os.environ.get("BRAVE_API_KEY")
+print(brave_api_key)
 log_message("Environment variables loaded using dotenv", "INFO")
 
 # ----- Load Whisper Models -----
@@ -386,16 +389,36 @@ def tts_worker(q):
         text = q.get()
         if text is None:
             log_message("TTS worker received shutdown signal.", "DEBUG")
+            q.task_done()
             break
         process_tts_request(text)
         q.task_done()
+
+def assemble_mixed_data(data):
+    """
+    Assembles a mixed set of variables, strings, and other data types into a single string.
+
+    Args:
+        data: An arbitrary collection (list, tuple, set, etc.) containing variables,
+              strings, and other data types.  The order of elements in the input
+              collection determines the order in the output string.
+
+    Returns:
+        A single string formed by converting each element in the input collection
+        to a string and concatenating them in the original order.
+    """
+
+    result = ""
+    for item in data:
+        result += str(item)  # Convert each item to a string and append
+
+    return result
 
 # ----- Microphone Audio Capture -----
 def audio_callback(indata, frames, time_info, status):
     if status:
         log_message("Audio callback status: " + str(status), "WARNING")
     audio_queue.put(indata.copy())
-    #log_message("Audio callback received data chunk.", "DEBUG")
 
 def start_audio_capture():
     log_message("Starting microphone capture...", "PROCESS")
@@ -404,42 +427,167 @@ def start_audio_capture():
     log_message("Microphone capture started.", "SUCCESS")
     return stream
 
-# ----- EQ-based Audio Enhancement Helper -----
-def apply_eq_boost(audio, sample_rate, lowcut=300, highcut=3000, gain=2.0):
+def dynamic_range_normalize(
+    audio: np.ndarray,
+    sr: int,
+    frame_ms: float = 20,
+    hop_ms: float = 10,
+    target_rms: float = 0.1,
+    eps: float = 1e-6,
+    smoothing_coef: float = 0.9
+) -> np.ndarray:
+    """
+    1) Split into overlapping frames.
+    2) Compute per-frame RMS.
+    3) Compute gain = target_rms / (frame_rms + eps).
+    4) Smooth gains across time.
+    5) Apply and overlap-add back.
+    """
+    frame_len = int(sr * frame_ms/1000)
+    hop_len   = int(sr * hop_ms/1000)
+    # pad to fit an integer number of hops
+    pad = (frame_len - (len(audio) - frame_len) % hop_len) % hop_len
+    audio_p = np.concatenate([audio, np.zeros(pad, dtype=audio.dtype)])
+    gains = []
+    # analysis
+    for start in range(0, len(audio_p)-frame_len+1, hop_len):
+        frame = audio_p[start:start+frame_len]
+        rms = np.sqrt(np.mean(frame**2))
+        gain = np.sqrt(target_rms**2 / (rms**2 + eps))
+        gains.append(gain)
+    gains = np.array(gains, dtype=np.float32)
+    # simple smoothing (IIR)
+    for i in range(1, len(gains)):
+        gains[i] = smoothing_coef * gains[i-1] + (1-smoothing_coef)*gains[i]
+    # synthesis
+    out = np.zeros_like(audio_p)
+    win = np.hanning(frame_len)
+    idx = 0
+    for i, g in enumerate(gains):
+        start = i*hop_len
+        out[start:start+frame_len] += g * (audio_p[start:start+frame_len] * win)
+    # compensate for the window overlap
+    norm = np.zeros_like(audio_p)
+    for i in range(len(gains)):
+        norm[i*hop_len:i*hop_len+frame_len] += win
+    out /= (norm + eps)
+    return out[:len(audio)]
+
+def apply_eq_and_denoise(
+    audio: np.ndarray,
+    sample_rate: int,
+    lowcut: float = 300.0,
+    highcut: float = 4000.0,
+    eq_gain: float = 2.0,
+    pre_emphasis_coef: float = 0.99,
+    compress_thresh: float = 0.1,
+    compress_ratio: float = 4.0
+) -> np.ndarray:
+    """
+    0) Dynamic range normalization to boost distant/quiet speech.
+    1) Noise reduction via spectral gating.
+    2) Pre‑emphasis filter.
+    3) Band‑pass EQ boost.
+    4) Simple dynamic range compression.
+
+    Args:
+        audio:       1‑D float32 waveform (–1.0 to +1.0).
+        sample_rate: Sampling rate in Hz.
+        lowcut:      Low frequency cutoff for band‑pass.
+        highcut:     High frequency cutoff for band‑pass.
+        eq_gain:     Multiplier for the band‑passed component.
+        pre_emphasis_coef:
+                     Coefficient for pre‑emphasis filter.
+        compress_thresh:
+                     Threshold (fraction of max) above which to compress.
+        compress_ratio:
+                     Compression ratio (e.g. 4:1).
+
+    Returns:
+        Enhanced audio, float32 in [–1, +1].
+    """
+    # --- 0) Dynamic range normalization ---
+    try:
+        log_message("Enhancement: Normalizing dynamic range...", "PROCESS")
+        audio = dynamic_range_normalize(
+            audio,
+            sample_rate,
+            frame_ms=20,
+            hop_ms=10,
+            target_rms=0.3,
+            smoothing_coef=0.9
+        )
+        log_message("Enhancement: Dynamic range normalization complete.", "SUCCESS")
+    except Exception as e:
+        log_message(f"Enhancement: Dynamic range normalization failed: {e}", "WARNING")
+
+    # --- 1) Noise reduction ---
+    try:
+        log_message("Enhancement: Reducing noise via spectral gating...", "PROCESS")
+        denoised = nr.reduce_noise(
+            y=audio,
+            sr=sample_rate,
+            prop_decrease=1.0,
+            stationary=False
+        )
+        log_message("Enhancement: Noise reduction complete.", "SUCCESS")
+    except Exception as e:
+        log_message(f"Enhancement: Noise reduction failed: {e}", "WARNING")
+        denoised = audio
+
+    # --- 2) Pre‑emphasis filter (boost highs) ---
+    log_message("Enhancement: Applying pre‑emphasis filter...", "PROCESS")
+    emphasized = np.append(
+        denoised[0],
+        denoised[1:] - pre_emphasis_coef * denoised[:-1]
+    )
+
+    # --- 3) Band‑pass EQ boost ---
+    log_message("Enhancement: Applying band‑pass EQ...", "PROCESS")
     nyq = 0.5 * sample_rate
     low = lowcut / nyq
     high = highcut / nyq
     b, a = butter(2, [low, high], btype="band")
-    band = lfilter(b, a, audio)
-    audio_boosted = audio + (gain - 1.0) * band
-    max_val = np.max(np.abs(audio_boosted))
-    if max_val > 1:
-        audio_boosted = audio_boosted / max_val
-    log_message("EQ boost applied to audio.", "DEBUG")
-    return audio_boosted.astype(np.float32)
+    band = lfilter(b, a, emphasized)
+    eq_boosted = emphasized + (eq_gain - 1.0) * band
+
+    # Normalize to prevent clipping before compression
+    max_val = np.max(np.abs(eq_boosted))
+    if max_val > 1.0:
+        eq_boosted = eq_boosted / max_val
+
+    # --- 4) Simple dynamic range compression ---
+    log_message("Enhancement: Applying dynamic range compression...", "PROCESS")
+    thresh = compress_thresh * np.max(np.abs(eq_boosted))
+    compressed = np.copy(eq_boosted)
+    over_thresh = np.abs(eq_boosted) > thresh
+    compressed[over_thresh] = (
+        np.sign(eq_boosted[over_thresh]) *
+        (thresh + (np.abs(eq_boosted[over_thresh]) - thresh) / compress_ratio)
+    )
+
+    # Final normalization
+    final_max = np.max(np.abs(compressed))
+    if final_max > 1.0:
+        compressed = compressed / final_max
+
+    log_message("Enhancement: Audio enhancement complete.", "DEBUG")
+    return compressed.astype(np.float32)
+
 
 def clean_text(text):
-    # Compile a regex pattern to match the emoji ranges
     emoji_pattern = re.compile("["
         u"\U0001F600-\U0001F64F"  # emoticons
         u"\U0001F300-\U0001F5FF"  # symbols & pictographs
         u"\U0001F680-\U0001F6FF"  # transport & map symbols
         u"\U0001F1E0-\U0001F1FF"  # flags (iOS)
                            "]+", flags=re.UNICODE)
-    # Remove emojis from the text
     text = emoji_pattern.sub(r'', text)
-    # Remove asterisk symbols
-    cleaned = text.replace("*", "")
-    # First remove triple backticks followed by tool_output
-    cleaned = cleaned.replace("```tool_output", "")
-    # Then remove any remaining tool_call and tool_output substrings
-    cleaned = cleaned.replace("tool_call", "").replace("tool_output", "")
-    # Return the cleaned text without any logging or tool calls
+    cleaned = text.replace("*", "").replace("```tool_output", "").replace("tool_call", "").replace("tool_output", "")
     return cleaned
 
 # ----- Consensus Transcription Helper -----
 def consensus_whisper_transcribe_helper(audio_array, language="en", rms_threshold=0.01, consensus_threshold=0.8):
-    # First check RMS level to reject low-volume chunks
     rms = np.sqrt(np.mean(np.square(audio_array)))
     if rms < rms_threshold:
         log_message("Audio RMS too low (RMS: {:.5f}). Skipping transcription.".format(rms), "WARNING")
@@ -448,7 +596,6 @@ def consensus_whisper_transcribe_helper(audio_array, language="en", rms_threshol
     transcription_base = ""
     transcription_medium = ""
     
-    # Worker functions for threading
     def transcribe_with_base():
         nonlocal transcription_base
         try:
@@ -469,7 +616,6 @@ def consensus_whisper_transcribe_helper(audio_array, language="en", rms_threshol
         except Exception as e:
             log_message("Error during medium transcription: " + str(e), "ERROR")
     
-    # Run both transcriptions concurrently in separate threads.
     thread_base = threading.Thread(target=transcribe_with_base)
     thread_medium = threading.Thread(target=transcribe_with_medium)
     thread_base.start()
@@ -477,12 +623,10 @@ def consensus_whisper_transcribe_helper(audio_array, language="en", rms_threshol
     thread_base.join()
     thread_medium.join()
     
-    # If either transcription is empty, discard.
     if not transcription_base or not transcription_medium:
         log_message("One of the models returned no transcription.", "WARNING")
         return ""
     
-    # Compare the two transcriptions
     similarity = difflib.SequenceMatcher(None, transcription_base, transcription_medium).ratio()
     log_message(f"Transcription similarity: {similarity:.2f}", "INFO")
     if similarity >= consensus_threshold:
@@ -681,21 +825,6 @@ class Tools:
 
     @staticmethod
     def capture_screen():
-        """
-        Capture the current screen using the pyautogui library.
-
-        This function takes no arguments. It utilizes pyautogui's screenshot
-        capability to capture the current state of the screen and saves it as a file
-        called "temp_screen.png" in the same directory as this script.
-
-        Returns:
-            str: The absolute path to the saved screenshot file, or an error message if capture fails.
-
-        Usage:
-            - To capture the screen, simply call:
-                  capture_screen()
-            - The result will be the file path to "temp_screen.png".
-        """
         try:
             import pyautogui
             log_message("Capturing screen using pyautogui...", "PROCESS")
@@ -710,23 +839,6 @@ class Tools:
 
     @staticmethod
     def capture_screenshot():
-        """
-        Capture a screenshot using Pillow's ImageGrab and save it uniquely.
-
-        This function uses Pillow's ImageGrab module to capture a screenshot,
-        then it creates (if necessary) a folder called "screen_states" in the same directory
-        as the script, and saves the screenshot with a unique timestamped filename.
-        The function returns a relative path to the saved screenshot.
-
-        Returns:
-            str: The relative file path (e.g., "./screen_states/20230414_152330.png")
-                 or an error message if the screenshot capture fails.
-
-        Usage:
-            - To capture a uniquely named screenshot, simply call:
-                  capture_screenshot()
-            - You may later refer to the returned file path for further processing.
-        """
         base_dir = os.path.dirname(os.path.abspath(__file__))
         folder = os.path.join(base_dir, "screen_states")
         if not os.path.exists(folder):
@@ -748,26 +860,6 @@ class Tools:
 
     @staticmethod
     def convert_query_for_image(query, image_path):
-        """
-        Convert a user query to an image-specific query using secondary model inference.
-
-        This function takes the user's query and the file path of an image (as context)
-        and constructs a prompt instructing the secondary agent tool to reframe the query so it
-        specifically pertains to the image content. The secondary_agent_tool is then used to
-        generate a more precise query.
-
-        Args:
-            query (str): The original user query.
-            image_path (str): The file path (absolute or relative) to the image file.
-
-        Returns:
-            str: A refined query string that is more directly related to the image content,
-                 or an error message if something fails.
-
-        Usage:
-            - Call with a sample query and image path:
-                  convert_query_for_image("What is in this picture?", "./image.png")
-        """
         prompt = (f"Given the user query: '{query}', and the context of the image at '{image_path}', "
                   "convert this query into a more precise information query related to the image content.")
         log_message(f"Converting user query for image using prompt: {prompt}", "PROCESS")
@@ -777,22 +869,6 @@ class Tools:
 
     @staticmethod
     def load_image(image_path):
-        """
-        Verify and load an image from the file system.
-
-        This function checks whether the provided image path corresponds to an existing file.
-        If found, it returns the absolute path to the image; otherwise, it returns an error message.
-
-        Args:
-            image_path (str): The path (relative or absolute) to the image file.
-
-        Returns:
-            str: The absolute path to the image file if it exists, or an error message if not.
-
-        Usage:
-            - To load an image:
-                  load_image("./image.png")
-        """
         full_path = os.path.abspath(image_path)
         if os.path.isfile(full_path):
             log_message(f"Image found at {full_path}", "SUCCESS")
@@ -803,84 +879,39 @@ class Tools:
         
     @staticmethod
     async def see_whats_around():
-        """
-        Attempt to capture an image from a locally hosted camera endpoint asynchronously.
-
-        This async version uses the httpx library to perform a non-blocking HTTP GET request
-        to the default camera endpoint (http://127.0.0.1:8234/camera/default_0). It retries the
-        request a few times in case of transient network or camera startup delays. If successful,
-        the image is saved under an "images" directory with a timestamped filename. The function
-        returns the path to the saved image. Otherwise, it returns an error message.
-
-        Returns:
-            str: The absolute path to the saved image if successful, or an error message
-                 if all retries fail or if status code != 200.
-
-        Usage:
-            - Await this function in an async context:
-                  file_path = await see_whats_around()
-        """
         images_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
         if not os.path.exists(images_dir):
             os.makedirs(images_dir, exist_ok=True)
             log_message(f"Images directory created at {images_dir}.", "SUCCESS")
-
         url = "http://127.0.0.1:8234/camera/default_0"
         import httpx
         max_retries = 3
-
         for attempt in range(max_retries):
             try:
                 log_message(f"[Attempt {attempt+1}/{max_retries}] Attempting to capture image from {url}", "PROCESS")
-
                 async with httpx.AsyncClient(timeout=5) as client:
                     response = await client.get(url)
                     if response.status_code == 200:
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         filename = f"camera_{timestamp}.jpg"
                         file_path = os.path.join(images_dir, filename)
-
                         with open(file_path, "wb") as f:
                             async for chunk in response.aiter_bytes(chunk_size=8192):
                                 f.write(chunk)
-
                         log_message(f"Image captured and saved at: {file_path}", "SUCCESS")
                         return file_path
                     else:
-                        log_message(
-                            f"Unexpected status code {response.status_code} while capturing image.",
-                            "WARNING"
-                        )
+                        log_message(f"Unexpected status code {response.status_code} while capturing image.", "WARNING")
             except httpx.RequestError as e:
                 log_message(f"Network or request error occurred: {e}", "WARNING")
-
-            # If we got here, either status_code != 200 or an exception occurred
             log_message("Retrying after short delay...", "INFO")
             await asyncio.sleep(1)
-
-        # If all attempts fail, return a final error
         error_msg = "Error: Unable to capture image after multiple attempts."
         log_message(error_msg, "ERROR")
         return error_msg
 
     @staticmethod
     def get_battery_voltage():
-        """
-        Retrieve the battery voltage reading from the user's home directory.
-
-        This function assumes that the battery voltage is stored in a file named "voltage.txt" in the user's home directory.
-        It reads the first line of the file, converts it to a float, and returns the value.
-
-        Returns:
-            float: The battery voltage value.
-
-        Raises:
-            RuntimeError: If the file cannot be read or does not contain a valid number.
-
-        Usage:
-            - To get the battery voltage:
-                  get_battery_voltage()
-        """
         try:
             home_dir = os.path.expanduser("~")
             file_path = os.path.join(home_dir, "voltage.txt")
@@ -894,23 +925,7 @@ class Tools:
 
     @staticmethod
     def brave_search(topic):
-        """
-        Perform a web search using the Brave API for the given topic.
-
-        This function requires that the environment variable BRAVE_API_KEY is set.
-        It uses this API key to query the Brave search API and returns the search results as text.
-
-        Args:
-            topic (str): The search query/topic.
-
-        Returns:
-            str: The raw JSON response text if successful, or an error message if the search fails.
-
-        Usage:
-            - To search for a topic:
-                  brave_search("latest tech news")
-        """
-        api_key = os.environ.get("BRAVE_API_KEY", "")
+        api_key = brave_api_key
         if not api_key:
             log_message("BRAVE_API_KEY not set for brave search.", "ERROR")
             return "Error: BRAVE_API_KEY not set."
@@ -937,22 +952,6 @@ class Tools:
         
     @staticmethod
     def search_internet(topic):
-        """
-        Perform a web search using the Brave API for the given topic.
-
-        This function requires that the environment variable BRAVE_API_KEY is set.
-        It uses this API key to query the Brave search API and returns the search results as text.
-
-        Args:
-            topic (str): The search query/topic.
-
-        Returns:
-            str: The raw JSON response text if successful, or an error message if the search fails.
-
-        Usage:
-            - To search for a topic:
-                  brave_search("latest tech news")
-        """
         api_key = os.environ.get("BRAVE_API_KEY", "")
         if not api_key:
             log_message("BRAVE_API_KEY not set for brave search.", "ERROR")
@@ -980,22 +979,6 @@ class Tools:
 
     @staticmethod
     def bs4_scrape(url):
-        """
-        Scrape and return the prettified HTML content of the specified URL.
-
-        This function uses the Requests library to fetch the webpage content and BeautifulSoup (with html5lib) to parse
-        and prettify the HTML.
-
-        Args:
-            url (str): The URL of the webpage to scrape.
-
-        Returns:
-            str: The prettified HTML content if successful, or an error message if the scraping fails.
-
-        Usage:
-            - To scrape a webpage:
-                  bs4_scrape("https://example.com")
-        """
         headers = {
             'User-Agent': ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1015,23 +998,6 @@ class Tools:
 
     @staticmethod
     def find_file(filename, search_path="."):
-        """
-        Search for a file by name starting from the specified search path.
-
-        This function recursively traverses the directories starting at search_path
-        and returns the first directory in which the file is found.
-
-        Args:
-            filename (str): The name of the file to search for.
-            search_path (str): The directory path to start the search from.
-
-        Returns:
-            str: The directory path containing the file if found, or None if not found.
-
-        Usage:
-            - To find a file:
-                  find_file("data.txt", "/home/user")
-        """
         log_message(f"Searching for file: {filename} in path: {search_path}", "PROCESS")
         for root, dirs, files in os.walk(search_path):
             if filename in files:
@@ -1042,20 +1008,6 @@ class Tools:
 
     @staticmethod
     def get_current_location():
-        """
-        Retrieve the current geographic location based on the IP address.
-
-        This function makes an HTTP request to the ip-api service to get
-        location data in JSON format.
-
-        Returns:
-            dict: A dictionary with the location data if successful,
-                  or an error message under the "error" key if it fails.
-
-        Usage:
-            - To get the current location:
-                  get_current_location()
-        """
         try:
             import requests
             log_message("Retrieving current location based on IP.", "PROCESS")
@@ -1072,19 +1024,6 @@ class Tools:
 
     @staticmethod
     def get_system_utilization():
-        """
-        Retrieve current system utilization metrics.
-
-        This function gathers and returns CPU usage, memory usage, and disk usage
-        information in a dictionary.
-
-        Returns:
-            dict: A dictionary containing the keys "cpu_usage", "memory_usage", and "disk_usage".
-
-        Usage:
-            - To check system utilization:
-                  get_system_utilization()
-        """
         utilization = {
             "cpu_usage": psutil.cpu_percent(interval=1),
             "memory_usage": psutil.virtual_memory().percent,
@@ -1095,24 +1034,6 @@ class Tools:
 
     @staticmethod
     def secondary_agent_tool(prompt: str, temperature: float = 0.7) -> str:
-        """
-        Send an inference request to a secondary agent model.
-
-        This function packages the given prompt (and optional temperature)
-        into a payload, sends it as a request to the secondary model (specified in the configuration),
-        and returns the generated response.
-
-        Args:
-            prompt (str): The prompt to send to the secondary model.
-            temperature (float, optional): The sampling temperature. Defaults to 0.7.
-
-        Returns:
-            str: The model's response text, or an error message if the request fails.
-
-        Usage:
-            - For example:
-                  secondary_agent_tool("Describe this image", temperature=0.5)
-        """
         secondary_model = config["secondary_model"]
         payload = {
             "model": secondary_model,
@@ -1149,6 +1070,7 @@ class ChatManager:
         log_message("ChatManager initialized.", "DEBUG")
     
     def build_payload(self):
+        log_message("ChatManager.build_payload: Building payload...", "DEBUG")
         cfg = self.config_manager.config
         system_prompt = cfg.get("system", "")
         tools_source = ""
@@ -1167,12 +1089,12 @@ class ChatManager:
             "When a function call is executed, its response will be wrapped in triple backticks with the label `tool_output`."
         )
         system_message = {"role": "system", "content": system_prompt + "\n\n" + tool_instructions}
-        log_message("System message constructed for payload.", "DEBUG")
+        log_message("ChatManager.build_payload: System message constructed.", "DEBUG")
         if self.history_manager.history:
             last_user_msg = next((msg["content"] for msg in reversed(self.history_manager.history) if msg["role"] == "user"), "")
             _ = Utils.embed_text(last_user_msg)
             mem_context = ""
-            log_message("Memory context extracted from history.", "DEBUG")
+            log_message("ChatManager.build_payload: Memory context extracted from history.", "DEBUG")
         else:
             mem_context = ""
         summary_text = ""
@@ -1196,99 +1118,101 @@ class ChatManager:
             payload["tools"] = self.tools_data
         if cfg["options"]:
             payload["options"] = cfg["options"]
-        log_message("Payload for chat completion built.", "SUCCESS")
+        log_message("ChatManager.build_payload: Payload built successfully.", "DEBUG")
         return payload
 
     def chat_completion_stream(self, processed_text):
+        log_message("ChatManager.chat_completion_stream: Starting streaming chat completion...", "DEBUG")
         payload = self.build_payload()
         tokens = ""
         model = self.config_manager.config["primary_model"]
         try:
-            log_message("Starting streaming chat completion...", "PROCESS")
             stream = chat(model=model,
                           messages=payload["messages"],
                           stream=self.config_manager.config["stream"])
             for part in stream:
                 if self.stop_flag:
-                    log_message("Stop flag detected during streaming.", "WARNING")
+                    log_message("ChatManager.chat_completion_stream: Stop flag detected.", "WARNING")
                     yield "", True
                     return
                 content = part["message"]["content"]
                 tokens += content
                 with display_state.lock:
                     display_state.current_tokens = tokens
+                log_message(f"ChatManager.chat_completion_stream: Received token: {content}", "DEBUG")
                 yield content, part.get("done", False)
                 if part.get("done", False):
-                    log_message("Streaming chat completion finished.", "SUCCESS")
+                    log_message("ChatManager.chat_completion_stream: Streaming chat completion finished.", "DEBUG")
                     break
         except Exception as e:
-            # Automatic pull on missing model
             if "not found" in str(e).lower():
-                log_message(f"Model {model} not found, pulling it now...", "WARNING")
+                log_message(f"ChatManager.chat_completion_stream: Model {model} not found, pulling it now...", "WARNING")
                 try:
                     from ollama import pull
                     pull(model)
-                    log_message(f"Model {model} pulled successfully. Retrying streaming chat completion.", "SUCCESS")
+                    log_message(f"ChatManager.chat_completion_stream: Model {model} pulled successfully. Retrying...", "DEBUG")
                     stream = chat(model=model,
                                   messages=payload["messages"],
                                   stream=self.config_manager.config["stream"])
                     for part in stream:
                         if self.stop_flag:
-                            log_message("Stop flag detected during streaming.", "WARNING")
+                            log_message("ChatManager.chat_completion_stream: Stop flag detected during retry.", "WARNING")
                             yield "", True
                             return
                         content = part["message"]["content"]
                         tokens += content
                         with display_state.lock:
                             display_state.current_tokens = tokens
+                        log_message(f"ChatManager.chat_completion_stream (retry): Received token: {content}", "DEBUG")
                         yield content, part.get("done", False)
                         if part.get("done", False):
-                            log_message("Streaming chat completion finished.", "SUCCESS")
+                            log_message("ChatManager.chat_completion_stream (retry): Finished.", "DEBUG")
                             break
                 except Exception as e2:
-                    log_message("Error during model pull or retry: " + str(e2), "ERROR")
+                    log_message("ChatManager.chat_completion_stream: Error during model pull or retry: " + str(e2), "ERROR")
                     yield "", True
             else:
-                log_message("Error during streaming chat completion: " + str(e), "ERROR")
+                log_message("ChatManager.chat_completion_stream: Error during streaming chat completion: " + str(e), "ERROR")
                 yield "", True
 
     def chat_completion_nonstream(self, processed_text):
+        log_message("ChatManager.chat_completion_nonstream: Starting non-streaming chat completion...", "DEBUG")
         payload = self.build_payload()
         model = self.config_manager.config["primary_model"]
         try:
-            log_message("Starting non-streaming chat completion...", "PROCESS")
             response = chat(model=model,
                             messages=payload["messages"],
                             stream=False)
-            log_message("Non-streaming chat completion finished.", "SUCCESS")
+            log_message("ChatManager.chat_completion_nonstream: Non-streaming chat completion finished.", "DEBUG")
             return response["message"]["content"]
         except Exception as e:
             if "not found" in str(e).lower():
-                log_message(f"Model {model} not found, pulling it now...", "WARNING")
+                log_message(f"ChatManager.chat_completion_nonstream: Model {model} not found, pulling it now...", "WARNING")
                 try:
                     from ollama import pull
                     pull(model)
-                    log_message(f"Model {model} pulled successfully. Retrying non-streaming chat completion.", "SUCCESS")
+                    log_message(f"ChatManager.chat_completion_nonstream: Model {model} pulled successfully. Retrying...", "DEBUG")
                     response = chat(model=model,
                                     messages=payload["messages"],
                                     stream=False)
-                    log_message("Non-streaming chat completion finished.", "SUCCESS")
+                    log_message("ChatManager.chat_completion_nonstream: Finished after retry.", "DEBUG")
                     return response["message"]["content"]
                 except Exception as e2:
-                    log_message("Error during model pull or retry: " + str(e2), "ERROR")
+                    log_message("ChatManager.chat_completion_nonstream: Error during model pull or retry: " + str(e2), "ERROR")
                     return ""
             else:
-                log_message("Error during non-streaming chat completion: " + str(e), "ERROR")
+                log_message("ChatManager.chat_completion_nonstream: Error during non-streaming chat completion: " + str(e), "ERROR")
                 return ""
 
     def process_text(self, text, skip_tts=False):
+        log_message("ChatManager.process_text: Starting processing of text.", "DEBUG")
         processed_text = Utils.convert_numbers_to_words(text)
         sentence_endings = re.compile(r'[.?!]+')
         tokens = ""
         if self.config_manager.config["stream"]:
             buffer = ""
-            log_message("Processing text in streaming mode.", "DEBUG")
             for content, done in self.chat_completion_stream(processed_text):
+                log_message(f"ChatManager.process_text: Received content chunk: {content}", "DEBUG")
                 buffer += content
                 tokens += content
                 with display_state.lock:
@@ -1301,36 +1225,38 @@ class ChatManager:
                     sentence = buffer[:end_index].strip()
                     buffer = buffer[end_index:].lstrip()
                     sentenceCleaned = clean_text(sentence)
+                    log_message(f"ChatManager.process_text: Extracted sentence: {sentenceCleaned}", "DEBUG")
                     if sentence and not skip_tts:
-                        threading.Thread(target=self.tts_manager.enqueue, args=(sentenceCleaned,), daemon=True).start()
-                        log_message(f"TTS enqueue triggered for sentence: {sentenceCleaned}", "DEBUG")
+                        self.tts_manager.enqueue(sentenceCleaned)
+                        log_message(f"ChatManager.process_text: Enqueued sentence for TTS: {sentenceCleaned}", "DEBUG")
                 if done:
                     break
             if buffer.strip():
                 tokens += buffer.strip()
                 with display_state.lock:
                     display_state.current_tokens = tokens
-            log_message("Text processing completed in streaming mode.", "SUCCESS")
+            log_message("ChatManager.process_text: Completed processing in streaming mode.", "DEBUG")
             return tokens
         else:
             result = self.chat_completion_nonstream(processed_text)
             tokens = result
             with display_state.lock:
                 display_state.current_tokens = tokens
-            log_message("Text processing completed in non-streaming mode.", "SUCCESS")
+            log_message("ChatManager.process_text: Completed processing in non-streaming mode.", "DEBUG")
             return tokens
 
     def inference_thread(self, user_message, result_holder, skip_tts):
-        log_message("Inference thread started.", "DEBUG")
+        log_message("ChatManager.inference_thread: Started for message: " + user_message, "DEBUG")
         result = self.process_text(user_message, skip_tts)
         result_holder.append(result)
-        log_message("Inference thread completed processing.", "SUCCESS")
+        log_message("ChatManager.inference_thread: Completed processing.", "DEBUG")
 
     def run_inference(self, prompt, skip_tts=False):
+        log_message("ChatManager.run_inference: Starting inference for prompt: " + prompt, "DEBUG")
         result_holder = []
         with self.inference_lock:
             if self.current_thread and self.current_thread.is_alive():
-                log_message("Existing inference thread is still running; stopping it.", "WARNING")
+                log_message("ChatManager.run_inference: Existing inference thread is still running; stopping it.", "WARNING")
                 self.stop_flag = True
                 self.current_thread.join()
                 self.stop_flag = False
@@ -1340,13 +1266,14 @@ class ChatManager:
                 target=self.inference_thread,
                 args=(prompt, result_holder, skip_tts)
             )
-            log_message("Starting new inference thread.", "PROCESS")
+            log_message("ChatManager.run_inference: Starting new inference thread.", "DEBUG")
             self.current_thread.start()
         self.current_thread.join()
-        log_message("Inference thread joined and result obtained.", "SUCCESS")
+        log_message("ChatManager.run_inference: Inference thread joined. Result obtained.", "DEBUG")
         return result_holder[0] if result_holder else ""
 
     def run_tool(self, tool_code):
+        log_message("ChatManager.run_tool: Executing tool call: " + tool_code, "DEBUG")
         allowed_tools = {}
         for attr in dir(Tools):
             if not attr.startswith("_"):
@@ -1354,99 +1281,131 @@ class ChatManager:
                 if callable(method):
                     allowed_tools[attr] = method
         try:
-            log_message(f"Executing tool call: {tool_code}", "PROCESS")
             result = eval(tool_code, {"__builtins__": {}}, allowed_tools)
-            log_message("Tool call executed successfully.", "SUCCESS")
+            log_message("ChatManager.run_tool: Tool call executed successfully.", "DEBUG")
             return str(result)
         except Exception as e:
-            log_message("Error executing tool: " + str(e), "ERROR")
+            log_message("ChatManager.run_tool: Error executing tool: " + str(e), "ERROR")
             return f"Error executing tool: {e}"
 
     def new_request(self, user_message, skip_tts=False):
-        log_message(f"New request received: {user_message}", "INFO")
+        log_message("ChatManager.new_request: Received new request: " + user_message, "DEBUG")
         self.history_manager.add_entry("user", user_message)
         _ = Utils.embed_text(user_message)
         with display_state.lock:
             display_state.current_request = user_message
             display_state.current_tool_calls = ""
         result = self.run_inference(user_message, skip_tts)
+        log_message("ChatManager.new_request: Inference result obtained: " + result, "DEBUG")
         tool_code = Tools.parse_tool_call(result)
         if tool_code:
+            log_message("ChatManager.new_request: Tool call detected.", "DEBUG")
             tool_output = self.run_tool(tool_code)
             formatted_output = f"```tool_output\n{tool_output}\n```"
             combined_prompt = f"{user_message}\n{formatted_output}"
             self.history_manager.add_entry("user", combined_prompt)
             _ = Utils.embed_text(combined_prompt)
-            log_message("Tool call detected and processed.", "INFO")
+            log_message("ChatManager.new_request: Recursively processing tool output.", "DEBUG")
             final_result = self.new_request(combined_prompt, skip_tts=False)
             return final_result
         else:
             self.history_manager.add_entry("assistant", result)
             _ = Utils.embed_text(result)
-            log_message("Assistant response recorded in history.", "SUCCESS")
+            log_message("ChatManager.new_request: Assistant response recorded in history.", "DEBUG")
             return result
-
+        
 # ----- Voice-to-LLM Loop (for microphone input) -----
-def voice_to_llm_loop(chat_manager: ChatManager):
+def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
     log_message("Voice-to-LLM loop started. Listening for voice input...", "INFO")
     while True:
-        # Latency reduction: poll audio queue every 0.1 second
-        time.sleep(1)
+        time.sleep(3)
         if audio_queue.empty():
             continue
-        chunks = [] 
+
+        # Gather all pending audio chunks
+        chunks = []
         while not audio_queue.empty():
             chunks.append(audio_queue.get())
             audio_queue.task_done()
         if not chunks:
             continue
-        log_message("Audio chunks collected for transcription.", "DEBUG")
+
+        log_message("Voice-to-LLM loop: Audio chunks collected for transcription.", "DEBUG")
         audio_data = np.concatenate(chunks, axis=0)
         audio_array = audio_data.flatten().astype(np.float32)
-        
-        # Apply noise reduction using the denoiser if enabled.
+
+        # Combined noise reduction, EQ boost, and dynamic compression
         if config.get("enable_noise_reduction", True):
-            log_message("Applying denoiser to audio chunk...", "PROCESS")
-            # Convert audio to torch tensor and add batch and channel dimensions
-            audio_tensor = torch.tensor(audio_array).float().unsqueeze(0).unsqueeze(0)
-            with torch.no_grad():
-                enhanced_tensor = denoiser_model(audio_tensor)
-            audio_array = enhanced_tensor.squeeze(0).squeeze(0).cpu().numpy()
-            log_message("Denoiser applied successfully.", "SUCCESS")
-        
-        # Optionally apply EQ enhancement and playback for debugging.
+            log_message("Voice-to-LLM loop: Enhancing audio (denoise, EQ, compression)...", "PROCESS")
+            audio_array = apply_eq_and_denoise(audio_array, SAMPLE_RATE)
+            log_message("Voice-to-LLM loop: Audio enhancement complete.", "SUCCESS")
+
+        # Prepare audio for transcription (already enhanced)
         audio_to_transcribe = audio_array
+
+        # Async debug playback of the enhanced audio
         if config.get("debug_audio_playback", False):
             volume = config.get("debug_volume", 1.0)
-            audio_to_transcribe = apply_eq_boost(audio_array, SAMPLE_RATE) * volume
-            log_message("Playing back the enhanced audio for debugging...", "INFO")
-            sd.play(audio_to_transcribe, samplerate=SAMPLE_RATE)
-            sd.wait()
-        
-        transcription = consensus_whisper_transcribe_helper(
+            playback_chunk = audio_to_transcribe * volume
+            log_message("Voice-to-LLM loop: Queueing async playback of enhanced audio...", "INFO")
+
+            def _play_chunk_async(data_chunk):
+                with playback_lock:
+                    output_stream.write(data_chunk)
+
+            threading.Thread(
+                target=_play_chunk_async,
+                args=(playback_chunk,),
+                daemon=True
+            ).start()
+
+        # Transcription via Whisper with built-in timestamps
+        log_message("Voice-to-LLM loop: Transcribing with Whisper segments...", "PROCESS")
+        whisper_result = whisper_model_base.transcribe(
             audio_to_transcribe,
             language="en",
-            rms_threshold=config["rms_threshold"],
-            consensus_threshold=config["consensus_threshold"]
+            temperature=0.0
         )
-        if not transcription:
+        segments = whisper_result.get("segments", [])
+        if not segments:
+            log_message("Voice-to-LLM loop: No segments from Whisper.", "WARNING")
             continue
-        
+
+        # Assemble transcription with alternating speaker labels
+        transcription = ""
+        for idx, seg in enumerate(segments):
+            speaker = f"SPEAKER_{(idx % 2) + 1}"
+            transcription += f"[{speaker}] {seg['text'].strip()} "
+        transcription = transcription.strip()
+
         if not validate_transcription(transcription):
-            log_message("Transcription validation failed (likely hallucinated). Skipping.", "WARNING")
+            log_message("Voice-to-LLM loop: Transcription validation failed. Skipping.", "WARNING")
             continue
-        
-        log_message(f"Transcribed prompt: {transcription}", "INFO")
-        session_log.write(json.dumps({"role": "user", "content": transcription, "timestamp": datetime.now().isoformat()}) + "\n")
+
+        log_message(f"Voice-to-LLM loop: Transcribed prompt: {transcription}", "INFO")
+        session_log.write(json.dumps({
+            "role": "user",
+            "content": transcription,
+            "timestamp": datetime.now().isoformat()
+        }) + "\n")
         session_log.flush()
+
         flush_current_tts()
-        
         response = chat_manager.new_request(transcription)
-        log_message("LLM response received.", "INFO")
-        log_message("LLM response: " + response, "INFO")
-        session_log.write(json.dumps({"role": "assistant", "content": response, "timestamp": datetime.now().isoformat()}) + "\n")
+        log_message("Voice-to-LLM loop: LLM response received.", "INFO")
+        log_message("Voice-to-LLM loop: LLM response: " + response, "INFO")
+
+        session_log.write(json.dumps({
+            "role": "assistant",
+            "content": response,
+            "timestamp": datetime.now().isoformat()
+        }) + "\n")
         session_log.flush()
-        log_message("--- Awaiting further voice input ---", "INFO")
+
+        log_message("Voice-to-LLM loop: Awaiting further voice input...", "INFO")
+
+
+
 
 # ----- New: Text Input Override Loop -----
 def text_input_loop(chat_manager: ChatManager):
@@ -1457,12 +1416,12 @@ def text_input_loop(chat_manager: ChatManager):
             user_text = input()  # Blocking call in its own thread.
             if not user_text.strip():
                 continue
-            log_message(f"You typed: {user_text}", "INFO")
+            log_message(f"Text input override: Received text: {user_text}", "INFO")
             session_log.write(json.dumps({"role": "user", "content": user_text, "timestamp": datetime.now().isoformat()}) + "\n")
             session_log.flush()
             flush_current_tts()
             response = chat_manager.new_request(user_text)
-            log_message("LLM response received for text input.", "INFO")
+            log_message("Text input override: LLM response received.", "INFO")
             print("LLM response:", response)
             session_log.write(json.dumps({"role": "assistant", "content": response, "timestamp": datetime.now().isoformat()}) + "\n")
             session_log.flush()
@@ -1470,65 +1429,98 @@ def text_input_loop(chat_manager: ChatManager):
             log_message("Error in text input loop: " + str(e), "ERROR")
 
 # ----- Main Function -----
+# ----- Main Function -----
 def main():
     log_message("Main function starting.", "INFO")
+
+    # Start the TTS worker thread
     tts_thread = threading.Thread(target=tts_worker, args=(tts_queue,))
     tts_thread.daemon = True
     tts_thread.start()
-    log_message("TTS worker thread launched.", "DEBUG")
-    
+    log_message("Main: TTS worker thread launched.", "DEBUG")
+
+    # --- new: one persistent output stream for debug playback ---
+    playback_lock = threading.Lock()
+    output_stream = sd.OutputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype='float32'
+    )
+    output_stream.start()
+
+    # Start mic capture
     try:
         mic_stream = start_audio_capture()
     except Exception as e:
-        log_message("Error starting microphone capture: " + str(e), "ERROR")
+        log_message("Main: Error starting microphone capture: " + str(e), "ERROR")
         sys.exit(1)
-    
+
+    # Initialize managers
     config_manager = ConfigManager(config)
     history_manager = HistoryManager()
     tts_manager = TTSManager()
     memory_manager = MemoryManager()
     mode_manager = ModeManager()
-    
-    chat_manager = ChatManager(config_manager, history_manager, tts_manager, tools_data=True,
-                               format_schema=None, memory_manager=memory_manager, mode_manager=mode_manager)
-    
-    voice_thread = threading.Thread(target=voice_to_llm_loop, args=(chat_manager,))
+
+    # Build ChatManager
+    chat_manager = ChatManager(
+        config_manager,
+        history_manager,
+        tts_manager,
+        tools_data=True,
+        format_schema=None,
+        memory_manager=memory_manager,
+        mode_manager=mode_manager
+    )
+
+    # Launch voice loop (passing in our playback primitives)
+    voice_thread = threading.Thread(
+        target=voice_to_llm_loop,
+        args=(chat_manager, playback_lock, output_stream)
+    )
     voice_thread.daemon = True
     voice_thread.start()
-    log_message("Voice-to-LLM loop thread started.", "DEBUG")
-    
-    text_thread = threading.Thread(target=text_input_loop, args=(chat_manager,))
+    log_message("Main: Voice-to-LLM loop thread started.", "DEBUG")
+
+    # Launch text‑override loop
+    text_thread = threading.Thread(
+        target=text_input_loop,
+        args=(chat_manager,)
+    )
     text_thread.daemon = True
     text_thread.start()
-    log_message("Text input override thread started.", "DEBUG")
-    
-    print("\nVoice-activated LLM mode (primary model: {}) is running.".format(config["primary_model"]))
+    log_message("Main: Text input override thread started.", "DEBUG")
+
+    print(f"\nVoice-activated LLM mode (primary model: {config['primary_model']}) is running.")
     print("Speak into the microphone or type your prompt. LLM responses are streamed and spoken via Piper. Press Ctrl+C to exit.")
-    
+
+    # Keep alive until Ctrl+C
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        log_message("KeyboardInterrupt detected. Exiting...", "INFO")
+        log_message("Main: KeyboardInterrupt detected. Exiting...", "INFO")
         print("\nExiting...")
-    
+
+    # Clean shutdown
     mic_stream.stop()
     tts_queue.put(None)
     tts_queue.join()
     tts_thread.join()
     voice_thread.join()
-    # Note: text_thread may be blocked on input() so it might not join cleanly.
+    # text_thread may remain blocked in input(), so we don’t join it
     session_log.close()
-    
-    # Package entire chat history into a JSON file.
+
+    # Save chat history
     history_path = os.path.join(session_folder, "chat_history.json")
     with open(history_path, "w", encoding="utf-8") as f:
         json.dump(history_manager.history, f, indent=4)
-    
+
     log_message(f"Chat session saved in folder: {session_folder}", "SUCCESS")
-    log_message("System terminated.", "INFO")
+    log_message("Main: System terminated.", "INFO")
     print("Chat session saved in folder:", session_folder)
     print("System terminated.")
+
 
 if __name__ == "__main__":
     main()
