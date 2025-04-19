@@ -185,7 +185,7 @@ def load_config():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(script_dir, "config.json")
     defaults = {
-        "primary_model": "gemma3:12b",  # For conversation (used by other parts of the system)
+        "primary_model": "deepseek-r1:1.5b",  # For conversation (used by other parts of the system)
         "secondary_model": "gemma3:4b",  # For tool calling (unused in current flow)
         "primary_temperature": 0.7,
         "secondary_temperature": 0.3,
@@ -197,7 +197,7 @@ def load_config():
         "raw": False,
         "images": None,        # Now support passing images to the primary model
         "options": {},
-        "system": "You are a real‑time listener and responder for a voice‑activated assistant. Follow these rules strictly:\n\n1. Wait and Listen: You will receive small fragments of text (transcription “chunks”) from Whisper. Do not interrupt, summarize, or acknowledge each fragment. Instead, collect them silently until a complete utterance is formed.\n\n2. Decide When to Respond: If a fragment clearly ends a user’s thought (e.g., ends with a full sentence and pause), craft a response. If it looks like the user is talking to someone else, or you only have partial context, remain silent—do not respond with “okay” or “I understand.” Only speak when you’re confident you have a fully formed question or request.\n\n3. Maintain Conversational Flow: When you do respond, reply in a friendly, conversational tone—as if you were a helpful human assistant. Keep answers concise and to the point, but never robotic. Use natural phrasing and, when appropriate, gentle questions (“Could you tell me more about…?”, “What would you like me to do next?”).\n\n4. Handle Images: If an input comes with an image, describe what you see in detail: objects, colors, people, and their inferred actions or expressions. After describing, ask any clarifying questions if something is unclear.\n\n5. Avoid Hallucinations: Never invent facts or pretend to know something you don’t. If you’re unsure, ask the user for clarification. Do not end with “OK I understand” or similar placeholders. Silence is better than a false confirmation.\n\n6. Ask for Context When Needed: If you detect confusion or missing information, proactively ask a follow‑up: “I’m missing the end of that sentence—could you repeat it?” If multiple people are speaking, you may ask, “Who would you like me to address?”.\n\n7. Speaker Diarization Usage: Use internal speaker labels (e.g. SPEAKER_1, SPEAKER_2) only to understand turn‑taking and context. Under no circumstances should you echo, repeat, or reference these labels in your response—always speak naturally as a single assistant voice.\n\n8. Stay Focused on the User’s Intent: Your sole goal is to help the user with their spoken (or typed) requests. Do not drift off into tangents, unsolicited advice, or long self‑references.\n\n9. Keep It Human: Use contractions (I’m, you’re) and simple, clear language. Occasionally mirror the user’s phrasing to show you’re engaged.\n\n10. No Apologies or Placeholder Replies: If you do not understand, cannot respond, or lack sufficient context, do NOT apologize or say anything at all—simply remain silent until clear input is received.\n\n11. Music Detection: If you detect the exact same fragment repeated more than three times in succession, assume it is background music or noise and remain completely silent—do not attempt to transcribe or respond.\n\nBy following these numbered rules, you’ll respond naturally, only when appropriate, with clarity and empathy. Always prioritize listening and understanding over eager or misguided replies.",
+        "system": "This is the FINAL INFERENCE stage. You will receive exactly one user message in this format:\n\n```context_analysis\n<your concise context analysis here>\n```\n```tool_output\n<any tool output here, or blank if none>\n```\n<the original user message>\n\n**Instructions:**\n- Do NOT say “I understand” or explain that you understand.\n- Do NOT apologize, offer pleasantries, or add filler.\n- Do NOT reference or repeat speaker labels like SPEAKER_1 or SPEAKER_2.\n- Do NOT summarize these rules or the context—just use the information in `context_analysis` and `tool_output`.\n- Immediately craft a direct, conversational, and delightfully sassy response to the user’s message.\n- Avoid hallucinations and stay on point.\n- No apologies, no “as an AI,” no extraneous commentary—just answer.",
         "conversation_id": "default_convo",
         "rms_threshold": 0.01,
         "debug_audio_playback": False,
@@ -276,6 +276,36 @@ except torch.cuda.OutOfMemoryError as e:
     torch.cuda.empty_cache()
     log_message("Cleared CUDA cache. Restarting script to recover...", "INFO")
     # re‑execute this script from scratch
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+    
+log_message("Warming up Ollama primary model...", "PROCESS")
+try:
+    # a minimal dummy chat to force the primary model to load & cache weights
+    dummy_messages = [{"role": "user", "content": "Hi"}]
+    _ = chat(
+        model=config["primary_model"],
+        messages=dummy_messages,
+        stream=False
+    )
+    log_message("Ollama primary model warm‑up complete.", "SUCCESS")
+
+    log_message("Warming up Ollama secondary model...", "PROCESS")
+    _ = chat(
+        model=config["secondary_model"],
+        messages=dummy_messages,
+        stream=False
+    )
+    log_message("Ollama secondary model warm‑up complete.", "SUCCESS")
+
+except Exception as e:
+    log_message(f"Error during Ollama model warm‑up: {e}", "ERROR")
+    # if it's an OOM or other recoverable error, you could clear cache and restart here
+    try:
+        torch.cuda.empty_cache()
+        log_message("Cleared CUDA cache after Ollama warm‑up failure.", "INFO")
+    except NameError:
+        pass
+    log_message("Restarting script to recover...", "INFO")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 # ----- Load Denoiser Model -----
@@ -1058,213 +1088,227 @@ class Tools:
             log_message("Error in secondary agent: " + str(e), "ERROR")
             return f"Error in secondary agent: {e}"
 
+import threading
+import re
+import inspect
+from ollama import chat
+
 class ChatManager:
+    # ---------------------------------------------------------------- #
+    #                           INITIALISATION                         #
+    # ---------------------------------------------------------------- #
     def __init__(self, config_manager: ConfigManager, history_manager: HistoryManager,
                  tts_manager: TTSManager, tools_data, format_schema,
                  memory_manager: MemoryManager, mode_manager: ModeManager):
-        self.config_manager = config_manager
-        self.history_manager = history_manager
-        self.tts_manager = tts_manager
-        self.tools_data = tools_data
-        self.format_schema = format_schema
-        self.memory_manager = memory_manager
-        self.mode_manager = mode_manager
-        self.current_tokens = ""
-        self.current_tool_calls = ""
-        self.stop_flag = False
-        self.inference_lock = threading.Lock()
-        self.current_thread = None
-        self.conversation_id = self.config_manager.config.get("conversation_id", "default_convo")
+        self.config_manager   = config_manager
+        self.history_manager  = history_manager
+        self.tts_manager      = tts_manager
+        self.tools_data       = tools_data
+        self.format_schema    = format_schema
+        self.memory_manager   = memory_manager
+        self.mode_manager     = mode_manager
+
+        self.stop_flag       = False
+        self.inference_lock  = threading.Lock()
+        self.current_thread  = None
+
         log_message("ChatManager initialized.", "DEBUG")
-    
-    def build_payload(self):
-        log_message("ChatManager.build_payload: Building payload...", "DEBUG")
-        cfg = self.config_manager.config
-        system_prompt = cfg.get("system", "")
-        tools_source = ""
-        for attr in dir(Tools):
-            if not attr.startswith("_"):
-                method = getattr(Tools, attr)
-                if callable(method):
-                    try:
-                        tools_source += "\n" + inspect.getsource(method)
-                    except Exception:
-                        pass
-        tool_instructions = (
-            "At each turn, if you decide to invoke any function, wrap the call in triple backticks with the label `tool_code`.\n\n"
-            "Review the following Python methods (source provided for context) to decide if a function call is appropriate:\n\n"
-            "```python\n" + tools_source + "\n```\n\n"
-            "When a function call is executed, its response will be wrapped in triple backticks with the label `tool_output`."
+
+    # ---------------------------------------------------------------- #
+    #                      INTERNAL STREAMING HELPERS                  #
+    # ---------------------------------------------------------------- #
+    def _stream_context(self, user_msg: str):
+        log_message("Phase 1: Starting context-analysis stream...", "INFO")
+        preamble = (
+            "You are a context‑assembly agent.\n"
+            "Given RECENT HISTORY ([[ ]]) and the CURRENT USER MESSAGE (<<< >>>), "
+            "produce a concise analysis. Return only the analysis text.\n\n"
         )
-        system_message = {"role": "system", "content": system_prompt + "\n\n" + tool_instructions}
-        log_message("ChatManager.build_payload: System message constructed.", "DEBUG")
-        if self.history_manager.history:
-            last_user_msg = next((msg["content"] for msg in reversed(self.history_manager.history) if msg["role"] == "user"), "")
-            _ = Utils.embed_text(last_user_msg)
-            mem_context = ""
-            log_message("ChatManager.build_payload: Memory context extracted from history.", "DEBUG")
+        recent = "\n".join(f"{m['role'].upper()}: {m['content']}"
+                           for m in self.history_manager.history[-5:])
+        messages = [
+            {"role": "system", "content": preamble + "[[ " + recent + " ]]"},
+            {"role": "user",   "content": user_msg}
+        ]
+        payload = self.build_payload(messages, model_key="secondary_model")
+
+        print("⟳ Context: ", end="", flush=True)
+        buf = ""
+        for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
+            if self.stop_flag:
+                log_message("Phase 1 aborted by stop flag.", "WARNING")
+                break
+            tok = part["message"]["content"]
+            buf += tok
+            print(tok, end="", flush=True)
+            yield tok, False
+
+        print()
+        log_message(f"Phase 1 complete: context analysis:\n{buf}", "INFO")
+        yield "", True
+
+    def _stream_tool(self, user_msg: str):
+        log_message("Phase 2: Starting tool-decision stream...", "INFO")
+        src = ""
+        for attr in dir(Tools):
+            if not attr.startswith("_") and callable(getattr(Tools, attr)):
+                try: src += "\n" + inspect.getsource(getattr(Tools, attr))
+                except: pass
+
+        preamble = (
+            "You are a TOOL‑CALLING agent.\n"
+            "If the USER MESSAGE requires exactly one of the available functions, "
+            "output it inside ```tool_code```; otherwise output ```tool_code\nNO_TOOL\n```.\n\n"
+            "Available functions:" + src + "\n\n"
+        )
+        messages = [
+            {"role": "system", "content": preamble},
+            {"role": "user",   "content": user_msg}
+        ]
+        payload = self.build_payload(messages, model_key="secondary_model")
+
+        print("⟳ Tool: ", end="", flush=True)
+        buf = ""
+        for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
+            if self.stop_flag:
+                log_message("Phase 2 aborted by stop flag.", "WARNING")
+                break
+            tok = part["message"]["content"]
+            buf += tok
+            print(tok, end="", flush=True)
+            yield tok, False
+
+        print()
+        log_message(f"Phase 2 complete: tool-decision:\n{buf}", "INFO")
+        yield "", True
+
+    # ---------------------------------------------------------------- #
+    #                    ORIGINAL (UNCHANGED) METHODS                  #
+    # ---------------------------------------------------------------- #
+    def build_payload(self, override_messages=None, model_key="primary_model"):
+        cfg = self.config_manager.config
+        if override_messages is not None:
+            messages = override_messages
+        elif model_key == "primary_model":
+            system_prompt = cfg.get("system","")
+            sys_msg = {"role":"system","content":system_prompt}
+            if self.history_manager.history:
+                last = next((m["content"] for m in reversed(self.history_manager.history)
+                             if m["role"]=="user"), "")
+                _ = Utils.embed_text(last)
+                mem = ""
+            else:
+                mem = ""
+            mem_msg = {"role":"system",
+                       "content":f"Memory Context:\n{mem}\n\nSummary Narrative:\n\n"}
+            messages = [sys_msg, mem_msg] + self.history_manager.history
         else:
-            mem_context = ""
-        summary_text = ""
-        memory_context = f"Memory Context:\n{mem_context}\n\nSummary Narrative:\n{summary_text}\n"
-        memory_message = {"role": "system", "content": memory_context}
-        messages = [system_message, memory_message] + self.history_manager.history
+            messages = override_messages or []
+
         payload = {
-            "model": cfg["primary_model"],
-            "temperature": cfg["primary_temperature"],
-            "messages": messages,
-            "stream": cfg["stream"]
+            "model":       cfg[model_key],
+            "temperature": cfg[f"{model_key.split('_')[0]}_temperature"],
+            "messages":    messages,
+            "stream":      cfg["stream"]
         }
         if self.format_schema:
             payload["format"] = self.format_schema
-        if cfg["raw"]:
+        if cfg.get("raw"):
             payload["raw"] = True
-        if cfg["images"]:
-            if self.history_manager.history and self.history_manager.history[-1].get("role") == "user":
-                self.history_manager.history[-1]["images"] = cfg["images"]
-        if self.tools_data:
-            payload["tools"] = self.tools_data
-        if cfg["options"]:
+        if cfg.get("options"):
             payload["options"] = cfg["options"]
-        log_message("ChatManager.build_payload: Payload built successfully.", "DEBUG")
         return payload
 
     def chat_completion_stream(self, processed_text):
-        log_message("ChatManager.chat_completion_stream: Starting streaming chat completion...", "DEBUG")
-        payload = self.build_payload()
-        tokens = ""
-        model = self.config_manager.config["primary_model"]
-        try:
-            stream = chat(model=model,
-                          messages=payload["messages"],
-                          stream=self.config_manager.config["stream"])
-            for part in stream:
-                if self.stop_flag:
-                    log_message("ChatManager.chat_completion_stream: Stop flag detected.", "WARNING")
-                    yield "", True
-                    return
-                content = part["message"]["content"]
-                tokens += content
-                with display_state.lock:
-                    display_state.current_tokens = tokens
-                log_message(f"ChatManager.chat_completion_stream: Received token: {content}", "DEBUG")
-                yield content, part.get("done", False)
-                if part.get("done", False):
-                    log_message("ChatManager.chat_completion_stream: Streaming chat completion finished.", "DEBUG")
-                    break
-        except Exception as e:
-            if "not found" in str(e).lower():
-                log_message(f"ChatManager.chat_completion_stream: Model {model} not found, pulling it now...", "WARNING")
-                try:
-                    from ollama import pull
-                    pull(model)
-                    log_message(f"ChatManager.chat_completion_stream: Model {model} pulled successfully. Retrying...", "DEBUG")
-                    stream = chat(model=model,
-                                  messages=payload["messages"],
-                                  stream=self.config_manager.config["stream"])
-                    for part in stream:
-                        if self.stop_flag:
-                            log_message("ChatManager.chat_completion_stream: Stop flag detected during retry.", "WARNING")
-                            yield "", True
-                            return
-                        content = part["message"]["content"]
-                        tokens += content
-                        with display_state.lock:
-                            display_state.current_tokens = tokens
-                        log_message(f"ChatManager.chat_completion_stream (retry): Received token: {content}", "DEBUG")
-                        yield content, part.get("done", False)
-                        if part.get("done", False):
-                            log_message("ChatManager.chat_completion_stream (retry): Finished.", "DEBUG")
-                            break
-                except Exception as e2:
-                    log_message("ChatManager.chat_completion_stream: Error during model pull or retry: " + str(e2), "ERROR")
-                    yield "", True
-            else:
-                log_message("ChatManager.chat_completion_stream: Error during streaming chat completion: " + str(e), "ERROR")
+        log_message("Primary-model stream starting...", "DEBUG")
+        payload = self.build_payload(None, model_key="primary_model")
+        print("⟳ Reply: ", end="", flush=True)
+        for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
+            if self.stop_flag:
+                log_message("Primary-model stream aborted.", "WARNING")
                 yield "", True
+                return
+            tok = part["message"]["content"]
+            print(tok, end="", flush=True)
+            yield tok, part.get("done", False)
+        print()
+        log_message("Primary-model stream finished.", "DEBUG")
 
     def chat_completion_nonstream(self, processed_text):
-        log_message("ChatManager.chat_completion_nonstream: Starting non-streaming chat completion...", "DEBUG")
-        payload = self.build_payload()
-        model = self.config_manager.config["primary_model"]
+        log_message("Primary-model non-stream starting...", "DEBUG")
+        payload = self.build_payload(None, model_key="primary_model")
         try:
-            response = chat(model=model,
-                            messages=payload["messages"],
-                            stream=False)
-            log_message("ChatManager.chat_completion_nonstream: Non-streaming chat completion finished.", "DEBUG")
-            return response["message"]["content"]
+            resp = chat(model=payload["model"], messages=payload["messages"], stream=False)
+            return resp["message"]["content"]
         except Exception as e:
-            if "not found" in str(e).lower():
-                log_message(f"ChatManager.chat_completion_nonstream: Model {model} not found, pulling it now...", "WARNING")
-                try:
-                    from ollama import pull
-                    pull(model)
-                    log_message(f"ChatManager.chat_completion_nonstream: Model {model} pulled successfully. Retrying...", "DEBUG")
-                    response = chat(model=model,
-                                    messages=payload["messages"],
-                                    stream=False)
-                    log_message("ChatManager.chat_completion_nonstream: Finished after retry.", "DEBUG")
-                    return response["message"]["content"]
-                except Exception as e2:
-                    log_message("ChatManager.chat_completion_nonstream: Error during model pull or retry: " + str(e2), "ERROR")
-                    return ""
-            else:
-                log_message("ChatManager.chat_completion_nonstream: Error during non-streaming chat completion: " + str(e), "ERROR")
-                return ""
+            log_message(f"Primary-model non-stream error: {e}", "ERROR")
+            return ""
 
     def process_text(self, text, skip_tts=False):
-        log_message("ChatManager.process_text: Starting processing of text.", "DEBUG")
-        processed_text = Utils.convert_numbers_to_words(text)
+        log_message("process_text: Starting...", "DEBUG")
+        converted = Utils.convert_numbers_to_words(text)
         sentence_endings = re.compile(r'[.?!]+')
+        in_think = False
+        tts_buffer = ""
         tokens = ""
+
         if self.config_manager.config["stream"]:
-            buffer = ""
-            for content, done in self.chat_completion_stream(processed_text):
-                log_message(f"ChatManager.process_text: Received content chunk: {content}", "DEBUG")
-                buffer += content
-                tokens += content
+            for chunk, done in self.chat_completion_stream(converted):
+                tokens += chunk
                 with display_state.lock:
                     display_state.current_tokens = tokens
+
+                data = chunk
+                idx = 0
+                while idx < len(data):
+                    if not in_think:
+                        start = data.find("<think>", idx)
+                        if start == -1:
+                            tts_buffer += data[idx:]
+                            break
+                        else:
+                            tts_buffer += data[idx:start]
+                            idx = start + len("<think>")
+                            in_think = True
+                    else:
+                        end = data.find("</think>", idx)
+                        if end == -1:
+                            # drop rest
+                            break
+                        else:
+                            idx = end + len("</think>")
+                            in_think = False
+                # extract full sentences from tts_buffer
                 while True:
-                    match = sentence_endings.search(buffer)
-                    if not match:
+                    m = sentence_endings.search(tts_buffer)
+                    if not m:
                         break
-                    end_index = match.end()
-                    sentence = buffer[:end_index].strip()
-                    buffer = buffer[end_index:].lstrip()
-                    sentenceCleaned = clean_text(sentence)
-                    log_message(f"ChatManager.process_text: Extracted sentence: {sentenceCleaned}", "DEBUG")
-                    if sentence and not skip_tts:
-                        self.tts_manager.enqueue(sentenceCleaned)
-                        log_message(f"ChatManager.process_text: Enqueued sentence for TTS: {sentenceCleaned}", "DEBUG")
+                    end = m.end()
+                    sentence = tts_buffer[:end].strip()
+                    tts_buffer = tts_buffer[end:].lstrip()
+                    clean = clean_text(sentence)
+                    if clean and not skip_tts:
+                        self.tts_manager.enqueue(clean)
+                        log_message(f"TTS enqueued: {clean}", "DEBUG")
+
                 if done:
                     break
-            if buffer.strip():
-                tokens += buffer.strip()
-                with display_state.lock:
-                    display_state.current_tokens = tokens
-            log_message("ChatManager.process_text: Completed processing in streaming mode.", "DEBUG")
+
             return tokens
         else:
-            result = self.chat_completion_nonstream(processed_text)
-            tokens = result
+            res = self.chat_completion_nonstream(converted)
             with display_state.lock:
-                display_state.current_tokens = tokens
-            log_message("ChatManager.process_text: Completed processing in non-streaming mode.", "DEBUG")
-            return tokens
+                display_state.current_tokens = res
+            return res
 
     def inference_thread(self, user_message, result_holder, skip_tts):
-        log_message("ChatManager.inference_thread: Started for message: " + user_message, "DEBUG")
-        result = self.process_text(user_message, skip_tts)
-        result_holder.append(result)
-        log_message("ChatManager.inference_thread: Completed processing.", "DEBUG")
+        result_holder.append(self.process_text(user_message, skip_tts))
 
     def run_inference(self, prompt, skip_tts=False):
-        log_message("ChatManager.run_inference: Starting inference for prompt: " + prompt, "DEBUG")
-        result_holder = []
+        log_message("run_inference: Starting...", "DEBUG")
+        holder = []
         with self.inference_lock:
             if self.current_thread and self.current_thread.is_alive():
-                log_message("ChatManager.run_inference: Existing inference thread is still running; stopping it.", "WARNING")
                 self.stop_flag = True
                 self.current_thread.join()
                 self.stop_flag = False
@@ -1272,55 +1316,56 @@ class ChatManager:
             self.tts_manager.start()
             self.current_thread = threading.Thread(
                 target=self.inference_thread,
-                args=(prompt, result_holder, skip_tts)
+                args=(prompt, holder, skip_tts)
             )
-            log_message("ChatManager.run_inference: Starting new inference thread.", "DEBUG")
             self.current_thread.start()
         self.current_thread.join()
-        log_message("ChatManager.run_inference: Inference thread joined. Result obtained.", "DEBUG")
-        return result_holder[0] if result_holder else ""
+        return holder[0] if holder else ""
 
     def run_tool(self, tool_code):
-        log_message("ChatManager.run_tool: Executing tool call: " + tool_code, "DEBUG")
-        allowed_tools = {}
-        for attr in dir(Tools):
-            if not attr.startswith("_"):
-                method = getattr(Tools, attr)
-                if callable(method):
-                    allowed_tools[attr] = method
+        log_message(f"run_tool: Executing {tool_code}", "DEBUG")
+        allowed = {
+            n: getattr(Tools, n) for n in dir(Tools)
+            if not n.startswith("_") and callable(getattr(Tools,n))
+        }
         try:
-            result = eval(tool_code, {"__builtins__": {}}, allowed_tools)
-            log_message("ChatManager.run_tool: Tool call executed successfully.", "DEBUG")
-            return str(result)
+            return str(eval(tool_code, {"__builtins__": {}}, allowed))
         except Exception as e:
-            log_message("ChatManager.run_tool: Error executing tool: " + str(e), "ERROR")
+            log_message(f"run_tool error: {e}", "ERROR")
             return f"Error executing tool: {e}"
 
     def new_request(self, user_message, skip_tts=False):
-        log_message("ChatManager.new_request: Received new request: " + user_message, "DEBUG")
+        log_message("new_request: Received user message.", "INFO")
+        # 1) record
         self.history_manager.add_entry("user", user_message)
         _ = Utils.embed_text(user_message)
-        with display_state.lock:
-            display_state.current_request = user_message
-            display_state.current_tool_calls = ""
-        result = self.run_inference(user_message, skip_tts)
-        log_message("ChatManager.new_request: Inference result obtained: " + result, "DEBUG")
-        tool_code = Tools.parse_tool_call(result)
-        if tool_code:
-            log_message("ChatManager.new_request: Tool call detected.", "DEBUG")
-            tool_output = self.run_tool(tool_code)
-            formatted_output = f"```tool_output\n{tool_output}\n```"
-            combined_prompt = f"{user_message}\n{formatted_output}"
-            self.history_manager.add_entry("user", combined_prompt)
-            _ = Utils.embed_text(combined_prompt)
-            log_message("ChatManager.new_request: Recursively processing tool output.", "DEBUG")
-            final_result = self.new_request(combined_prompt, skip_tts=False)
-            return final_result
-        else:
-            self.history_manager.add_entry("assistant", result)
-            _ = Utils.embed_text(result)
-            log_message("ChatManager.new_request: Assistant response recorded in history.", "DEBUG")
-            return result
+        # 2) context
+        ctx = []
+        for tok, done in self._stream_context(user_message):
+            ctx.append(tok)
+            if done: break
+        ctx_txt = "".join(ctx)
+        # 3) tool
+        tb = []
+        for tok, done in self._stream_tool(user_message):
+            if done: break
+            tb.append(tok)
+        tool_str = "".join(tb)
+        code = Tools.parse_tool_call(tool_str)
+        out = ""
+        if code and code.strip().upper() != "NO_TOOL":
+            out = self.run_tool(code)
+        # 4) assemble
+        assembled = f"```context_analysis\n{ctx_txt}\n```"
+        if out:
+            assembled += f"\n```tool_output\n{out}\n```"
+        assembled += f"\n{user_message}"
+        self.history_manager.add_entry("user", assembled)
+        _ = Utils.embed_text(assembled)
+        # 5) final inference
+        return self.run_inference(assembled, skip_tts)
+
+
         
 # ----- Voice-to-LLM Loop (for microphone input) -----
 def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
