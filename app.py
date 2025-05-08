@@ -874,75 +874,105 @@ class Tools:
         return code
 
     @staticmethod
-    def get_chat_history(count: int | None = None, since: str | None = None) -> str:
+    def get_chat_history(arg1, arg2=None) -> str:
         """
-        Return up to `count` entries from the global chat history, optionally only entries
-        from `since` (absolute timestamp or relative like '2 hours ago').
+        get_chat_history(n) -> last n messages
+        get_chat_history(n, period) -> last n messages since 'period' ago (e.g. "2 days", "3 hours") or since ISO timestamp
+        get_chat_history(query, n) -> top n messages by cosine similarity & keyword match to 'query'
         """
         import re, json
-        from datetime import datetime
+        from datetime import datetime, timedelta
 
-        # require dateutil for parsing
-        try:
-            from dateutil import parser
-            from dateutil.relativedelta import relativedelta
-        except ImportError:
-            log_message("get_chat_history: python-dateutil not installed", "ERROR")
-            return "Error: date parsing library missing."
+        hm = Tools._history_manager
+        if not hm:
+            return json.dumps({"error": "HistoryManager not set"}, indent=2)
+        all_entries = hm.history
 
-        # grab the global history list
-        hist = getattr(Tools, "_history_ref", None)
-        if hist is None:
-            log_message("get_chat_history: history reference not set", "ERROR")
-            return "Error: history not available."
+        # Determine mode
+        top_n = None
+        since_dt = None
+        query = None
 
-        # compute cutoff if `since` provided
-        cutoff: datetime | None = None
-        if since:
-            # try relative "X units ago"
-            m = re.match(
-                r"^\s*(\d+)\s*(seconds?|minutes?|hours?|days?|weeks?|months?|years?)\s+ago\s*$",
-                since, re.IGNORECASE
-            )
-            if m:
-                num = int(m.group(1))
-                unit = m.group(2).lower()
-                if not unit.endswith("s"):
-                    unit += "s"
-                cutoff = datetime.now() - relativedelta(**{unit: num})
+        # arg1 numeric => retrieval count
+        if re.match(r'^\d+$', str(arg1)):
+            top_n = int(arg1)
+            if arg2:
+                # try relative period "2 days" etc.
+                m = re.match(r'(\d+)\s*(day|hour|minute|week)s?', str(arg2), re.IGNORECASE)
+                if m:
+                    val, unit = int(m.group(1)), m.group(2).lower()
+                    now = datetime.now()
+                    if unit.startswith('day'):
+                        since_dt = now - timedelta(days=val)
+                    elif unit.startswith('hour'):
+                        since_dt = now - timedelta(hours=val)
+                    elif unit.startswith('minute'):
+                        since_dt = now - timedelta(minutes=val)
+                    elif unit.startswith('week'):
+                        since_dt = now - timedelta(weeks=val)
+                else:
+                    # try ISO timestamp
+                    try:
+                        since_dt = datetime.fromisoformat(arg2)
+                    except Exception:
+                        since_dt = None
+        else:
+            # arg1 is query string
+            query = str(arg1)
+            # arg2 numeric => top_n
+            if arg2 and re.match(r'^\d+$', str(arg2)):
+                top_n = int(arg2)
             else:
-                # try absolute parse
-                try:
-                    cutoff = parser.parse(since)
-                except Exception as e:
-                    log_message(f"get_chat_history: cannot parse date '{since}': {e}", "ERROR")
-                    return f"Error: unable to parse date '{since}'."
+                top_n = 5
 
-        # filter and slice
-        entries = list(hist)  # shallow copy
-        if cutoff:
-            filtered = []
-            for e in entries:
-                ts_str = e.get("timestamp", "")
-                try:
-                    ts = parser.parse(ts_str)
-                    if ts >= cutoff:
-                        filtered.append(e)
-                except Exception:
-                    # skip unparsable
-                    continue
-            entries = filtered
+        if top_n is None:
+            top_n = 5
 
-        if count is not None:
+        # filter by since_dt if provided
+        filtered = []
+        for e in all_entries:
+            ts = None
             try:
-                c = int(count)
-                entries = entries[-c:]
+                ts = datetime.fromisoformat(e.get("timestamp",""))
             except Exception:
-                log_message(f"get_chat_history: invalid count '{count}'", "ERROR")
-                return f"Error: invalid count '{count}'."
+                pass
+            if since_dt and ts and ts < since_dt:
+                continue
+            filtered.append(e)
 
-        # return JSON string
-        return json.dumps(entries, indent=2)
+        results = []
+        # If query mode: score by substring + cosine
+        if query:
+            q_vec = Utils.embed_text(query)
+            for e in filtered:
+                content = e.get("content","")
+                score = 0.0
+                if query.lower() in content.lower():
+                    score += 1.0
+                v = Utils.embed_text(content)
+                score += Utils.cosine_similarity(q_vec, v)
+                results.append((score, e))
+            results.sort(key=lambda x: x[0], reverse=True)
+        else:
+            # No query: return most recent first
+            # assume history in chronological order
+            for e in reversed(filtered):
+                results.append((0.0, e))
+
+        # take top_n
+        top = results[:top_n]
+
+        # build output
+        out = []
+        for score, e in top:
+            out.append({
+                "timestamp": e.get("timestamp"),
+                "role":      e.get("role"),
+                "content":   e.get("content"),
+                "score":     round(score, 3)
+            })
+
+        return json.dumps({"results": out}, indent=2)
 
     @staticmethod
     def capture_screen():
@@ -1097,6 +1127,46 @@ class Tools:
         except Exception as e:
             log_message("Error in brave search: " + str(e), "ERROR")
             return f"Error: {e}"
+        
+    @staticmethod
+    def summarize_search(topic: str, top_n: int = 3) -> str:
+        """
+        1) Search Brave for `topic`
+        2) Take the top_n web results
+        3) Scrape each URL
+        4) Summarize each page with the secondary agent
+        Returns a bullet-list summary.
+        """
+        import json, traceback
+
+        try:
+            raw = Tools.search_internet(topic)
+            data = json.loads(raw)
+            web_results = data.get("web", {}).get("results", [])[:top_n]
+        except Exception as e:
+            return f"Error parsing search results: {e}"
+
+        summaries = []
+        for idx, r in enumerate(web_results, start=1):
+            url   = r.get("url")
+            title = r.get("title", url)
+            try:
+                html = Tools.bs4_scrape(url)
+                # take only the first 2000 characters to stay under token limits
+                snippet = html[:2000].replace("\n"," ")  
+                prompt = (
+                    f"Here is the beginning of the page at {url}:\n\n"
+                    f"{snippet}\n\n"
+                    "Please give me a 2-3 sentence summary of the key points."
+                )
+                summary = Tools.secondary_agent_tool(prompt, temperature=0.3)
+            except Exception:
+                summary = "Failed to scrape or summarize that page."
+            summaries.append(f"{idx}. {title} — {summary.strip()}")
+
+        if not summaries:
+            return "No web results found."
+        return "\n".join(summaries)
 
     @staticmethod
     def bs4_scrape(url):
@@ -1370,6 +1440,7 @@ class ChatManager:
             return ""
 
     def process_text(self, text, skip_tts=False):
+        import re
         log_message("process_text: Starting...", "DEBUG")
         converted = Utils.convert_numbers_to_words(text)
         sentence_endings = re.compile(r'[.?!]+')
@@ -1402,6 +1473,8 @@ class ChatManager:
                         else:
                             idx = end + len("</think>")
                             in_think = False
+
+                # extract full sentences from tts_buffer
                 while True:
                     m = sentence_endings.search(tts_buffer)
                     if not m:
@@ -1410,6 +1483,8 @@ class ChatManager:
                     sentence = tts_buffer[:end].strip()
                     tts_buffer = tts_buffer[end:].lstrip()
                     clean = clean_text(sentence)
+                    # remove special characters before TTS (e.g., asterisks, backticks, underscores)
+                    clean = re.sub(r'[*_`]', '', clean)
                     if clean and not skip_tts:
                         self.tts_manager.enqueue(clean)
                         log_message(f"TTS enqueued: {clean}", "DEBUG")
@@ -1423,6 +1498,7 @@ class ChatManager:
             with display_state.lock:
                 display_state.current_tokens = res
             return res
+
 
     def inference_thread(self, user_message, result_holder, skip_tts):
         result_holder.append(self.process_text(user_message, skip_tts))
@@ -1530,6 +1606,7 @@ class ChatManager:
 
     def new_request(self, user_message, skip_tts=False):
         import re, json
+        from bs4 import BeautifulSoup
         log_message("new_request: Received user message.", "INFO")
         # 1) Record raw user message
         self.history_manager.add_entry("user", user_message)
@@ -1561,14 +1638,9 @@ class ChatManager:
             log_message(f"Raw tool-decision output (iter {i+1}): {raw_tool!r}", "DEBUG")
 
             code = Tools.parse_tool_call(raw_tool)
-            # fallback to search if none
             if not code or code.upper() == "NO_TOOL":
-                if re.search(r"\b(search|lookup|find|news|headline)\b", tool_context, re.IGNORECASE):
-                    code = f'brave_search("{tool_context}")'
-                    log_message(f"Falling back to brave_search: {code}", "INFO")
-                else:
-                    log_message("No more tools to invoke; breaking.", "INFO")
-                    break
+                log_message("No tool selected; breaking chain.", "INFO")
+                break
 
             # extract function name
             m = re.match(r"\s*([A-Za-z_]\w*)\s*\(", code)
@@ -1592,13 +1664,22 @@ class ChatManager:
                     top3 = results[:3]
                     lines = []
                     for entry in top3:
-                        title = entry.get("title") or entry.get("name") or entry.get("description","(no title)")
-                        url   = entry.get("url")   or entry.get("link","")
-                        lines.append(f"- {title} ({url})")
+                        title = entry.get("title") or entry.get("name") or entry.get("description", "(no title)")
+                        url   = entry.get("url")   or entry.get("link", "")
+                        # fetch the page and extract a snippet
+                        html = Tools.bs4_scrape(url)
+                        if html.startswith("Error"):
+                            snippet = "(no snippet available)"
+                        else:
+                            soup = BeautifulSoup(html, "html5lib")
+                            p = soup.find("p")
+                            text = p.get_text().strip() if p else ""
+                            snippet = text[:200] + "…" if len(text) > 200 else text
+                        lines.append(f"- {title}: {snippet} ({url})")
                     summary = f"Top {len(lines)} search results:\n" + "\n".join(lines)
                 elif fn == "get_current_location":
-                    city   = data.get("city","?")
-                    region = data.get("regionName","?")
+                    city   = data.get("city", "?")
+                    region = data.get("regionName", "?")
                     lat    = data.get("lat")
                     lon    = data.get("lon")
                     summary = f"Location: {city}, {region} (lat {lat}, lon {lon})"
@@ -1617,8 +1698,7 @@ class ChatManager:
         # 4) Assemble tool_output block
         assembled = user_message
         if summaries:
-            fence = "```tool_output"
-            block = fence + "\n" + "\n\n".join(summaries) + "\n```"
+            block = "```tool_output\n" + "\n\n".join(summaries) + "\n```"
             assembled = block + "\n" + user_message
 
         # record and embed
@@ -1635,28 +1715,44 @@ class ChatManager:
 
 # ----- Voice-to-LLM Loop (for microphone input) -----
 def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
-    import re, json
+    import re, json, time
     from datetime import datetime
-    log_message("Voice-to-LLM loop started. Listening for voice input...", "INFO")
+    import numpy as np
+
+    log_message("Voice-to-LLM loop started. Waiting for speech...", "INFO")
     last_response = None
     max_words = config.get("max_response_words", 100)
+    rms_threshold = config.get("rms_threshold", 0.01)
+    silence_duration = 2.0  # seconds of silence to mark end of speech
 
     while True:
-        time.sleep(3)
-        log_message("Checking audio_queue...", "DEBUG")
-        if audio_queue.empty():
-            continue
+        # Block until the first audio chunk arrives
+        chunk = audio_queue.get()
+        audio_queue.task_done()
+        buffer = [chunk]
+        silence_start = None
+        log_message("Recording audio until silence detected...", "DEBUG")
 
-        # Gather pending audio chunks
-        chunks = []
-        while not audio_queue.empty():
-            chunks.append(audio_queue.get())
+        # Keep collecting audio until we detect sustained silence
+        while True:
+            chunk = audio_queue.get()
             audio_queue.task_done()
-        log_message(f"Collected {len(chunks)} audio chunks", "DEBUG")
-        if not chunks:
-            continue
+            buffer.append(chunk)
 
-        audio_data = np.concatenate(chunks, axis=0)
+            # Compute RMS of this chunk
+            rms = np.sqrt(np.mean(chunk.flatten()**2))
+            if rms >= rms_threshold:
+                silence_start = None
+            else:
+                if silence_start is None:
+                    silence_start = time.time()
+                elif time.time() - silence_start >= silence_duration:
+                    break  # sustained silence -> end of speech
+
+        log_message(f"Silence for {silence_duration}s; processing audio...", "INFO")
+
+        # Concatenate and preprocess audio
+        audio_data = np.concatenate(buffer, axis=0)
         audio_array = audio_data.flatten().astype(np.float32)
 
         # Audio enhancement
@@ -1665,30 +1761,33 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
             audio_array = apply_eq_and_denoise(audio_array, SAMPLE_RATE)
             log_message("Audio enhancement complete.", "SUCCESS")
 
-        # Debug playback
+        # Optional debug playback
         if config.get("debug_audio_playback", False):
             volume = config.get("debug_volume", 1.0)
-            log_message("Queueing async playback of enhanced audio...", "INFO")
+            log_message("Queueing async playback of captured audio...", "INFO")
             playback_chunk = audio_array * volume
             def _play_chunk_async(data_chunk):
                 with playback_lock:
                     output_stream.write(data_chunk)
-            threading.Thread(target=_play_chunk_async, args=(playback_chunk,), daemon=True).start()
+            threading.Thread(
+                target=_play_chunk_async,
+                args=(playback_chunk,),
+                daemon=True
+            ).start()
 
         # Consensus-based transcription
         log_message("Transcribing via consensus helper...", "PROCESS")
         transcription = consensus_whisper_transcribe_helper(
             audio_array,
             language="en",
-            rms_threshold=config.get("rms_threshold", 0.01),
+            rms_threshold=rms_threshold,
             consensus_threshold=config.get("consensus_threshold", 0.8)
         )
         if not transcription:
-            log_message("No valid transcription (below RMS or no consensus). Skipping.", "WARNING")
+            log_message("No valid transcription; skipping.", "WARNING")
             continue
-
         if not validate_transcription(transcription):
-            log_message("Transcription validation failed. Skipping.", "WARNING")
+            log_message("Transcription did not pass validation; skipping.", "WARNING")
             continue
 
         labeled = f"[SPEAKER_1] {transcription}"
@@ -1702,30 +1801,30 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
         }) + "\n")
         session_log.flush()
 
-        # Flush any pending TTS and send to ChatManager
+        # Flush TTS and send to ChatManager
         log_message("Flushing TTS queue before inference...", "DEBUG")
         flush_current_tts()
         response = chat_manager.new_request(labeled, skip_tts=True)
 
-        # Strip tool_output markers for log/display
+        # Clean out any tool_output fences
         clean_resp = re.sub(r"```tool_output.*?```", "", response, flags=re.DOTALL).strip()
 
         # Skip empty or repeated
         if not clean_resp or clean_resp == last_response:
             continue
 
-        # Hallucination check
+        # Hallucination guard
         if len(clean_resp.split()) > max_words:
-            log_message(f"Hallucination detected (> {max_words} words). Discarding.", "WARNING")
+            log_message(f"Hallucination detected (> {max_words} words); discarding.", "WARNING")
             last_response = None
             continue
 
         last_response = clean_resp
-        log_message("LLM response received.", "INFO")
+        log_message("LLM response ready.", "INFO")
         log_message(f"LLM response: {clean_resp}", "INFO")
 
-        # Speak the final, cleaned response
-        log_message("Enqueuing final response for TTS.", "INFO")
+        # Speak the final response
+        log_message("Enqueuing response for TTS...", "INFO")
         chat_manager.tts_manager.enqueue(clean_resp)
 
         # Log assistant turn
@@ -1736,7 +1835,7 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
         }) + "\n")
         session_log.flush()
 
-        log_message("Awaiting further voice input...", "INFO")
+        log_message("Ready for next voice input...", "INFO")
 
 
 # ----- New: Text Input Override Loop -----
