@@ -185,7 +185,7 @@ def load_config():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(script_dir, "config.json")
     defaults = {
-        "primary_model": "deepseek-r1:1.5b",  # For conversation (used by other parts of the system)
+        "primary_model": "gemma3:12b",  # For conversation (used by other parts of the system)
         "secondary_model": "gemma3:4b",  # For tool calling (unused in current flow)
         "primary_temperature": 0.7,
         "secondary_temperature": 0.3,
@@ -197,12 +197,13 @@ def load_config():
         "raw": False,
         "images": None,        # Now support passing images to the primary model
         "options": {},
-        "system": "This is the FINAL INFERENCE stage. You will receive exactly one user message in this format:\n\n```context_analysis\n<your concise context analysis here>\n```\n```tool_output\n<any tool output here, or blank if none>\n```\n<the original user message>\n\n**Instructions:**\n- Do NOT say “I understand” or explain that you understand.\n- Do NOT apologize, offer pleasantries, or add filler.\n- Do NOT reference or repeat speaker labels like SPEAKER_1 or SPEAKER_2.\n- Do NOT summarize these rules or the context—just use the information in `context_analysis` and `tool_output`.\n- Immediately craft a direct, conversational, and delightfully sassy response to the user’s message.\n- Avoid hallucinations and stay on point.\n- No apologies, no “as an AI,” no extraneous commentary—just answer.",
+        "system": "This is the FINAL INFERENCE stage. You will receive exactly one user message in this precise format:\\n\\n```context_analysis\\n<your concise context analysis here>\\n```\\n```tool_output\\n<any tool output here, or blank if none>\\n```\\n<the original user message>\\n\\n**Instructions:** Do NOT say “I understand” or explain that you understand; do NOT apologize, offer pleasantries or filler; do NOT include meta‐commentary or summarize these rules; do NOT reference speaker labels like SPEAKER_1 or SPEAKER_2; calibrate your response length intelligently—provide succinct, snappy answers for straightforward prompts and rich, multi‐sentence explanations (with examples or analogies when helpful) for complex requests; maintain a direct, conversational, delightfully sassy tone; avoid hallucinations and stay ruthlessly on point; do NOT mention you are an AI.",
         "conversation_id": "default_convo",
         "rms_threshold": 0.01,
+        "tts_volume": 0.8,  # Volume for TTS playback
         "debug_audio_playback": False,
-        "enable_noise_reduction": True,
-        "consensus_threshold": 0.8       # Similarity ratio required for consensus between models
+        "enable_noise_reduction": False,
+        "consensus_threshold": 0.5       # Similarity ratio required for consensus between models
     }
     if not os.path.isfile(config_path):
         with open(config_path, "w") as f:
@@ -348,7 +349,7 @@ def flush_current_tts():
 
 # ----- TTS Processing -----
 def process_tts_request(text):
-    volume = config.get("tts_volume", 1.0)  # <-- new volume config
+    volume = config.get("tts_volume", 0.6)  # <-- new volume config
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     piper_exe = os.path.join(script_dir, "piper", "piper")
@@ -854,13 +855,24 @@ import psutil
 
 class Tools:
     @staticmethod
-    def parse_tool_call(text):
-        pattern = r"```tool_(?:code|call)\s*(.*?)\s*```"
-        match = re.search(pattern, text, re.DOTALL)
-        result = match.group(1).strip() if match else None
-        log_message("Parsed tool call from text.", "DEBUG")
-        return result
-
+    def parse_tool_call(text: str) -> str | None:
+        """
+        Extract either a fenced tool_code block or a bare call on its own line.
+        Returns e.g. "search_internet(robotics news)".
+        """
+        import re
+        pattern = (
+            r"(?:```tool_(?:code|call)\s*(.*?)\s*```)"  # fenced block
+            r"|^\s*([A-Za-z_]\w*\s*\(.*?\))\s*$"        # bare call
+        )
+        m = re.search(pattern, text, re.DOTALL | re.MULTILINE)
+        if not m:
+            log_message("Parsed tool call from text: None", "DEBUG")
+            return None
+        code = (m.group(1) or m.group(2)).strip()
+        log_message(f"Parsed tool call from text: {code!r}", "DEBUG")
+        return code
+    
     @staticmethod
     def capture_screen():
         try:
@@ -1092,7 +1104,6 @@ import threading
 import re
 import inspect
 from ollama import chat
-
 class ChatManager:
     # ---------------------------------------------------------------- #
     #                           INITIALISATION                         #
@@ -1120,10 +1131,18 @@ class ChatManager:
     def _stream_context(self, user_msg: str):
         log_message("Phase 1: Starting context-analysis stream...", "INFO")
         preamble = (
-            "You are a context‑assembly agent.\n"
-            "Given RECENT HISTORY ([[ ]]) and the CURRENT USER MESSAGE (<<< >>>), "
-            "produce a concise analysis. Return only the analysis text.\n\n"
+            "You are the CONTEXT-ASSEMBLY AGENT, the essential first pass for structuring raw conversation into actionable context.\n"
+            "You will receive exactly two inputs:\n"
+            "  1) RECENT HISTORY ([[ ]]) containing up to the last five exchanges, with speaker roles and timestamps.\n"
+            "  2) THE CURRENT USER MESSAGE (<<< >>>) with only the most recent user utterance.\n"
+            "Your goal is to produce a focused, concise analysis that:\n"
+            "  • Identifies the user’s intent, goals, and any embedded commands or questions.\n"
+            "  • Highlights key facts, constraints, or prior decisions from the history.\n"
+            "  • Notes any tools or actions that should be triggered in the next phase.\n"
+            "Keep your analysis strictly to the essentials—no greetings, apologies, or meta-commentary.\n"
+            "Return **only** the analysis text. For simple prompts, use 1–2 sentences; for complex scenarios, up to 3–4 sentences.\n"
         )
+
         recent = "\n".join(f"{m['role'].upper()}: {m['content']}"
                            for m in self.history_manager.history[-5:])
         messages = [
@@ -1148,25 +1167,41 @@ class ChatManager:
         yield "", True
 
     def _stream_tool(self, user_msg: str):
-        log_message("Phase 2: Starting tool-decision stream...", "INFO")
-        src = ""
+        log_message("Phase 2: Starting tool‐decision stream...", "INFO")
+
+        # 1) Build a concise list of available functions (name + signature only)
+        func_sigs = []
         for attr in dir(Tools):
             if not attr.startswith("_") and callable(getattr(Tools, attr)):
-                try: src += "\n" + inspect.getsource(getattr(Tools, attr))
-                except: pass
+                try:
+                    sig = inspect.signature(getattr(Tools, attr))
+                    func_sigs.append(f"{attr}{sig}")
+                except (ValueError, TypeError):
+                    func_sigs.append(f"{attr}(...)")
+        tools_message = "AVAILABLE FUNCTIONS (name + signature only):\n" + "\n".join(func_sigs)
 
+        # 2) Tightened instructions to force ONLY the codeblock
         preamble = (
-            "You are a TOOL‑CALLING agent.\n"
-            "If the USER MESSAGE requires exactly one of the available functions, "
-            "output it inside ```tool_code```; otherwise output ```tool_code\nNO_TOOL\n```.\n\n"
-            "Available functions:" + src + "\n\n"
+            "You are a TOOL‐CALLING agent. YOUR ONLY job is to pick exactly one of the functions below—no prose, no extra text. "
+            "Correct minor typos in the function name if needed. IMMEDIATELY output **one** of these two, with NO EXCEPTIONS:\n"
+            "```tool_code\n<FunctionName>(<arg1>, <arg2>, ...)\n```\n"
+            "or\n"
+            "```tool_code\nNO_TOOL\n```"
         )
+        final_instruction = "NOW: read the user message below and output your SINGLE `tool_code` block."
+
         messages = [
             {"role": "system", "content": preamble},
+            {"role": "system", "content": tools_message},
+            {"role": "system", "content": final_instruction},
             {"role": "user",   "content": user_msg}
         ]
-        payload = self.build_payload(messages, model_key="secondary_model")
 
+        # 3) Build payload for secondary_model with dedicated temperature
+        payload = self.build_payload(override_messages=messages, model_key="secondary_model")
+        payload["temperature"] = self.config_manager.config.get("tool_temperature", payload["temperature"])
+
+        # 4) Stream the model’s decision
         print("⟳ Tool: ", end="", flush=True)
         buf = ""
         for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
@@ -1179,8 +1214,27 @@ class ChatManager:
             yield tok, False
 
         print()
-        log_message(f"Phase 2 complete: tool-decision:\n{buf}", "INFO")
+        log_message(f"Phase 2 complete: raw tool‐decision output:\n{buf}", "DEBUG")
+
+        # 5) Extract and log the chosen code, with or without fences
+        import re
+        pattern = (
+            r"(?:```tool_code\s*(.*?)\s*```)"      # fenced block
+            r"|^\s*([A-Za-z_]\w*\(.*?\))\s*$"      # bare function call on its own line
+        )
+        m = re.search(pattern, buf, re.DOTALL | re.MULTILINE)
+        code = None
+        if m:
+            code = (m.group(1) or m.group(2) or "").strip()
+        if code and code.upper() != "NO_TOOL":
+            log_message(f"Tool selected: {code}", "INFO")
+        else:
+            log_message("No valid tool_code detected; treating as NO_TOOL.", "INFO")
+            code = None
+
+        # 6) End of tool stream
         yield "", True
+
 
     # ---------------------------------------------------------------- #
     #                    ORIGINAL (UNCHANGED) METHODS                  #
@@ -1273,12 +1327,10 @@ class ChatManager:
                     else:
                         end = data.find("</think>", idx)
                         if end == -1:
-                            # drop rest
                             break
                         else:
                             idx = end + len("</think>")
                             in_think = False
-                # extract full sentences from tts_buffer
                 while True:
                     m = sentence_endings.search(tts_buffer)
                     if not m:
@@ -1322,158 +1374,217 @@ class ChatManager:
         self.current_thread.join()
         return holder[0] if holder else ""
 
-    def run_tool(self, tool_code):
-        log_message(f"run_tool: Executing {tool_code}", "DEBUG")
-        allowed = {
-            n: getattr(Tools, n) for n in dir(Tools)
-            if not n.startswith("_") and callable(getattr(Tools,n))
-        }
+    def run_tool(self, tool_code: str) -> str:
+        """
+        Instead of eval, manually parse func(arg1, arg2, …) and call it.
+        Supports unquoted raw text arguments.
+        """
+        import re
+        log_message(f"run_tool: Executing {tool_code!r}", "DEBUG")
+        m = re.fullmatch(r"\s*([A-Za-z_]\w*)\s*\(\s*(.*?)\s*\)\s*", tool_code)
+        if not m:
+            log_message("run_tool: Could not parse tool_code.", "ERROR")
+            return f"Error: invalid tool invocation `{tool_code}`"
+        func_name, args_str = m.group(1), m.group(2)
+        raw_args = [arg.strip() for arg in args_str.split(",")] if args_str else []
+        # Strip surrounding quotes if present; otherwise leave as raw text
+        args = []
+        for a in raw_args:
+            if (a.startswith('"') and a.endswith('"')) or (a.startswith("'") and a.endswith("'")):
+                args.append(a[1:-1])
+            else:
+                args.append(a)
+        func = getattr(Tools, func_name, None)
+        if not func:
+            log_message(f"run_tool: Unknown function `{func_name}`", "ERROR")
+            return f"Error: unknown tool `{func_name}`"
         try:
-            return str(eval(tool_code, {"__builtins__": {}}, allowed))
+            result = func(*args)
+            log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
+            return str(result)
         except Exception as e:
             log_message(f"run_tool error: {e}", "ERROR")
-            return f"Error executing tool: {e}"
+            return f"Error executing `{func_name}`: {e}"
 
     def new_request(self, user_message, skip_tts=False):
+        import re, json
         log_message("new_request: Received user message.", "INFO")
-        # 1) record
+        # 1) Record raw user message
         self.history_manager.add_entry("user", user_message)
         _ = Utils.embed_text(user_message)
-        # 2) context
-        ctx = []
+
+        # 2) Phase 1: Context analysis
+        ctx_parts = []
         for tok, done in self._stream_context(user_message):
-            ctx.append(tok)
-            if done: break
-        ctx_txt = "".join(ctx)
-        # 3) tool
-        tb = []
-        for tok, done in self._stream_tool(user_message):
-            if done: break
-            tb.append(tok)
-        tool_str = "".join(tb)
-        code = Tools.parse_tool_call(tool_str)
+            ctx_parts.append(tok)
+            if done:
+                break
+        ctx_txt = "".join(ctx_parts)
+        log_message(f"Context analysis result: {ctx_txt!r}", "DEBUG")
+
+        # 3) Phase 2: Tool decision & execution (use ctx_txt)
+        tool_parts = []
+        for tok, done in self._stream_tool(ctx_txt):
+            tool_parts.append(tok)
+            if done:
+                break
+        raw_tool = "".join(tool_parts).strip()
+        log_message(f"Raw tool-decision output: {raw_tool!r}", "DEBUG")
+
+        code = Tools.parse_tool_call(raw_tool)
+        if not code or code.strip().upper() == "NO_TOOL":
+            if re.search(r"\b(search|lookup|find|news|headline)\b", ctx_txt, re.IGNORECASE):
+                code = f'brave_search("{ctx_txt}")'
+                log_message(f"Falling back to brave_search for query: {code}", "INFO")
+            else:
+                log_message("No tool selected; skipping tool phase.", "INFO")
+                code = None
+        else:
+            log_message(f"Tool code detected: {code}", "INFO")
+
         out = ""
-        if code and code.strip().upper() != "NO_TOOL":
+        if code:
             out = self.run_tool(code)
-        # 4) assemble
-        assembled = f"```context_analysis\n{ctx_txt}\n```"
+            log_message(f"Tool executed, raw output: {out!r}", "INFO")
+            # — do not enqueue raw tool output to TTS —
+
+        # 4) Convert raw tool output into a human‐friendly summary
+        summary = ""
         if out:
-            assembled += f"\n```tool_output\n{out}\n```"
-        assembled += f"\n{user_message}"
+            try:
+                data = json.loads(out)
+                city = data.get("city", "")
+                region = data.get("regionName", "")
+                lat = data.get("lat")
+                lon = data.get("lon")
+                summary = (
+                    f"Location lookup result: {city}, {region}. "
+                    f"Coordinates: {lat}, {lon}."
+                )
+            except Exception:
+                summary = f"Tool result: {out}"
+            log_message(f"Generated human summary: {summary!r}", "DEBUG")
+
+        # 5) Assemble final prompt for the primary model
+        if summary:
+            assembled = summary + "\n" + user_message
+        else:
+            assembled = user_message
         self.history_manager.add_entry("user", assembled)
         _ = Utils.embed_text(assembled)
-        # 5) final inference
-        return self.run_inference(assembled, skip_tts)
+        log_message(f"Final prompt for primary model: {assembled!r}", "DEBUG")
+
+        # 6) Phase 3: Final inference (primary model)
+        log_message("Starting final inference with primary model...", "INFO")
+        response = self.run_inference(assembled, skip_tts)
+        log_message(f"Final inference response: {response!r}", "INFO")
+        return response
 
 
-        
 # ----- Voice-to-LLM Loop (for microphone input) -----
 def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
-    import re
+    import re, json
+    from datetime import datetime
     log_message("Voice-to-LLM loop started. Listening for voice input...", "INFO")
     last_response = None
     max_words = config.get("max_response_words", 100)
+
     while True:
         time.sleep(3)
+        log_message("Checking audio_queue...", "DEBUG")
         if audio_queue.empty():
             continue
 
-        # Gather all pending audio chunks
+        # Gather pending audio chunks
         chunks = []
         while not audio_queue.empty():
             chunks.append(audio_queue.get())
             audio_queue.task_done()
+        log_message(f"Collected {len(chunks)} audio chunks", "DEBUG")
         if not chunks:
             continue
 
-        log_message("Voice-to-LLM loop: Audio chunks collected for transcription.", "DEBUG")
         audio_data = np.concatenate(chunks, axis=0)
         audio_array = audio_data.flatten().astype(np.float32)
 
-        # Combined noise reduction, EQ boost, and dynamic compression
+        # Audio enhancement
         if config.get("enable_noise_reduction", True):
-            log_message("Voice-to-LLM loop: Enhancing audio (denoise, EQ, compression)...", "PROCESS")
+            log_message("Enhancing audio (denoise, EQ, compression)...", "PROCESS")
             audio_array = apply_eq_and_denoise(audio_array, SAMPLE_RATE)
-            log_message("Voice-to-LLM loop: Audio enhancement complete.", "SUCCESS")
+            log_message("Audio enhancement complete.", "SUCCESS")
 
-        # Prepare audio for transcription (already enhanced)
-        audio_to_transcribe = audio_array
-
-        # Async debug playback of the enhanced audio
+        # Debug playback
         if config.get("debug_audio_playback", False):
             volume = config.get("debug_volume", 1.0)
-            playback_chunk = audio_to_transcribe * volume
-            log_message("Voice-to-LLM loop: Queueing async playback of enhanced audio...", "INFO")
-
+            log_message("Queueing async playback of enhanced audio...", "INFO")
+            playback_chunk = audio_array * volume
             def _play_chunk_async(data_chunk):
                 with playback_lock:
                     output_stream.write(data_chunk)
+            threading.Thread(target=_play_chunk_async, args=(playback_chunk,), daemon=True).start()
 
-            threading.Thread(
-                target=_play_chunk_async,
-                args=(playback_chunk,),
-                daemon=True
-            ).start()
-
-        # Transcription via Whisper with built-in timestamps
-        log_message("Voice-to-LLM loop: Transcribing with Whisper segments...", "PROCESS")
-        whisper_result = whisper_model_primary.transcribe(
-            audio_to_transcribe,
+        # Consensus-based transcription
+        log_message("Transcribing via consensus helper...", "PROCESS")
+        transcription = consensus_whisper_transcribe_helper(
+            audio_array,
             language="en",
-            temperature=0.0
+            rms_threshold=config.get("rms_threshold", 0.01),
+            consensus_threshold=config.get("consensus_threshold", 0.8)
         )
-        segments = whisper_result.get("segments", [])
-        if not segments:
-            log_message("Voice-to-LLM loop: No segments from Whisper.", "WARNING")
+        if not transcription:
+            log_message("No valid transcription (below RMS or no consensus). Skipping.", "WARNING")
             continue
-
-        # Assemble transcription with alternating speaker labels
-        transcription = ""
-        for idx, seg in enumerate(segments):
-            speaker = f"SPEAKER_{(idx % 2) + 1}"
-            transcription += f"[{speaker}] {seg['text'].strip()} "
-        transcription = transcription.strip()
 
         if not validate_transcription(transcription):
-            log_message("Voice-to-LLM loop: Transcription validation failed. Skipping.", "WARNING")
+            log_message("Transcription validation failed. Skipping.", "WARNING")
             continue
 
-        log_message(f"Voice-to-LLM loop: Transcribed prompt: {transcription}", "INFO")
+        labeled = f"[SPEAKER_1] {transcription}"
+        log_message(f"Transcribed prompt: {labeled}", "INFO")
+
+        # Log user turn
         session_log.write(json.dumps({
             "role": "user",
-            "content": transcription,
+            "content": labeled,
             "timestamp": datetime.now().isoformat()
-        }) + "")
+        }) + "\n")
         session_log.flush()
 
+        # Flush any pending TTS and send to ChatManager
+        log_message("Flushing TTS queue before inference...", "DEBUG")
         flush_current_tts()
-        response = chat_manager.new_request(transcription)
-        # strip tool_output markers
-        response = re.sub(r"```tool_output.*?```", "", response, flags=re.DOTALL).strip()
-        # skip empty or repeated
-        if not response or response == last_response:
+        response = chat_manager.new_request(labeled, skip_tts=True)
+
+        # Strip tool_output markers for log/display
+        clean_resp = re.sub(r"```tool_output.*?```", "", response, flags=re.DOTALL).strip()
+
+        # Skip empty or repeated
+        if not clean_resp or clean_resp == last_response:
             continue
-        # detect hallucination: overly long
-        if len(response.split()) > max_words:
-            log_message(
-                f"Voice-to-LLM loop: Hallucination detected (>{max_words} words). Discarding response and restarting inference.",
-                "WARNING"
-            )
+
+        # Hallucination check
+        if len(clean_resp.split()) > max_words:
+            log_message(f"Hallucination detected (> {max_words} words). Discarding.", "WARNING")
             last_response = None
             continue
-        last_response = response
 
-        log_message("Voice-to-LLM loop: LLM response received.", "INFO")
-        log_message("Voice-to-LLM loop: LLM response: " + response, "INFO")
+        last_response = clean_resp
+        log_message("LLM response received.", "INFO")
+        log_message(f"LLM response: {clean_resp}", "INFO")
 
+        # Speak the final, cleaned response
+        log_message("Enqueuing final response for TTS.", "INFO")
+        chat_manager.tts_manager.enqueue(clean_resp)
+
+        # Log assistant turn
         session_log.write(json.dumps({
             "role": "assistant",
-            "content": response,
+            "content": clean_resp,
             "timestamp": datetime.now().isoformat()
-        }) + "")
+        }) + "\n")
         session_log.flush()
 
-        log_message("Voice-to-LLM loop: Awaiting further voice input...", "INFO")
+        log_message("Awaiting further voice input...", "INFO")
 
 
 # ----- New: Text Input Override Loop -----
@@ -1496,6 +1607,7 @@ def text_input_loop(chat_manager: ChatManager):
             session_log.flush()
         except Exception as e:
             log_message("Error in text input loop: " + str(e), "ERROR")
+
 # ----- Main Function -----
 def main():
     # file watcher to restart on code or config.json changes
