@@ -872,7 +872,78 @@ class Tools:
         code = (m.group(1) or m.group(2)).strip()
         log_message(f"Parsed tool call from text: {code!r}", "DEBUG")
         return code
-    
+
+    @staticmethod
+    def get_chat_history(count: int | None = None, since: str | None = None) -> str:
+        """
+        Return up to `count` entries from the global chat history, optionally only entries
+        from `since` (absolute timestamp or relative like '2 hours ago').
+        """
+        import re, json
+        from datetime import datetime
+
+        # require dateutil for parsing
+        try:
+            from dateutil import parser
+            from dateutil.relativedelta import relativedelta
+        except ImportError:
+            log_message("get_chat_history: python-dateutil not installed", "ERROR")
+            return "Error: date parsing library missing."
+
+        # grab the global history list
+        hist = getattr(Tools, "_history_ref", None)
+        if hist is None:
+            log_message("get_chat_history: history reference not set", "ERROR")
+            return "Error: history not available."
+
+        # compute cutoff if `since` provided
+        cutoff: datetime | None = None
+        if since:
+            # try relative "X units ago"
+            m = re.match(
+                r"^\s*(\d+)\s*(seconds?|minutes?|hours?|days?|weeks?|months?|years?)\s+ago\s*$",
+                since, re.IGNORECASE
+            )
+            if m:
+                num = int(m.group(1))
+                unit = m.group(2).lower()
+                if not unit.endswith("s"):
+                    unit += "s"
+                cutoff = datetime.now() - relativedelta(**{unit: num})
+            else:
+                # try absolute parse
+                try:
+                    cutoff = parser.parse(since)
+                except Exception as e:
+                    log_message(f"get_chat_history: cannot parse date '{since}': {e}", "ERROR")
+                    return f"Error: unable to parse date '{since}'."
+
+        # filter and slice
+        entries = list(hist)  # shallow copy
+        if cutoff:
+            filtered = []
+            for e in entries:
+                ts_str = e.get("timestamp", "")
+                try:
+                    ts = parser.parse(ts_str)
+                    if ts >= cutoff:
+                        filtered.append(e)
+                except Exception:
+                    # skip unparsable
+                    continue
+            entries = filtered
+
+        if count is not None:
+            try:
+                c = int(count)
+                entries = entries[-c:]
+            except Exception:
+                log_message(f"get_chat_history: invalid count '{count}'", "ERROR")
+                return f"Error: invalid count '{count}'."
+
+        # return JSON string
+        return json.dumps(entries, indent=2)
+
     @staticmethod
     def capture_screen():
         try:
@@ -1376,35 +1447,86 @@ class ChatManager:
 
     def run_tool(self, tool_code: str) -> str:
         """
-        Instead of eval, manually parse func(arg1, arg2, …) and call it.
-        Supports unquoted raw text arguments.
+        Execute a Tools.<func>(...) invocation, supporting:
+         - keyword args with literal constants
+         - bare positional args (quoted or unquoted → treated as strings)
+         - Name nodes (treated as their .id)
         """
-        import re
+        import ast, re
         log_message(f"run_tool: Executing {tool_code!r}", "DEBUG")
-        m = re.fullmatch(r"\s*([A-Za-z_]\w*)\s*\(\s*(.*?)\s*\)\s*", tool_code)
-        if not m:
-            log_message("run_tool: Could not parse tool_code.", "ERROR")
-            return f"Error: invalid tool invocation `{tool_code}`"
-        func_name, args_str = m.group(1), m.group(2)
-        raw_args = [arg.strip() for arg in args_str.split(",")] if args_str else []
-        # Strip surrounding quotes if present; otherwise leave as raw text
-        args = []
-        for a in raw_args:
-            if (a.startswith('"') and a.endswith('"')) or (a.startswith("'") and a.endswith("'")):
-                args.append(a[1:-1])
-            else:
-                args.append(a)
-        func = getattr(Tools, func_name, None)
-        if not func:
-            log_message(f"run_tool: Unknown function `{func_name}`", "ERROR")
-            return f"Error: unknown tool `{func_name}`"
+
+        # 1) Regex fallback for single unquoted arg: func(foo bar) → treat "foo bar" as single string
+        m_simple = re.fullmatch(r"\s*([A-Za-z_]\w*)\(\s*([^)]+?)\s*\)\s*", tool_code)
+        if m_simple:
+            func_name, raw_arg = m_simple.group(1), m_simple.group(2)
+            func = getattr(Tools, func_name, None)
+            if func:
+                log_message(f"run_tool: Fallback parse → {func_name}('{raw_arg}')", "DEBUG")
+                try:
+                    result = func(raw_arg)
+                    log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
+                    return str(result)
+                except Exception as e:
+                    log_message(f"run_tool error: {e}", "ERROR")
+                    return f"Error executing `{func_name}`: {e}"
+
+        # 2) Full AST-based parsing for richer calls
         try:
-            result = func(*args)
+            tree = ast.parse(tool_code.strip(), mode="eval")
+            if not isinstance(tree, ast.Expression) or not isinstance(tree.body, ast.Call):
+                raise ValueError("Not a function call")
+            call: ast.Call = tree.body
+
+            # get function
+            if isinstance(call.func, ast.Name):
+                func_name = call.func.id
+            else:
+                raise ValueError("Unsupported function expression")
+            func = getattr(Tools, func_name, None)
+            if not func:
+                raise NameError(f"Unknown tool `{func_name}`")
+
+            # positional args
+            args = []
+            for arg in call.args:
+                if isinstance(arg, ast.Constant):
+                    args.append(arg.value)
+                elif isinstance(arg, ast.Name):
+                    # treat bare name as string
+                    args.append(arg.id)
+                else:
+                    # try to pull the source segment
+                    seg = ast.get_source_segment(tool_code, arg)
+                    if seg is not None:
+                        args.append(seg.strip())
+                    else:
+                        raise ValueError("Unsupported arg type")
+
+            # keyword args
+            kwargs = {}
+            for kw in call.keywords:
+                if not kw.arg:
+                    continue
+                v = kw.value
+                if isinstance(v, ast.Constant):
+                    kwargs[kw.arg] = v.value
+                elif isinstance(v, ast.Name):
+                    kwargs[kw.arg] = v.id
+                else:
+                    seg = ast.get_source_segment(tool_code, v)
+                    if seg is not None:
+                        kwargs[kw.arg] = seg.strip()
+                    else:
+                        raise ValueError("Unsupported kwarg type")
+
+            log_message(f"run_tool: Calling {func_name} with args={args} kwargs={kwargs}", "DEBUG")
+            result = func(*args, **kwargs)
             log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
             return str(result)
+
         except Exception as e:
             log_message(f"run_tool error: {e}", "ERROR")
-            return f"Error executing `{func_name}`: {e}"
+            return f"Error executing `{tool_code}`: {e}"
 
     def new_request(self, user_message, skip_tts=False):
         import re, json
@@ -1422,59 +1544,89 @@ class ChatManager:
         ctx_txt = "".join(ctx_parts)
         log_message(f"Context analysis result: {ctx_txt!r}", "DEBUG")
 
-        # 3) Phase 2: Tool decision & execution (use ctx_txt)
-        tool_parts = []
-        for tok, done in self._stream_tool(ctx_txt):
-            tool_parts.append(tok)
-            if done:
+        # 3) Phase 2: Tool chaining & execution
+        tool_context   = ctx_txt
+        summaries      = []
+        invoked_fns    = set()
+        MAX_TOOL_CALLS = 3
+
+        for i in range(MAX_TOOL_CALLS):
+            # decide the next tool
+            tool_parts = []
+            for tok, done in self._stream_tool(tool_context):
+                tool_parts.append(tok)
+                if done:
+                    break
+            raw_tool = "".join(tool_parts).strip()
+            log_message(f"Raw tool-decision output (iter {i+1}): {raw_tool!r}", "DEBUG")
+
+            code = Tools.parse_tool_call(raw_tool)
+            # fallback to search if none
+            if not code or code.upper() == "NO_TOOL":
+                if re.search(r"\b(search|lookup|find|news|headline)\b", tool_context, re.IGNORECASE):
+                    code = f'brave_search("{tool_context}")'
+                    log_message(f"Falling back to brave_search: {code}", "INFO")
+                else:
+                    log_message("No more tools to invoke; breaking.", "INFO")
+                    break
+
+            # extract function name
+            m = re.match(r"\s*([A-Za-z_]\w*)\s*\(", code)
+            fn = m.group(1) if m else None
+            if not fn or fn in invoked_fns:
+                log_message(f"Function '{fn}' already invoked or invalid; stopping.", "INFO")
                 break
-        raw_tool = "".join(tool_parts).strip()
-        log_message(f"Raw tool-decision output: {raw_tool!r}", "DEBUG")
+            invoked_fns.add(fn)
+            log_message(f"Invoking tool: {code!r}", "INFO")
 
-        code = Tools.parse_tool_call(raw_tool)
-        if not code or code.strip().upper() == "NO_TOOL":
-            if re.search(r"\b(search|lookup|find|news|headline)\b", ctx_txt, re.IGNORECASE):
-                code = f'brave_search("{ctx_txt}")'
-                log_message(f"Falling back to brave_search for query: {code}", "INFO")
-            else:
-                log_message("No tool selected; skipping tool phase.", "INFO")
-                code = None
-        else:
-            log_message(f"Tool code detected: {code}", "INFO")
-
-        out = ""
-        if code:
+            # execute
             out = self.run_tool(code)
-            log_message(f"Tool executed, raw output: {out!r}", "INFO")
-            # — do not enqueue raw tool output to TTS —
+            log_message(f"Tool '{fn}' output: {out!r}", "INFO")
 
-        # 4) Convert raw tool output into a human‐friendly summary
-        summary = ""
-        if out:
+            # summarize output
+            summary = None
             try:
                 data = json.loads(out)
-                city = data.get("city", "")
-                region = data.get("regionName", "")
-                lat = data.get("lat")
-                lon = data.get("lon")
-                summary = (
-                    f"Location lookup result: {city}, {region}. "
-                    f"Coordinates: {lat}, {lon}."
-                )
-            except Exception:
-                summary = f"Tool result: {out}"
-            log_message(f"Generated human summary: {summary!r}", "DEBUG")
+                if fn in ("search_internet", "brave_search"):
+                    results = data.get("web", {}).get("results", [])
+                    top3 = results[:3]
+                    lines = []
+                    for entry in top3:
+                        title = entry.get("title") or entry.get("name") or entry.get("description","(no title)")
+                        url   = entry.get("url")   or entry.get("link","")
+                        lines.append(f"- {title} ({url})")
+                    summary = f"Top {len(lines)} search results:\n" + "\n".join(lines)
+                elif fn == "get_current_location":
+                    city   = data.get("city","?")
+                    region = data.get("regionName","?")
+                    lat    = data.get("lat")
+                    lon    = data.get("lon")
+                    summary = f"Location: {city}, {region} (lat {lat}, lon {lon})"
+            except Exception as e:
+                log_message(f"Could not parse JSON from {fn}: {e}", "WARNING")
 
-        # 5) Assemble final prompt for the primary model
-        if summary:
-            assembled = summary + "\n" + user_message
-        else:
-            assembled = user_message
+            if summary is None:
+                # fallback raw echo
+                summary = f"{fn} result: {out}"
+            log_message(f"Generated summary for '{fn}': {summary!r}", "DEBUG")
+
+            summaries.append(summary)
+            # chain context
+            tool_context += "\n" + summary
+
+        # 4) Assemble tool_output block
+        assembled = user_message
+        if summaries:
+            fence = "```tool_output"
+            block = fence + "\n" + "\n\n".join(summaries) + "\n```"
+            assembled = block + "\n" + user_message
+
+        # record and embed
         self.history_manager.add_entry("user", assembled)
         _ = Utils.embed_text(assembled)
         log_message(f"Final prompt for primary model: {assembled!r}", "DEBUG")
 
-        # 6) Phase 3: Final inference (primary model)
+        # 5) Phase 3: Final inference
         log_message("Starting final inference with primary model...", "INFO")
         response = self.run_inference(assembled, skip_tts)
         log_message(f"Final inference response: {response!r}", "INFO")
