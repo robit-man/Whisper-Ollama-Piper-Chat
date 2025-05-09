@@ -832,20 +832,38 @@ class Utils:
                 pass
     @staticmethod
     def embed_text(text):
+        """
+        Embed into a 1-D numpy array of shape (768,).
+        """
         try:
             log_message("Embedding text for context.", "PROCESS")
             response = embed(model="nomic-embed-text", input=text)
-            embedding = response['embeddings']
-            vec = np.array(embedding, dtype=float)
+            vec = np.array(response["embeddings"], dtype=float)
+            # ensure 1-D
+            vec = vec.flatten()
             norm = np.linalg.norm(vec)
-            if norm == 0:
-                return vec
-            normalized = vec / norm
+            if norm > 0:
+                vec = vec / norm
             log_message("Text embedding computed and normalized.", "SUCCESS")
-            return normalized
+            return vec
         except Exception as e:
             log_message("Error during text embedding: " + str(e), "ERROR")
-            return np.zeros(768)
+            return np.zeros(768, dtype=float)
+
+    @staticmethod
+    def cosine_similarity(vec1, vec2):
+        """
+        Compute cosine‐similarity between two 1-D vectors.
+        """
+        # flatten just in case
+        v1 = np.array(vec1).flatten()
+        v2 = np.array(vec2).flatten()
+        if np.linalg.norm(v1) == 0 or np.linalg.norm(v2) == 0:
+            log_message("One of the vectors has zero norm in cosine similarity calculation.", "WARNING")
+            return 0.0
+        sim = float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
+        log_message("Cosine similarity computed.", "DEBUG")
+        return sim
 
 import os
 import re
@@ -857,15 +875,27 @@ class Tools:
     @staticmethod
     def parse_tool_call(text: str) -> str | None:
         """
-        Extract either a fenced tool_code block or a bare call on its own line.
-        Returns e.g. "search_internet(robotics news)".
+        Extract either a fenced ```tool_code``` block or a bare call on its own line,
+        allowing positional OR keyword args (string, number or None).
+        Returns the raw call, e.g. `get_chat_history("latest", 5)` or `my_tool(foo="bar", n=3)`.
         """
         import re
-        pattern = (
-            r"(?:```tool_(?:code|call)\s*(.*?)\s*```)"  # fenced block
-            r"|^\s*([A-Za-z_]\w*\s*\(.*?\))\s*$"        # bare call
+        pattern_str = (
+            r"(?:```tool_code\s*"
+              r"([A-Za-z_]\w*\(\s*"
+                # one arg: literal or keyword‐literal
+                r"(?:(?:[A-Za-z_]\w*\s*=\s*)?(?:'[^']*'|\"[^\"]*\"|\d+|None))"
+                # additional comma‐separated args
+                r"(?:\s*,\s*(?:(?:[A-Za-z_]\w*\s*=\s*)?(?:'[^']*'|\"[^\"]*\"|\d+|None)))*"
+              r"\)\s*)```)"
+            r"|^"
+              r"([A-Za-z_]\w*\(\s*"
+                r"(?:(?:[A-Za-z_]\w*\s*=\s*)?(?:'[^']*'|\"[^\"]*\"|\d+|None))"
+                r"(?:\s*,\s*(?:(?:[A-Za-z_]\w*\s*=\s*)?(?:'[^']*'|\"[^\"]*\"|\d+|None)))*"
+              r"\))"
+            r"\s*$"
         )
-        m = re.search(pattern, text, re.DOTALL | re.MULTILINE)
+        m = re.search(pattern_str, text, flags=re.DOTALL | re.MULTILINE)
         if not m:
             log_message("Parsed tool call from text: None", "DEBUG")
             return None
@@ -1260,6 +1290,8 @@ class ChatManager:
         self.memory_manager   = memory_manager
         self.mode_manager     = mode_manager
 
+        Tools._history_manager = history_manager
+        
         self.stop_flag       = False
         self.inference_lock  = threading.Lock()
         self.current_thread  = None
@@ -1270,28 +1302,49 @@ class ChatManager:
     #                      INTERNAL STREAMING HELPERS                  #
     # ---------------------------------------------------------------- #
     def _stream_context(self, user_msg: str):
+        import json
         log_message("Phase 1: Starting context-analysis stream...", "INFO")
+
+        # 1) Build the system prompt
         preamble = (
-            "You are the CONTEXT-ASSEMBLY AGENT, the essential first pass for structuring raw conversation into actionable context.\n"
-            "You will receive exactly two inputs:\n"
-            "  1) RECENT HISTORY ([[ ]]) containing up to the last five exchanges, with speaker roles and timestamps.\n"
-            "  2) THE CURRENT USER MESSAGE (<<< >>>) with only the most recent user utterance.\n"
-            "Your goal is to produce a focused, concise analysis that:\n"
-            "  • Identifies the user’s intent, goals, and any embedded commands or questions.\n"
-            "  • Highlights key facts, constraints, or prior decisions from the history.\n"
-            "  • Notes any tools or actions that should be triggered in the next phase.\n"
-            "Keep your analysis strictly to the essentials—no greetings, apologies, or meta-commentary.\n"
-            "Return **only** the analysis text. For simple prompts, use 1–2 sentences; for complex scenarios, up to 3–4 sentences.\n"
+            "You are the CONTEXT-ASSEMBLY AGENT. Your job is to take the following inputs and produce a concise analysis "
+            "of the user’s intent, goals, and any embedded commands or constraints—no greetings or meta-commentary.\n"
+            "Return only the analysis text, in 1–2 sentences for simple prompts or up to 3–4 sentences for complex ones.\n\n"
         )
 
-        recent = "\n".join(f"{m['role'].upper()}: {m['content']}"
-                           for m in self.history_manager.history[-5:])
+        # 2) Grab the last 5 exchanges
+        recent = "\n".join(
+            f"{m['role'].upper()}: {m['content']}"
+            for m in self.history_manager.history[-5:]
+        )
+
+        # 3) Do a similarity search against the full history
+        try:
+            sim_json = Tools.get_chat_history(user_msg, 5)  # top 5 by cosine + keyword
+            sim_results = json.loads(sim_json).get("results", [])
+            similar = "\n".join(
+                f"{e['role'].upper()}: {e['content']}"
+                for e in sim_results
+            )
+        except Exception as e:
+            log_message(f"Could not retrieve similar history: {e}", "WARNING")
+            similar = ""
+
+        # 4) Assemble the combined context block
+        context_block = ""
+        if similar:
+            context_block += "SIMILAR PAST MESSAGES:\n" + similar + "\n\n"
+        if recent:
+            context_block += "RECENT HISTORY:\n" + recent + "\n\n"
+
+        # 5) Build the Chat payload
         messages = [
-            {"role": "system", "content": preamble + "[[ " + recent + " ]]"},
+            {"role": "system", "content": preamble + context_block},
             {"role": "user",   "content": user_msg}
         ]
-        payload = self.build_payload(messages, model_key="secondary_model")
+        payload = self.build_payload(override_messages=messages, model_key="secondary_model")
 
+        # 6) Stream the model’s context analysis
         print("⟳ Context: ", end="", flush=True)
         buf = ""
         for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
@@ -1306,6 +1359,7 @@ class ChatManager:
         print()
         log_message(f"Phase 1 complete: context analysis:\n{buf}", "INFO")
         yield "", True
+
 
     def _stream_tool(self, user_msg: str):
         log_message("Phase 2: Starting tool‐decision stream...", "INFO")
