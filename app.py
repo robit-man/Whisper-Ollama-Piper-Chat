@@ -169,6 +169,8 @@ if not os.path.exists(SETUP_MARKER):
         "denoiser",         # For real-time speech enhancement via denoiser
         "pyautogui",        # For screen capture
         "pillow",           # For image handling
+        "opencv-python",             # For image processing
+        "mss",             # For screen capture
     ])
     with open(SETUP_MARKER, "w") as f:
         f.write("Setup complete")
@@ -259,6 +261,9 @@ import noisereduce as nr
 import torch
 from denoiser import pretrained  # For speech enhancement via denoiser
 from PIL import ImageGrab  # Ensure Pillow is installed
+import inspect
+import cv2
+import mss
 
 load_dotenv()
 brave_api_key = os.environ.get("BRAVE_API_KEY")
@@ -883,31 +888,74 @@ class Tools:
     @staticmethod
     def parse_tool_call(text: str) -> str | None:
         """
-        Extract either a fenced ```tool_code``` block or a bare call on its own line,
-        allowing positional OR keyword args (string, number or None).
-        Returns the raw call, e.g. `get_chat_history("latest", 5)` or `my_tool(foo="bar", n=3)`.
+        Extract either:
+          1) A fenced ```tool_code``` block
+          2) An inline-backtick call: `func(arg1, arg2)`
+          3) A bare call on its own line: func(arg1, arg2)
+
+        Supports:
+          - Zero-argument calls: func()
+          - Positional or keyword args of the form:
+              * "string" or 'string'
+              * integer literals (\d+)
+              * the literal None
+          - Keyword args written as key=value or key: value
+        Returns the raw call, e.g.:
+          'get_current_location()'
+          'get_chat_history("latest", 5)'
+          'secondary_agent_tool(prompt="Hi", temperature=0.5)'
+        or None if no valid tool invocation is found.
         """
         import re
-        pattern_str = (
-            r"(?:```tool_code\s*"
-              r"([A-Za-z_]\w*\(\s*"
-                # one arg: literal or keyword‐literal
-                r"(?:(?:[A-Za-z_]\w*\s*=\s*)?(?:'[^']*'|\"[^\"]*\"|\d+|None))"
-                # additional comma‐separated args
-                r"(?:\s*,\s*(?:(?:[A-Za-z_]\w*\s*=\s*)?(?:'[^']*'|\"[^\"]*\"|\d+|None)))*"
-              r"\)\s*)```)"
-            r"|^"
-              r"([A-Za-z_]\w*\(\s*"
-                r"(?:(?:[A-Za-z_]\w*\s*=\s*)?(?:'[^']*'|\"[^\"]*\"|\d+|None))"
-                r"(?:\s*,\s*(?:(?:[A-Za-z_]\w*\s*=\s*)?(?:'[^']*'|\"[^\"]*\"|\d+|None)))*"
-              r"\))"
-            r"\s*$"
+
+        # 1) Trim leading/trailing whitespace
+        t = text.strip()
+
+        # 2) Normalize key: value → key=value
+        t = re.sub(
+            r'(\b[A-Za-z_]\w*\b)\s*:\s*'                 # key:
+            r'("(?:[^"\\]|\\.)*"|'                      #   "quoted string"
+            r'\'(?:[^\'\\]|\\.)*\'|'                    #   'quoted string'
+            r'\d+|None)',                               #   integer or None
+            r'\1=\2',
+            t
         )
-        m = re.search(pattern_str, text, flags=re.DOTALL | re.MULTILINE)
+
+        # 3) Unwrap inline single-backticks if present
+        if t.startswith("`") and t.endswith("`"):
+            t = t[1:-1].strip()
+
+        # Prepare a reusable piece for “literal” (string, number, None)
+        LIT = r'(?:\"[^\"]*\"|\'[^\']*\'|\d+|None)'
+
+        # And optional key= prefix
+        KV  = rf'(?:[A-Za-z_]\w*\s*=\s*)?{LIT}'
+
+        # 4) Try fenced ```tool_code``` block
+        fenced_re = re.compile(
+            rf"```tool_code\s*"
+            rf"([A-Za-z_]\w*\s*\(\s*"                  # FuncName(
+            rf"(?:{KV}(?:\s*,\s*{KV})*)?\s*"           #   optional args...
+            rf"\)\s*)```",                            # )```
+            re.DOTALL
+        )
+        m = fenced_re.search(t)
+
+        # 5) If not found, fall back to a bare call on its own line
+        if not m:
+            bare_re = re.compile(
+                rf"^([A-Za-z_]\w*\s*\(\s*"
+                rf"(?:{KV}(?:\s*,\s*{KV})*)?\s*"
+                rf"\))\s*$",
+                re.DOTALL
+            )
+            m = bare_re.match(t)
+
         if not m:
             log_message("Parsed tool call from text: None", "DEBUG")
             return None
-        code = (m.group(1) or m.group(2)).strip()
+
+        code = m.group(1).strip()
         log_message(f"Parsed tool call from text: {code!r}", "DEBUG")
         return code
 
@@ -993,7 +1041,6 @@ class Tools:
             results.sort(key=lambda x: x[0], reverse=True)
         else:
             # No query: return most recent first
-            # assume history in chronological order
             for e in reversed(filtered):
                 results.append((0.0, e))
 
@@ -1012,40 +1059,93 @@ class Tools:
 
         return json.dumps({"results": out}, indent=2)
 
+
+        
     @staticmethod
-    def capture_screen():
+    def capture_screen_and_annotate():
+        """
+        Capture the primary monitor’s screen using mss, save it with a timestamp,
+        and return a JSON string containing:
+          - 'file': the saved file path
+          - 'prompt': an instruction for the model to describe the screenshot.
+
+        Usage:
+            ```tool_code
+            capture_screen_and_annotate()
+            ```
+        """
+
+        # 1) Build output path
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename   = f"screen_{ts}.png"
+        path       = os.path.join(script_dir, filename)
+
+        # 2) Capture with mss
         try:
-            import pyautogui
-            log_message("Capturing screen using pyautogui...", "PROCESS")
-            screenshot = pyautogui.screenshot()
-            file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_screen.png")
-            screenshot.save(file_path)
-            log_message(f"Screen captured and saved to {file_path}", "SUCCESS")
-            return file_path
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]  # primary monitor
+                img     = sct.grab(monitor)
+                mss.tools.to_png(img.rgb, img.size, output=path)
+            log_message(f"Screen captured and saved to {path}", "SUCCESS")
         except Exception as e:
-            log_message("Error capturing screen: " + str(e), "ERROR")
-            return f"Error: {e}"
+            log_message(f"Error capturing screen: {e}", "ERROR")
+            return json.dumps({"error": str(e)})
+
+        # 3) Return the file path plus a prompt
+        return json.dumps({
+            "file":   path,
+            "prompt": f"Please describe what you see in the screenshot, considering this is a screenshot which is of the computer that you reside on, and activity on the screen may be critical to answering questions, be as verbose as possible and describe any text or images present at '{path}'."
+        })
+
 
     @staticmethod
-    def capture_screenshot():
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        folder = os.path.join(base_dir, "screen_states")
-        if not os.path.exists(folder):
-            os.makedirs(folder)
-            log_message(f"Created folder for screenshots: {folder}", "SUCCESS")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{timestamp}.png"
-        file_path = os.path.join(folder, filename)
+    def capture_webcam_and_annotate():
+        """
+        Capture one frame from the default webcam using OpenCV,
+        save it with a timestamp, and return a JSON string containing:
+          - 'file': the saved file path
+          - 'prompt': an instruction for the model to describe the image.
+
+        Usage:
+            ```tool_code
+            capture_webcam_and_annotate()
+            ```
+        """
+
+        # 1) Open the default camera
+        cam = cv2.VideoCapture(0, cv2.CAP_DSHOW if os.name == "nt" else 0)
+        if not cam.isOpened():
+            log_message("Webcam not accessible via cv2.VideoCapture", "ERROR")
+            return json.dumps({"error": "Webcam not accessible."})
+
+        # 2) Grab a frame
+        ret, frame = cam.read()
+        cam.release()
+        if not ret:
+            log_message("Failed to read frame from webcam", "ERROR")
+            return json.dumps({"error": "Failed to capture frame."})
+
+        # 3) Build output path
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename   = f"webcam_{ts}.png"
+        path       = os.path.join(script_dir, filename)
+
+        # 4) Save as PNG
         try:
-            from PIL import ImageGrab
-            log_message("Capturing screenshot using Pillow's ImageGrab...", "PROCESS")
-            screenshot = ImageGrab.grab()
-            screenshot.save(file_path)
-            log_message(f"Screenshot captured and saved to {file_path}", "SUCCESS")
-            return f"./screen_states/{filename}"
+            cv2.imwrite(path, frame)
+            log_message(f"Webcam frame saved to {path}", "SUCCESS")
         except Exception as e:
-            log_message("Error capturing screenshot: " + str(e), "ERROR")
-            return f"Error: {e}"
+            log_message(f"Error saving webcam frame: {e}", "ERROR")
+            return json.dumps({"error": str(e)})
+
+        # 5) Return the file path plus a prompt
+        return json.dumps({
+            "file":   path,
+            "prompt": f"Please describe what you see in the image in great detail, considering the context that this image is coming from a webcam attached to the computer you reside on at '{path}'."
+        })
+
 
     @staticmethod
     def convert_query_for_image(query, image_path):
@@ -1066,39 +1166,6 @@ class Tools:
             log_message(f"Image file not found: {full_path}", "ERROR")
             return f"Error: Image file not found: {full_path}"
         
-    @staticmethod
-    async def see_whats_around():
-        images_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
-        if not os.path.exists(images_dir):
-            os.makedirs(images_dir, exist_ok=True)
-            log_message(f"Images directory created at {images_dir}.", "SUCCESS")
-        url = "http://127.0.0.1:8234/camera/default_0"
-        import httpx
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                log_message(f"[Attempt {attempt+1}/{max_retries}] Attempting to capture image from {url}", "PROCESS")
-                async with httpx.AsyncClient(timeout=5) as client:
-                    response = await client.get(url)
-                    if response.status_code == 200:
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        filename = f"camera_{timestamp}.jpg"
-                        file_path = os.path.join(images_dir, filename)
-                        with open(file_path, "wb") as f:
-                            async for chunk in response.aiter_bytes(chunk_size=8192):
-                                f.write(chunk)
-                        log_message(f"Image captured and saved at: {file_path}", "SUCCESS")
-                        return file_path
-                    else:
-                        log_message(f"Unexpected status code {response.status_code} while capturing image.", "WARNING")
-            except httpx.RequestError as e:
-                log_message(f"Network or request error occurred: {e}", "WARNING")
-            log_message("Retrying after short delay...", "INFO")
-            await asyncio.sleep(1)
-        error_msg = "Error: Unable to capture image after multiple attempts."
-        log_message(error_msg, "ERROR")
-        return error_msg
-
     @staticmethod
     def get_battery_voltage():
         try:
@@ -1263,7 +1330,12 @@ class Tools:
 
     @staticmethod
     def secondary_agent_tool(prompt: str, temperature: float = 0.7) -> str:
-        secondary_model = config["secondary_model"]
+        """
+        Invoke the secondary LLM (for tool processing) with a user prompt
+        and an optional temperature. Returns the assistant’s message content
+        as a plain string (or an error message on failure).
+        """
+        secondary_model = config.get("secondary_model")
         payload = {
             "model": secondary_model,
             "temperature": temperature,
@@ -1271,18 +1343,23 @@ class Tools:
             "stream": False
         }
         try:
-            log_message("Calling secondary agent tool.", "PROCESS")
-            response = chat(model=secondary_model, messages=payload["messages"], stream=False)
+            log_message(f"Calling secondary agent tool with prompt={prompt!r} temperature={temperature}", "PROCESS")
+            response = chat(
+                model=secondary_model,
+                messages=payload["messages"],
+                stream=False
+            )
+            # Ollama’s chat(...) returns {"message": {"content": ...}}
+            content = response.get("message", {}).get("content")
+            if content is None:
+                log_message("Secondary agent tool returned no content field", "WARNING")
+                return ""
             log_message("Secondary agent tool responded.", "SUCCESS")
-            return response["message"]["content"]
+            return content
         except Exception as e:
-            log_message("Error in secondary agent: " + str(e), "ERROR")
+            log_message(f"Error in secondary agent tool: {e}", "ERROR")
             return f"Error in secondary agent: {e}"
 
-import threading
-import re
-import inspect
-from ollama import chat
 class ChatManager:
     # ---------------------------------------------------------------- #
     #                           INITIALISATION                         #
@@ -1315,12 +1392,14 @@ class ChatManager:
 
         # 1) Build the system prompt
         preamble = (
-            "You are the CONTEXT-ASSEMBLY AGENT. Your job is to take the following inputs and produce a concise analysis "
-            "of the user’s intent, goals, and any embedded commands or constraints—no greetings or meta-commentary.\n"
-            "Return only the analysis text, in 1–2 sentences for simple prompts or up to 3–4 sentences for complex ones.\n\n"
+            "You are the CONTEXT-ASSEMBLY AGENT. Your job is to take the following inputs "
+            "and produce a concise analysis of the user’s intent, goals, and any embedded "
+            "commands or constraints—no greetings or meta-commentary.\n"
+            "Return only the analysis text, in 1–2 sentences for simple prompts or up to 3–4 "
+            "sentences for complex ones.\n\n"
         )
 
-        # 2) Grab the last 5 exchanges
+        # 2) Grab the last 5 exchanges (strictly chronological)
         recent = "\n".join(
             f"{m['role'].upper()}: {m['content']}"
             for m in self.history_manager.history[-5:]
@@ -1690,6 +1769,7 @@ class ChatManager:
     def new_request(self, user_message, skip_tts=False):
         import re, json
         from bs4 import BeautifulSoup
+
         log_message("new_request: Received user message.", "INFO")
         # 1) Record raw user message
         self.history_manager.add_entry("user", user_message)
@@ -1718,6 +1798,9 @@ class ChatManager:
                 if done:
                     break
             raw_tool = "".join(tool_parts).strip()
+            # unwrap any fenced or backtick markup
+            raw_tool = re.sub(r"^```tool_code\s*|\s*```$", "", raw_tool, flags=re.DOTALL).strip()
+            raw_tool = raw_tool.strip("`").strip()
             log_message(f"Raw tool-decision output (iter {i+1}): {raw_tool!r}", "DEBUG")
 
             code = Tools.parse_tool_call(raw_tool)
@@ -1743,21 +1826,19 @@ class ChatManager:
             try:
                 data = json.loads(out)
                 if fn in ("search_internet", "brave_search"):
-                    results = data.get("web", {}).get("results", [])
-                    top3 = results[:3]
+                    results = data.get("web", {}).get("results", [])[:3]
                     lines = []
-                    for entry in top3:
+                    for entry in results:
                         title = entry.get("title") or entry.get("name") or entry.get("description", "(no title)")
                         url   = entry.get("url")   or entry.get("link", "")
-                        # fetch the page and extract a snippet
-                        html = Tools.bs4_scrape(url)
+                        html  = Tools.bs4_scrape(url)
                         if html.startswith("Error"):
                             snippet = "(no snippet available)"
                         else:
                             soup = BeautifulSoup(html, "html5lib")
                             p = soup.find("p")
-                            text = p.get_text().strip() if p else ""
-                            snippet = text[:200] + "…" if len(text) > 200 else text
+                            text = (p.get_text().strip() if p else "")[:200]
+                            snippet = text + ("…" if len(text) == 200 else "")
                         lines.append(f"- {title}: {snippet} ({url})")
                     summary = f"Top {len(lines)} search results:\n" + "\n".join(lines)
                 elif fn == "get_current_location":
@@ -1775,20 +1856,18 @@ class ChatManager:
             log_message(f"Generated summary for '{fn}': {summary!r}", "DEBUG")
 
             summaries.append(summary)
-            # chain context
             tool_context += "\n" + summary
 
-        # 4) Assemble final prompt to match your SYSTEM spec
+        # 4) Assemble final prompt to match SYSTEM spec
         assembled = ""
-        # insert context_analysis fence
+        # context_analysis fence
         assembled += "```context_analysis\n"
         assembled += ctx_txt.strip() + "\n"
         assembled += "```"
-        # insert tool_output fence if any
+        # tool_output fence if any
         if summaries:
-            block = "```tool_output\n" + "\n\n".join(summaries) + "\n```"
-            assembled += "\n" + block
-        # finally the original user message
+            assembled += "\n```tool_output\n" + "\n\n".join(summaries) + "\n```"
+        # original user message
         assembled += "\n" + user_message
 
         # record and embed
@@ -1808,28 +1887,27 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
     import re, json, time
     from datetime import datetime
     import numpy as np
+    import threading
 
     log_message("Voice-to-LLM loop started. Waiting for speech...", "INFO")
-    last_response = None
-    max_words = config.get("max_response_words", 100)
-    rms_threshold = config.get("rms_threshold", 0.01)
-    silence_duration = 2.0  # seconds of silence to mark end of speech
+    last_response    = None
+    max_words        = config.get("max_response_words", 100)
+    rms_threshold    = config.get("rms_threshold", 0.01)
+    silence_duration = 2.0  # seconds of sustained silence → end of speech
 
     while True:
-        # Block until the first audio chunk arrives
+        # Block until first chunk arrives
         chunk = audio_queue.get()
         audio_queue.task_done()
         buffer = [chunk]
         silence_start = None
         log_message("Recording audio until silence detected...", "DEBUG")
 
-        # Keep collecting audio until we detect sustained silence
+        # collect until sustained silence
         while True:
             chunk = audio_queue.get()
             audio_queue.task_done()
             buffer.append(chunk)
-
-            # Compute RMS of this chunk
             rms = np.sqrt(np.mean(chunk.flatten()**2))
             if rms >= rms_threshold:
                 silence_start = None
@@ -1837,12 +1915,10 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
                 if silence_start is None:
                     silence_start = time.time()
                 elif time.time() - silence_start >= silence_duration:
-                    break  # sustained silence -> end of speech
+                    break
 
         log_message(f"Silence for {silence_duration}s; processing audio...", "INFO")
-
-        # Concatenate and preprocess audio
-        audio_data = np.concatenate(buffer, axis=0)
+        audio_data  = np.concatenate(buffer, axis=0)
         audio_array = audio_data.flatten().astype(np.float32)
 
         # Audio enhancement
@@ -1856,14 +1932,10 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
             volume = config.get("debug_volume", 1.0)
             log_message("Queueing async playback of captured audio...", "INFO")
             playback_chunk = audio_array * volume
-            def _play_chunk_async(data_chunk):
+            def _play_async(data_chunk):
                 with playback_lock:
                     output_stream.write(data_chunk)
-            threading.Thread(
-                target=_play_chunk_async,
-                args=(playback_chunk,),
-                daemon=True
-            ).start()
+            threading.Thread(target=_play_async, args=(playback_chunk,), daemon=True).start()
 
         # Consensus-based transcription
         log_message("Transcribing via consensus helper...", "PROCESS")
@@ -1873,11 +1945,8 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
             rms_threshold=rms_threshold,
             consensus_threshold=config.get("consensus_threshold", 0.8)
         )
-        if not transcription:
-            log_message("No valid transcription; skipping.", "WARNING")
-            continue
-        if not validate_transcription(transcription):
-            log_message("Transcription did not pass validation; skipping.", "WARNING")
+        if not transcription or not validate_transcription(transcription):
+            log_message("Invalid transcription; skipping.", "WARNING")
             continue
 
         labeled = f"[SPEAKER_1] {transcription}"
@@ -1891,13 +1960,18 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
         }) + "\n")
         session_log.flush()
 
-        # Flush TTS and send to ChatManager
         log_message("Flushing TTS queue before inference...", "DEBUG")
         flush_current_tts()
         response = chat_manager.new_request(labeled, skip_tts=True)
 
-        # Clean out any tool_output fences
-        clean_resp = re.sub(r"```tool_output.*?```", "", response, flags=re.DOTALL).strip()
+        # Clean out any fences, backticks, asterisks, underscores before TTS
+        clean_resp = response
+        clean_resp = re.sub(r"```tool_output.*?```",    "", clean_resp, flags=re.DOTALL)
+        clean_resp = re.sub(r"```tool_code.*?```",      "", clean_resp, flags=re.DOTALL)
+        clean_resp = re.sub(r"```context_analysis.*?```","", clean_resp, flags=re.DOTALL)
+        clean_resp = clean_resp.replace("`", "")
+        clean_resp = re.sub(r"[*_]", "", clean_resp)
+        clean_resp = clean_resp.strip()
 
         # Skip empty or repeated
         if not clean_resp or clean_resp == last_response:
@@ -1910,8 +1984,7 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
             continue
 
         last_response = clean_resp
-        log_message("LLM response ready.", "INFO")
-        log_message(f"LLM response: {clean_resp}", "INFO")
+        log_message(f"LLM response ready: {clean_resp}", "INFO")
 
         # Speak the final response
         log_message("Enqueuing response for TTS...", "INFO")
@@ -1926,8 +1999,6 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
         session_log.flush()
 
         log_message("Ready for next voice input...", "INFO")
-
-
 
 # ----- New: Text Input Override Loop -----
 def text_input_loop(chat_manager: ChatManager):
