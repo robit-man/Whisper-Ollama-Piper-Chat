@@ -613,17 +613,30 @@ def apply_eq_and_denoise(
     log_message("Enhancement: Audio enhancement complete.", "DEBUG")
     return compressed.astype(np.float32)
 
-
 def clean_text(text):
-    emoji_pattern = re.compile("["
+    # 1) Remove emojis
+    emoji_pattern = re.compile(
+        "["
         u"\U0001F600-\U0001F64F"  # emoticons
         u"\U0001F300-\U0001F5FF"  # symbols & pictographs
         u"\U0001F680-\U0001F6FF"  # transport & map symbols
-        u"\U0001F1E0-\U0001F1FF"  # flags (iOS)
-                           "]+", flags=re.UNICODE)
-    text = emoji_pattern.sub(r'', text)
-    cleaned = text.replace("*", "").replace("```tool_output", "").replace("tool_call", "").replace("tool_output", "")
-    return cleaned
+        u"\U0001F1E0-\U0001F1FF"  # flags
+        "]+",
+        flags=re.UNICODE
+    )
+    text = emoji_pattern.sub("", text)
+
+    # 2) Remove any code-fence markers or tool tags
+    text = text.replace("```tool_output", "") \
+               .replace("tool_call", "") \
+               .replace("tool_output", "")
+
+    # 3) Strip out all asterisks, backticks, and underscores
+    text = re.sub(r'[*_`]', "", text)
+
+    # 4) Trim whitespace
+    return text.strip()
+
 
 # ----- Consensus Transcription Helper -----
 def consensus_whisper_transcribe_helper(audio_array, language="en", rms_threshold=0.01, consensus_threshold=0.8):
@@ -865,11 +878,6 @@ class Utils:
         log_message("Cosine similarity computed.", "DEBUG")
         return sim
 
-import os
-import re
-from datetime import datetime
-from bs4 import BeautifulSoup
-import psutil
 
 class Tools:
     @staticmethod
