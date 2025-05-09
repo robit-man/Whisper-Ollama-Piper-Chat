@@ -197,10 +197,10 @@ def load_config():
         "raw": False,
         "images": None,        # Now support passing images to the primary model
         "options": {},
-        "system": "This is the FINAL INFERENCE stage. You will receive exactly one user message in this precise format:\\n\\n```context_analysis\\n<your concise context analysis here>\\n```\\n```tool_output\\n<any tool output here, or blank if none>\\n```\\n<the original user message>\\n\\n**Instructions:** Do NOT say “I understand” or explain that you understand; do NOT apologize, offer pleasantries or filler; do NOT include meta‐commentary or summarize these rules; do NOT reference speaker labels like SPEAKER_1 or SPEAKER_2; calibrate your response length intelligently—provide succinct, snappy answers for straightforward prompts and rich, multi‐sentence explanations (with examples or analogies when helpful) for complex requests; maintain a direct, conversational, delightfully sassy tone; avoid hallucinations and stay ruthlessly on point; do NOT mention you are an AI.",
+        "system": "You will receive a user message which may include tool_output. Respond only with the final answer—no context_analysis block, no apologies or filler, no meta commentary.",
         "conversation_id": "default_convo",
         "rms_threshold": 0.01,
-        "tts_volume": 0.8,  # Volume for TTS playback
+        "tts_volume": 0.5,  # Volume for TTS playback
         "debug_audio_playback": False,
         "enable_noise_reduction": False,
         "consensus_threshold": 0.5       # Similarity ratio required for consensus between models
@@ -349,7 +349,7 @@ def flush_current_tts():
 
 # ----- TTS Processing -----
 def process_tts_request(text):
-    volume = config.get("tts_volume", 0.6)  # <-- new volume config
+    volume = config.get("tts_volume", 0.2)  # <-- new volume config
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     piper_exe = os.path.join(script_dir, "piper", "piper")
@@ -1310,10 +1310,12 @@ class ChatManager:
     def _stream_tool(self, user_msg: str):
         log_message("Phase 2: Starting tool‐decision stream...", "INFO")
 
-        # 1) Build a concise list of available functions (name + signature only)
+        # 1) Build list of available tool names and their signatures
+        tool_names = []
         func_sigs = []
         for attr in dir(Tools):
             if not attr.startswith("_") and callable(getattr(Tools, attr)):
+                tool_names.append(attr)
                 try:
                     sig = inspect.signature(getattr(Tools, attr))
                     func_sigs.append(f"{attr}{sig}")
@@ -1321,15 +1323,16 @@ class ChatManager:
                     func_sigs.append(f"{attr}(...)")
         tools_message = "AVAILABLE FUNCTIONS (name + signature only):\n" + "\n".join(func_sigs)
 
-        # 2) Tightened instructions to force ONLY the codeblock
+        # 2) Instructions to output exactly one tool_code block or NO_TOOL
         preamble = (
-            "You are a TOOL‐CALLING agent. YOUR ONLY job is to pick exactly one of the functions below—no prose, no extra text. "
-            "Correct minor typos in the function name if needed. IMMEDIATELY output **one** of these two, with NO EXCEPTIONS:\n"
-            "```tool_code\n<FunctionName>(<arg1>, <arg2>, ...)\n```\n"
+            "You are a TOOL‐CALLING agent. Your ONLY job is to choose exactly one of the functions below—no prose, no extra text. "
+            "If you choose a function with text input, include the full query as a double‐quoted string. "
+            "Output exactly one of:\n"
+            "```tool_code\n<FunctionName>(\"arg1\", ...)\n```\n"
             "or\n"
             "```tool_code\nNO_TOOL\n```"
         )
-        final_instruction = "NOW: read the user message below and output your SINGLE `tool_code` block."
+        final_instruction = "NOW: read the user message below and immediately output your SINGLE `tool_code` block."
 
         messages = [
             {"role": "system", "content": preamble},
@@ -1338,7 +1341,7 @@ class ChatManager:
             {"role": "user",   "content": user_msg}
         ]
 
-        # 3) Build payload for secondary_model with dedicated temperature
+        # 3) Build payload for secondary model
         payload = self.build_payload(override_messages=messages, model_key="secondary_model")
         payload["temperature"] = self.config_manager.config.get("tool_temperature", payload["temperature"])
 
@@ -1353,29 +1356,45 @@ class ChatManager:
             buf += tok
             print(tok, end="", flush=True)
             yield tok, False
-
         print()
         log_message(f"Phase 2 complete: raw tool‐decision output:\n{buf}", "DEBUG")
 
-        # 5) Extract and log the chosen code, with or without fences
-        import re
+        # 5) Extract the tool call (fenced or bare)
+        import re, ast
         pattern = (
-            r"(?:```tool_code\s*(.*?)\s*```)"      # fenced block
-            r"|^\s*([A-Za-z_]\w*\(.*?\))\s*$"      # bare function call on its own line
+            r"(?:```tool_code\s*(.*?)\s*```)"   # fenced block
+            r"|^\s*([A-Za-z_]\w*\(.*?\))\s*$"   # bare call
         )
         m = re.search(pattern, buf, re.DOTALL | re.MULTILINE)
-        code = None
-        if m:
-            code = (m.group(1) or m.group(2) or "").strip()
+        code = (m.group(1) or m.group(2) or "").strip() if m else None
+
+        # 6) Validate with AST: single function call, known tool, literal args
         if code and code.upper() != "NO_TOOL":
-            log_message(f"Tool selected: {code}", "INFO")
+            try:
+                expr = ast.parse(code, mode="eval")
+                if not isinstance(expr, ast.Expression) or not isinstance(expr.body, ast.Call):
+                    raise ValueError("Not a single function call")
+                call = expr.body
+                if not isinstance(call.func, ast.Name) or call.func.id not in tool_names:
+                    raise ValueError(f"Unknown function '{getattr(call.func, 'id', None)}'")
+                # check positional args are literals
+                for arg in call.args:
+                    if not isinstance(arg, ast.Constant):
+                        raise ValueError("All positional args must be literals")
+                # check keyword args are literals
+                for kw in call.keywords:
+                    if not kw.arg or not isinstance(kw.value, ast.Constant):
+                        raise ValueError("All keyword args must be literal")
+                log_message(f"Tool selected: {code}", "INFO")
+            except Exception as e:
+                log_message(f"Invalid tool invocation `{code}`: {e}", "ERROR")
+                code = None
         else:
             log_message("No valid tool_code detected; treating as NO_TOOL.", "INFO")
             code = None
 
-        # 6) End of tool stream
+        # 7) End of tool stream
         yield "", True
-
 
     # ---------------------------------------------------------------- #
     #                    ORIGINAL (UNCHANGED) METHODS                  #
@@ -1438,10 +1457,11 @@ class ChatManager:
         except Exception as e:
             log_message(f"Primary-model non-stream error: {e}", "ERROR")
             return ""
-
     def process_text(self, text, skip_tts=False):
         import re
         log_message("process_text: Starting...", "DEBUG")
+        # Remove any asterisks from the incoming text
+        text = text.replace('*', '')
         converted = Utils.convert_numbers_to_words(text)
         sentence_endings = re.compile(r'[.?!]+')
         in_think = False
@@ -1482,8 +1502,9 @@ class ChatManager:
                     end = m.end()
                     sentence = tts_buffer[:end].strip()
                     tts_buffer = tts_buffer[end:].lstrip()
+                    # Clean up the sentence for TTS
                     clean = clean_text(sentence)
-                    # remove special characters before TTS (e.g., asterisks, backticks, underscores)
+                    # Remove special characters before TTS (asterisks, backticks, underscores)
                     clean = re.sub(r'[*_`]', '', clean)
                     if clean and not skip_tts:
                         self.tts_manager.enqueue(clean)
@@ -1695,11 +1716,18 @@ class ChatManager:
             # chain context
             tool_context += "\n" + summary
 
-        # 4) Assemble tool_output block
-        assembled = user_message
+        # 4) Assemble final prompt to match your SYSTEM spec
+        assembled = ""
+        # insert context_analysis fence
+        assembled += "```context_analysis\n"
+        assembled += ctx_txt.strip() + "\n"
+        assembled += "```"
+        # insert tool_output fence if any
         if summaries:
             block = "```tool_output\n" + "\n\n".join(summaries) + "\n```"
-            assembled = block + "\n" + user_message
+            assembled += "\n" + block
+        # finally the original user message
+        assembled += "\n" + user_message
 
         # record and embed
         self.history_manager.add_entry("user", assembled)
@@ -1836,6 +1864,7 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
         session_log.flush()
 
         log_message("Ready for next voice input...", "INFO")
+
 
 
 # ----- New: Text Input Override Loop -----
