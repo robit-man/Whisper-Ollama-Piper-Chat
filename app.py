@@ -1406,7 +1406,7 @@ class ChatManager:
         # 2) Grab the last 5 exchanges (strictly chronological)
         recent = "\n".join(
             f"{m['role'].upper()}: {m['content']}"
-            for m in self.history_manager.history[-5:]
+            for m in self.history_manager.history[-15:]
         )
 
         # 3) Do a similarity search against the full history
@@ -1540,6 +1540,99 @@ class ChatManager:
 
         # 7) End of tool stream
         yield "", True
+    # ----------------------------------------
+    # NEW: Intent Clarification
+    # ----------------------------------------
+    def _clarify_intent(self, user_message):
+        """
+        If the user message is ambiguous, ask a quick follow-up question.
+        Returns either None (no clarification needed) or a prompt to send to the user.
+        """
+        system = (
+            "You are an Intent Clarifier. If the user’s request is unclear or might have multiple interpretations, "
+            "ask ONE simple question that will let you disambiguate. "
+            "If everything is clear, respond with NO_CLARIFICATION."
+        )
+        user   = f"User said: “{user_message}” — do you need more info?"
+        resp = chat(
+            model=self.config_manager.config["secondary_model"],
+            messages=[{"role":"system","content":system},
+                      {"role":"user","content":user}],
+            stream=False
+        )["message"]["content"].strip()
+        if resp.upper() == "NO_CLARIFICATION":
+            return None
+        return resp
+
+    # NEW: External Knowledge Retrieval (RAG)
+    # ----------------------------------------
+    def _fetch_external_knowledge(self, user_message):
+        """
+        If the user query seems to need up-to-date facts, do a quick web search.
+        Returns a short summary string (or empty).
+        """
+        # naive keyword check: you can customize
+        if any(kw in user_message.lower() for kw in ("latest", "today", "current")):
+            raw = Tools.search_internet(user_message)
+            # assume raw is JSON text
+            try:
+                data = json.loads(raw)
+                top = data["web"]["results"][:2]
+                lines = [f"{r['title']}: {r.get('description','')}" for r in top]
+                return "External facts:\n" + "\n".join(lines)
+            except:
+                return ""
+        return ""
+
+    # ----------------------------------------
+    # NEW: Memory Summarization
+    # ----------------------------------------
+    def _memory_summarize(self):
+        """
+        Every N turns compresses full history to a short summary stored in memory.
+        Returns a summary string (or None if not time yet).
+        """
+        if len(self.history_manager.history) % 10 == 0:   # every 10 turns
+            full = "\n".join(m["content"] for m in self.history_manager.history)
+            summary = chat(
+                model=self.config_manager.config["secondary_model"],
+                messages=[
+                  {"role":"system","content":
+                   "You are a Memory Agent—summarize this conversation in one paragraph."},
+                  {"role":"user","content":full}
+                ],
+                stream=False
+            )["message"]["content"].strip()
+            # store or log it
+            log_message("Memory summary: " + summary, "INFO")
+            return summary
+        return None
+
+    # ----------------------------------------
+    # NEW: Human-in-the-Loop Review
+    # ----------------------------------------
+    def _human_review(self, assembled):
+        """
+        For very long or high-risk responses, escalate to a human.
+        Returns True to proceed automatically, False to pause.
+        """
+        # here we just check length > 200 tokens
+        if len(assembled.split()) > 200:
+            print("\n⚠️  Response is lengthy—please review before sending:")
+            print(assembled[:500] + "…")
+            input("Press Enter to continue automatically…")
+        return True
+
+    # ----------------------------------------
+    # NEW: Notification & Audit
+    # ----------------------------------------
+    def _emit_event(self, event, payload):
+        """
+        Stub for webhook or metrics emission.
+        You can hook this to requests.post(...) or a Prometheus counter.
+        """
+        log_message(f"[EVENT] {event}: {payload}", "DEBUG")
+        # e.g. requests.post("https://my.monitor/api", json={...})
 
     # ---------------------------------------------------------------- #
     #                    ORIGINAL (UNCHANGED) METHODS                  #
@@ -1686,7 +1779,6 @@ class ChatManager:
             self.current_thread.start()
         self.current_thread.join()
         return holder[0] if holder else ""
-
     def run_tool(self, tool_code: str) -> str:
         """
         Execute a Tools.<func>(...) invocation, supporting:
@@ -1712,14 +1804,14 @@ class ChatManager:
                     log_message(f"run_tool error: {e}", "ERROR")
                     return f"Error executing `{func_name}`: {e}"
 
-        # 2) Full AST-based parsing for richer calls
+        # 2) Full AST‐based parsing for richer calls
         try:
             tree = ast.parse(tool_code.strip(), mode="eval")
             if not isinstance(tree, ast.Expression) or not isinstance(tree.body, ast.Call):
                 raise ValueError("Not a function call")
             call: ast.Call = tree.body
 
-            # get function
+            # get function name
             if isinstance(call.func, ast.Name):
                 func_name = call.func.id
             else:
@@ -1737,7 +1829,6 @@ class ChatManager:
                     # treat bare name as string
                     args.append(arg.id)
                 else:
-                    # try to pull the source segment
                     seg = ast.get_source_segment(tool_code, arg)
                     if seg is not None:
                         args.append(seg.strip())
@@ -1761,6 +1852,11 @@ class ChatManager:
                     else:
                         raise ValueError("Unsupported kwarg type")
 
+            # --- default for get_chat_history() with no args ---
+            if func_name == "get_chat_history" and not args and not kwargs:
+                # default to last 5 messages
+                args = [5]
+
             log_message(f"run_tool: Calling {func_name} with args={args} kwargs={kwargs}", "DEBUG")
             result = func(*args, **kwargs)
             log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
@@ -1770,6 +1866,7 @@ class ChatManager:
             log_message(f"run_tool error: {e}", "ERROR")
             return f"Error executing `{tool_code}`: {e}"
 
+        
     def new_request(self, user_message, skip_tts=False):
         import re, json
         from bs4 import BeautifulSoup
@@ -1788,31 +1885,47 @@ class ChatManager:
         ctx_txt = "".join(ctx_parts)
         log_message(f"Context analysis result: {ctx_txt!r}", "DEBUG")
 
-        # 1) Peek at the tool‐decision
+        # --- New Stage: Intent Clarification ---
+        clarification = self._clarify_intent(user_message)
+        if clarification:
+            print(clarification)
+            log_message(f"Asked for clarification: {clarification}", "INFO")
+            self.tts_manager.enqueue(clarification)
+            return  # wait for user's clarification
+
+        # --- New Stage: External Knowledge Retrieval ---
+        ext_facts = self._fetch_external_knowledge(user_message)
+        if ext_facts:
+            log_message("Fetched external facts", "DEBUG")
+            ctx_txt += "\n" + ext_facts
+
+        # --- New Stage: Memory Summarization ---
+        mem_sum = self._memory_summarize()
+        if mem_sum:
+            log_message("Appended memory summary", "DEBUG")
+            ctx_txt += "\nMemory summary:\n" + mem_sum
+
+        # --- Intermediate Planning Summary ---
+        # Peek at tool decision
         peek_parts = []
         for tok, done in self._stream_tool(user_message):
             peek_parts.append(tok)
             if done:
                 break
-
         raw_decision = "".join(peek_parts).strip()
         raw_decision = re.sub(r"^```tool_code\s*|\s*```$", "", raw_decision,
-                            flags=re.DOTALL).strip().strip("`")
+                              flags=re.DOTALL).strip().strip("`")
         planned_call = Tools.parse_tool_call(raw_decision)
 
-        # 2) If a tool is planned, ask the model to phrase a natural-language plan
         if planned_call:
             summary_system = (
                 "You are a Planning Agent. When you see a tool call, "
-                "produce a single, concise, natural-sounding sentence "
-                "describing the action you will take to fulfill the user's request. "
-                "Do not mention code or formatting—just describe the step in plain language."
+                "produce one concise, natural-sounding sentence describing "
+                "the action you will take—no code, just plain language."
             )
             summary_user = (
                 f"The user said: “{user_message}”. I will now run `{planned_call}`. "
-                "In one clear sentence, explain what I’m about to do., keep it extremely casual and natural sounding, "
-                "as if you were talking to a friend. "
-                "Do not include any code or formatting, just a plain sentence."
+                "In one casual sentence, explain what I’m about to do."
             )
             plan_response = chat(
                 model=self.config_manager.config["secondary_model"],
@@ -1823,113 +1936,104 @@ class ChatManager:
                 stream=False
             )["message"]["content"].strip()
 
-            # 3) Notify the user
+            # Notify & speak
             print(plan_response)
-            log_message(plan_response, "INFO")
+            log_message(f"Planning summary: {plan_response}", "INFO")
             self.tts_manager.enqueue(plan_response)
 
-        # 4) Reset and continue into the real Phase 2 loop
+        # Reset and continue into Phase 2
         self.stop_flag = False
 
-        # 5) Phase 2: Tool chaining & execution
-        tool_context   = ctx_txt
-        summaries      = []
-        invoked_fns    = set()
+        # 3) Phase 2: Tool chaining & execution
+        tool_context = ctx_txt
+        summaries = []
+        invoked_fns = set()
         MAX_TOOL_CALLS = 3
 
         for i in range(MAX_TOOL_CALLS):
-            # decide the next tool
             tool_parts = []
             for tok, done in self._stream_tool(tool_context):
                 tool_parts.append(tok)
                 if done:
                     break
             raw_tool = "".join(tool_parts).strip()
-            # unwrap any fenced or backtick markup
-            raw_tool = re.sub(r"^```tool_code\s*|\s*```$", "", raw_tool, flags=re.DOTALL).strip()
-            raw_tool = raw_tool.strip("`").strip()
+            raw_tool = re.sub(r"^```tool_code\s*|\s*```$", "", raw_tool,
+                              flags=re.DOTALL).strip().strip("`")
             log_message(f"Raw tool-decision output (iter {i+1}): {raw_tool!r}", "DEBUG")
 
             code = Tools.parse_tool_call(raw_tool)
             if not code or code.upper() == "NO_TOOL":
-                log_message("No tool selected; breaking chain.", "INFO")
+                log_message("No tool selected; ending chain.", "INFO")
                 break
 
-            # extract function name
             m = re.match(r"\s*([A-Za-z_]\w*)\s*\(", code)
             fn = m.group(1) if m else None
             if not fn or fn in invoked_fns:
-                log_message(f"Function '{fn}' already invoked or invalid; stopping.", "INFO")
+                log_message(f"Tool '{fn}' already invoked or invalid; stopping.", "INFO")
                 break
             invoked_fns.add(fn)
-            log_message(f"Invoking tool: {code!r}", "INFO")
+            log_message(f"Invoking tool: {code}", "INFO")
 
-            # execute
             out = self.run_tool(code)
             log_message(f"Tool '{fn}' output: {out!r}", "INFO")
 
-            # summarize output
+            # Summarize tool output
             summary = None
             try:
                 data = json.loads(out)
                 if fn in ("search_internet", "brave_search"):
                     results = data.get("web", {}).get("results", [])[:3]
                     lines = []
-                    for entry in results:
-                        title = entry.get("title") or entry.get("name") or entry.get("description", "(no title)")
-                        url   = entry.get("url")   or entry.get("link", "")
-                        html  = Tools.bs4_scrape(url)
-                        if html.startswith("Error"):
-                            snippet = "(no snippet available)"
-                        else:
-                            soup = BeautifulSoup(html, "html5lib")
-                            p = soup.find("p")
-                            text = (p.get_text().strip() if p else "")[:200]
-                            snippet = text + ("…" if len(text) == 200 else "")
-                        lines.append(f"- {title}: {snippet} ({url})")
-                    summary = f"Top {len(lines)} search results:\n" + "\n".join(lines)
+                    for r in results:
+                        title = r.get("title") or r.get("name") or "(no title)"
+                        desc  = r.get("description", "")
+                        url   = r.get("url") or r.get("link", "")
+                        lines.append(f"- {title}: {desc} ({url})")
+                    summary = "Top results:\n" + "\n".join(lines)
                 elif fn == "get_current_location":
                     city   = data.get("city", "?")
                     region = data.get("regionName", "?")
                     lat    = data.get("lat")
                     lon    = data.get("lon")
                     summary = f"Location: {city}, {region} (lat {lat}, lon {lon})"
-            except Exception as e:
-                log_message(f"Could not parse JSON from {fn}: {e}", "WARNING")
-
+            except Exception:
+                pass
             if summary is None:
-                # fallback raw echo
                 summary = f"{fn} result: {out}"
-            log_message(f"Generated summary for '{fn}': {summary!r}", "DEBUG")
+            log_message(f"Summary for '{fn}': {summary}", "DEBUG")
 
             summaries.append(summary)
             tool_context += "\n" + summary
 
-        # 4) Assemble final prompt to match SYSTEM spec
-        assembled = ""
-        # context_analysis fence
-        assembled += "```context_analysis\n"
-        assembled += ctx_txt.strip() + "\n"
-        assembled += "```"
-        # tool_output fence if any
+        # 4) Assemble final prompt
+        assembled = (
+            "```context_analysis\n" + ctx_txt.strip() + "\n```"
+        )
         if summaries:
             assembled += "\n```tool_output\n" + "\n\n".join(summaries) + "\n```"
-        # original user message
         assembled += "\n" + user_message
 
-        # record and embed
+        # Record & embed
         self.history_manager.add_entry("user", assembled)
         _ = Utils.embed_text(assembled)
-        log_message(f"Final prompt for primary model: {assembled!r}", "DEBUG")
+        log_message(f"Final prompt: {assembled!r}", "DEBUG")
 
         # 5) Phase 3: Final inference
         log_message("Starting final inference with primary model...", "INFO")
         response = self.run_inference(assembled, skip_tts)
         log_message(f"Final inference response: {response!r}", "INFO")
+
+        # --- New Stage: Human-in-the-Loop Review ---
+        #self._human_review(assembled)
+
+        # --- New Stage: Notification & Audit ---
+        self._emit_event("assistant_response", {
+            "input": user_message,
+            "output": response
+        })
+
         return response
 
-
-# ----- Voice-to-LLM Loop (for microphone input) -----
 def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
     import re, json, time
     from datetime import datetime
@@ -1943,17 +2047,12 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
     silence_duration = 2.0  # seconds of sustained silence → end of speech
 
     while True:
-        # Block until first chunk arrives
-        chunk = audio_queue.get()
-        audio_queue.task_done()
-        buffer = [chunk]
-        silence_start = None
+        # --- capture audio until silence ---
+        chunk = audio_queue.get(); audio_queue.task_done()
+        buffer = [chunk]; silence_start = None
         log_message("Recording audio until silence detected...", "DEBUG")
-
-        # collect until sustained silence
         while True:
-            chunk = audio_queue.get()
-            audio_queue.task_done()
+            chunk = audio_queue.get(); audio_queue.task_done()
             buffer.append(chunk)
             rms = np.sqrt(np.mean(chunk.flatten()**2))
             if rms >= rms_threshold:
@@ -1965,26 +2064,15 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
                     break
 
         log_message(f"Silence for {silence_duration}s; processing audio...", "INFO")
-        audio_data  = np.concatenate(buffer, axis=0)
-        audio_array = audio_data.flatten().astype(np.float32)
+        audio_array = np.concatenate(buffer, axis=0).flatten().astype(np.float32)
 
-        # Audio enhancement
+        # optional audio enhancement...
         if config.get("enable_noise_reduction", True):
             log_message("Enhancing audio (denoise, EQ, compression)...", "PROCESS")
             audio_array = apply_eq_and_denoise(audio_array, SAMPLE_RATE)
             log_message("Audio enhancement complete.", "SUCCESS")
 
-        # Optional debug playback
-        if config.get("debug_audio_playback", False):
-            volume = config.get("debug_volume", 1.0)
-            log_message("Queueing async playback of captured audio...", "INFO")
-            playback_chunk = audio_array * volume
-            def _play_async(data_chunk):
-                with playback_lock:
-                    output_stream.write(data_chunk)
-            threading.Thread(target=_play_async, args=(playback_chunk,), daemon=True).start()
-
-        # Consensus-based transcription
+        # consensus transcription
         log_message("Transcribing via consensus helper...", "PROCESS")
         transcription = consensus_whisper_transcribe_helper(
             audio_array,
@@ -1999,32 +2087,28 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
         labeled = f"[SPEAKER_1] {transcription}"
         log_message(f"Transcribed prompt: {labeled}", "INFO")
 
-        # Log user turn
+        # flush and send to chat manager
         session_log.write(json.dumps({
-            "role": "user",
-            "content": labeled,
-            "timestamp": datetime.now().isoformat()
+            "role": "user", "content": labeled, "timestamp": datetime.now().isoformat()
         }) + "\n")
         session_log.flush()
-
-        log_message("Flushing TTS queue before inference...", "DEBUG")
         flush_current_tts()
-        response = chat_manager.new_request(labeled, skip_tts=True)
 
-        # Clean out any fences, backticks, asterisks, underscores before TTS
-        clean_resp = response
-        clean_resp = re.sub(r"```tool_output.*?```",    "", clean_resp, flags=re.DOTALL)
+        # --- NEW: guard against None ---
+        response = chat_manager.new_request(labeled, skip_tts=True)
+        if response is None:
+            log_message("new_request returned None; skipping TTS and cleanup", "WARNING")
+            continue
+
+        # --- clean up fences and markup ---
+        clean_resp = re.sub(r"```tool_output.*?```",    "", response, flags=re.DOTALL)
         clean_resp = re.sub(r"```tool_code.*?```",      "", clean_resp, flags=re.DOTALL)
         clean_resp = re.sub(r"```context_analysis.*?```","", clean_resp, flags=re.DOTALL)
         clean_resp = clean_resp.replace("`", "")
-        clean_resp = re.sub(r"[*_]", "", clean_resp)
-        clean_resp = clean_resp.strip()
+        clean_resp = re.sub(r"[*_]", "", clean_resp).strip()
 
-        # Skip empty or repeated
         if not clean_resp or clean_resp == last_response:
             continue
-
-        # Hallucination guard
         if len(clean_resp.split()) > max_words:
             log_message(f"Hallucination detected (> {max_words} words); discarding.", "WARNING")
             last_response = None
@@ -2033,19 +2117,17 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
         last_response = clean_resp
         log_message(f"LLM response ready: {clean_resp}", "INFO")
 
-        # Speak the final response
-        log_message("Enqueuing response for TTS...", "INFO")
+        # enqueue for TTS
         chat_manager.tts_manager.enqueue(clean_resp)
 
-        # Log assistant turn
+        # log assistant turn
         session_log.write(json.dumps({
-            "role": "assistant",
-            "content": clean_resp,
-            "timestamp": datetime.now().isoformat()
+            "role": "assistant", "content": clean_resp, "timestamp": datetime.now().isoformat()
         }) + "\n")
         session_log.flush()
 
         log_message("Ready for next voice input...", "INFO")
+
 
 # ----- New: Text Input Override Loop -----
 def text_input_loop(chat_manager: ChatManager):
