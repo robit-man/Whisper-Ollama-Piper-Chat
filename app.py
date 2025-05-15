@@ -687,9 +687,13 @@ def consensus_whisper_transcribe_helper(audio_array, language="en", rms_threshol
     similarity = difflib.SequenceMatcher(None, transcription_base, transcription_medium).ratio()
     log_message(f"Transcription similarity: {similarity:.2f}", "INFO")
     if similarity >= consensus_threshold:
+        log_message("The Primary Model transcription is: " + transcription_base, "DEBUG")
+        log_message("The Secondary Model transcription is: " + transcription_medium, "DEBUG")
         log_message("Consensus reached between Whisper models.", "SUCCESS")
         return transcription_base
     else:
+        log_message("Primary Whisper model transcription: " + transcription_base, "DEBUG")
+        log_message("Secondary Whisper model transcription: " + transcription_medium, "DEBUG")
         log_message("No consensus between base and medium models; ignoring transcription.", "WARNING")
         return ""
 
@@ -1393,7 +1397,7 @@ class ChatManager:
         # 1) Build the system prompt
         preamble = (
             "You are the CONTEXT-ASSEMBLY AGENT. Your job is to take the following inputs "
-            "and produce a concise analysis of the user’s intent, goals, and any embedded "
+            "and produce a concise analysis of the user’s intent, goals, and take into account previous history in chat to inform your context analysis and instruction for downstream agents and any embedded "
             "commands or constraints—no greetings or meta-commentary.\n"
             "Return only the analysis text, in 1–2 sentences for simple prompts or up to 3–4 "
             "sentences for complex ones.\n\n"
@@ -1784,7 +1788,50 @@ class ChatManager:
         ctx_txt = "".join(ctx_parts)
         log_message(f"Context analysis result: {ctx_txt!r}", "DEBUG")
 
-        # 3) Phase 2: Tool chaining & execution
+        # 1) Peek at the tool‐decision
+        peek_parts = []
+        for tok, done in self._stream_tool(user_message):
+            peek_parts.append(tok)
+            if done:
+                break
+
+        raw_decision = "".join(peek_parts).strip()
+        raw_decision = re.sub(r"^```tool_code\s*|\s*```$", "", raw_decision,
+                            flags=re.DOTALL).strip().strip("`")
+        planned_call = Tools.parse_tool_call(raw_decision)
+
+        # 2) If a tool is planned, ask the model to phrase a natural-language plan
+        if planned_call:
+            summary_system = (
+                "You are a Planning Agent. When you see a tool call, "
+                "produce a single, concise, natural-sounding sentence "
+                "describing the action you will take to fulfill the user's request. "
+                "Do not mention code or formatting—just describe the step in plain language."
+            )
+            summary_user = (
+                f"The user said: “{user_message}”. I will now run `{planned_call}`. "
+                "In one clear sentence, explain what I’m about to do., keep it extremely casual and natural sounding, "
+                "as if you were talking to a friend. "
+                "Do not include any code or formatting, just a plain sentence."
+            )
+            plan_response = chat(
+                model=self.config_manager.config["secondary_model"],
+                messages=[
+                    {"role": "system", "content": summary_system},
+                    {"role": "user",   "content": summary_user}
+                ],
+                stream=False
+            )["message"]["content"].strip()
+
+            # 3) Notify the user
+            print(plan_response)
+            log_message(plan_response, "INFO")
+            self.tts_manager.enqueue(plan_response)
+
+        # 4) Reset and continue into the real Phase 2 loop
+        self.stop_flag = False
+
+        # 5) Phase 2: Tool chaining & execution
         tool_context   = ctx_txt
         summaries      = []
         invoked_fns    = set()
