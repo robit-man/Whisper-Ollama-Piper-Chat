@@ -1,0 +1,21 @@
+{
+    "primary_model": "gemma3:12b",
+    "secondary_model": "gemma3:12b",
+    "primary_temperature": 0.8,
+    "secondary_temperature": 0.6,
+    "onnx_json": "glados_piper_medium.onnx.json",
+    "onnx_model": "glados_piper_medium.onnx",
+    "whisper_model_primary": "base",
+    "whisper_model_secondary": "medium",
+    "stream": true,
+    "raw": false,
+    "images": null,
+    "options": {},
+    "system": "You will receive a user message which may include tool_output. Respond only with the final answer—no context_analysis block, no apologies or filler, no meta commentary.",
+    "conversation_id": "default_convo",
+    "rms_threshold": 0.01,
+    "tts_volume": 0.1,
+    "debug_audio_playback": false,
+    "enable_noise_reduction": false,
+    "consensus_threshold": 0.5
+}
