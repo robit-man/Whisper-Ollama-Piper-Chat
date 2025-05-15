@@ -205,7 +205,8 @@ def load_config():
         "tts_volume": 0.5,  # Volume for TTS playback
         "debug_audio_playback": False,
         "enable_noise_reduction": False,
-        "consensus_threshold": 0.5       # Similarity ratio required for consensus between models
+        "consensus_threshold": 0.5,       # Similarity ratio required for consensus between models
+        "speak_chain_of_thought": False,
     }
     if not os.path.isfile(config_path):
         with open(config_path, "w") as f:
@@ -962,96 +963,154 @@ class Tools:
         code = m.group(1).strip()
         log_message(f"Parsed tool call from text: {code!r}", "DEBUG")
         return code
-
+    
     @staticmethod
-    def get_chat_history(arg1, arg2=None) -> str:
+    def get_chat_history(arg1=None, arg2=None) -> str:
         """
+        get_chat_history("today"/"yesterday"/"last N days") -> all messages in that window
         get_chat_history(n) -> last n messages
-        get_chat_history(n, period) -> last n messages since 'period' ago (e.g. "2 days", "3 hours") or since ISO timestamp
-        get_chat_history(query, n) -> top n messages by cosine similarity & keyword match to 'query'
+        get_chat_history(n, "2 days") -> last n messages from the last 2 days
+        get_chat_history("query", n) -> top-n by relevance to 'query'
+
+        Also merges on-disk chat_sessions/*/session.txt entries with in-memory history,
+        and caps any semantic similarity search to the 100 most recent messages.
         """
-        import re, json
+        import os, re, json
         from datetime import datetime, timedelta
 
+        # --- load on-disk session logs ---
+        script_dir   = os.path.dirname(os.path.abspath(__file__))
+        sessions_dir = os.path.join(script_dir, "chat_sessions")
+        disk_entries = []
+        if os.path.isdir(sessions_dir):
+            for sub in os.listdir(sessions_dir):
+                path = os.path.join(sessions_dir, sub, "session.txt")
+                if os.path.isfile(path):
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            for line in f:
+                                try:
+                                    e = json.loads(line)
+                                    if "timestamp" in e and "role" in e and "content" in e:
+                                        disk_entries.append(e)
+                                except:
+                                    pass
+                    except:
+                        pass
+
+        # --- grab in-memory entries ---
         hm = Tools._history_manager
-        if not hm:
-            return json.dumps({"error": "HistoryManager not set"}, indent=2)
-        all_entries = hm.history
+        mem_entries = hm.history if hm else []
 
-        # Determine mode
-        top_n = None
+        # merge (disk first so more recent in-memory can overwrite)
+        all_entries = disk_entries + mem_entries
+
+        # --- 1) TIMEFRAME-ONLY MODE ---
+        if isinstance(arg1, str):
+            period = arg1.lower().strip()
+            now    = datetime.now()
+            today  = now.date()
+
+            # compute start/end
+            if period == "today":
+                start = datetime.combine(today, datetime.min.time())
+                end   = start + timedelta(days=1)
+            elif period == "yesterday":
+                start = datetime.combine(today - timedelta(days=1), datetime.min.time())
+                end   = datetime.combine(today, datetime.min.time())
+            else:
+                m = re.match(r'last\s+(\d+)\s+days?', period)
+                if m:
+                    days = int(m.group(1))
+                    start = datetime.combine(today - timedelta(days=days), datetime.min.time())
+                    end   = datetime.combine(today + timedelta(days=1), datetime.min.time())
+                else:
+                    start = None
+
+            if start is not None:
+                results = []
+                for e in all_entries:
+                    try:
+                        ts = datetime.fromisoformat(e["timestamp"])
+                    except:
+                        continue
+                    if start <= ts < end:
+                        results.append({
+                            "timestamp": e["timestamp"],
+                            "role":      e["role"],
+                            "content":   e["content"]
+                        })
+                return json.dumps({"results": results}, indent=2)
+
+        # --- 2) NUMERIC (+ optional relative period) MODE ---
+        top_n    = None
         since_dt = None
-        query = None
+        query    = None
 
-        # arg1 numeric => retrieval count
-        if re.match(r'^\d+$', str(arg1)):
+        # pure integer -> last N messages (optionally since a relative period)
+        if isinstance(arg1, (int, str)) and re.match(r'^\d+$', str(arg1)):
             top_n = int(arg1)
             if arg2:
-                # try relative period "2 days" etc.
                 m = re.match(r'(\d+)\s*(day|hour|minute|week)s?', str(arg2), re.IGNORECASE)
                 if m:
                     val, unit = int(m.group(1)), m.group(2).lower()
                     now = datetime.now()
-                    if unit.startswith('day'):
+                    if unit.startswith("day"):
                         since_dt = now - timedelta(days=val)
-                    elif unit.startswith('hour'):
+                    elif unit.startswith("hour"):
                         since_dt = now - timedelta(hours=val)
-                    elif unit.startswith('minute'):
+                    elif unit.startswith("minute"):
                         since_dt = now - timedelta(minutes=val)
-                    elif unit.startswith('week'):
+                    elif unit.startswith("week"):
                         since_dt = now - timedelta(weeks=val)
                 else:
-                    # try ISO timestamp
                     try:
                         since_dt = datetime.fromisoformat(arg2)
-                    except Exception:
+                    except:
                         since_dt = None
         else:
-            # arg1 is query string
-            query = str(arg1)
-            # arg2 numeric => top_n
-            if arg2 and re.match(r'^\d+$', str(arg2)):
-                top_n = int(arg2)
-            else:
+            # semantic search: arg1 is query string
+            if arg1 is not None:
+                query = str(arg1)
+                if arg2 and re.match(r'^\d+$', str(arg2)):
+                    top_n = int(arg2)
+            if top_n is None:
                 top_n = 5
 
         if top_n is None:
             top_n = 5
 
-        # filter by since_dt if provided
+        # filter by since_dt if given
         filtered = []
         for e in all_entries:
-            ts = None
             try:
-                ts = datetime.fromisoformat(e.get("timestamp",""))
-            except Exception:
-                pass
-            if since_dt and ts and ts < since_dt:
+                ts = datetime.fromisoformat(e["timestamp"])
+            except:
+                continue
+            if since_dt and ts < since_dt:
                 continue
             filtered.append(e)
 
-        results = []
-        # If query mode: score by substring + cosine
+        # --- 3) RESULTS ---
+        scored = []
+
         if query:
+            # only look at the most recent 100 entries to limit embedding overhead
+            candidates = filtered[-100:]
             q_vec = Utils.embed_text(query)
-            for e in filtered:
-                content = e.get("content","")
-                score = 0.0
-                if query.lower() in content.lower():
-                    score += 1.0
-                v = Utils.embed_text(content)
+            for e in candidates:
+                text  = e.get("content", "")
+                score = (1.0 if query.lower() in text.lower() else 0.0)
+                v     = Utils.embed_text(text)
                 score += Utils.cosine_similarity(q_vec, v)
-                results.append((score, e))
-            results.sort(key=lambda x: x[0], reverse=True)
+                scored.append((score, e))
+            scored.sort(key=lambda x: x[0], reverse=True)
         else:
-            # No query: return most recent first
+            # just reverse-chronological
             for e in reversed(filtered):
-                results.append((0.0, e))
+                scored.append((0.0, e))
 
-        # take top_n
-        top = results[:top_n]
-
-        # build output
+        top = scored[:top_n]
         out = []
         for score, e in top:
             out.append({
@@ -1062,7 +1121,6 @@ class Tools:
             })
 
         return json.dumps({"results": out}, indent=2)
-
 
         
     @staticmethod
@@ -1246,7 +1304,6 @@ class Tools:
         4) Summarize each page with the secondary agent
         Returns a bullet-list summary.
         """
-        import json, traceback
 
         try:
             raw = Tools.search_internet(topic)
@@ -1391,7 +1448,6 @@ class ChatManager:
     #                      INTERNAL STREAMING HELPERS                  #
     # ---------------------------------------------------------------- #
     def _stream_context(self, user_msg: str):
-        import json
         log_message("Phase 1: Starting context-analysis stream...", "INFO")
 
         # 1) Build the system prompt
@@ -1540,6 +1596,7 @@ class ChatManager:
 
         # 7) End of tool stream
         yield "", True
+
     # ----------------------------------------
     # NEW: Intent Clarification
     # ----------------------------------------
@@ -1563,6 +1620,126 @@ class ChatManager:
         if resp.upper() == "NO_CLARIFICATION":
             return None
         return resp
+
+    def _parse_timeframe(self, period: str) -> (str, str):
+        from datetime import datetime, timedelta
+        today = datetime.now().date()
+
+        if period == "yesterday":
+            start = datetime.combine(today - timedelta(days=1), datetime.min.time())
+            end   = datetime.combine(today,                        datetime.min.time())
+        elif period == "today":
+            start = datetime.combine(today,                        datetime.min.time())
+            end   = datetime.combine(today + timedelta(days=1),   datetime.min.time())
+        elif period.startswith("last "):
+            # e.g. “last 7 days”
+            try:
+                n = int(period.split()[1])
+            except ValueError:
+                n = 1
+            start = datetime.combine(today - timedelta(days=n),   datetime.min.time())
+            end   = datetime.combine(today + timedelta(days=1),   datetime.min.time())
+        else:
+            # fallback to “yesterday”
+            start = datetime.combine(today - timedelta(days=1),   datetime.min.time())
+            end   = datetime.combine(today,                        datetime.min.time())
+
+        return start.isoformat(), end.isoformat()
+    
+    def _history_timeframe_query(self, user_message: str) -> str | None:
+        """
+        Detects time-based history queries like:
+          - "what did we talk about yesterday?"
+          - "show me our chats from last week"
+          - "what was said between 2025-05-01 and 2025-05-10?"
+          - "past 3 days"
+        If matched, returns a formatted string of the relevant history and
+        enqueues it to TTS; otherwise returns None.
+        """
+        import re
+        from datetime import datetime, timedelta, date
+
+        # normalize
+        msg = user_message.lower()
+
+        # 1) explicit range "from X to Y"
+        m = re.search(r"from\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})", msg)
+        if m:
+            start = datetime.fromisoformat(m.group(1)).isoformat()
+            # include full Y-day
+            end_dt = datetime.fromisoformat(m.group(2)) + timedelta(days=1)
+            end = end_dt.isoformat()
+        else:
+            today = date.today()
+            # 2) single keywords
+            if "yesterday" in msg:
+                start_dt = datetime.combine(today - timedelta(days=1), datetime.min.time())
+                end_dt   = datetime.combine(today,             datetime.min.time())
+            elif "today" in msg:
+                start_dt = datetime.combine(today,             datetime.min.time())
+                end_dt   = datetime.combine(today + timedelta(days=1), datetime.min.time())
+            elif "last week" in msg:
+                # ISO week starts Monday
+                monday = today - timedelta(days=today.weekday())
+                start_dt = datetime.combine(monday - timedelta(weeks=1), datetime.min.time())
+                end_dt   = datetime.combine(monday,               datetime.min.time())
+            elif "this week" in msg:
+                monday = today - timedelta(days=today.weekday())
+                start_dt = datetime.combine(monday, datetime.min.time())
+                end_dt   = datetime.combine(monday + timedelta(weeks=1), datetime.min.time())
+            elif "last month" in msg:
+                first_this = today.replace(day=1)
+                # subtract one day to get last month's last day, then to 1st
+                prev_last_day = first_this - timedelta(days=1)
+                start_dt = datetime.combine(prev_last_day.replace(day=1), datetime.min.time())
+                end_dt   = datetime.combine(first_this,            datetime.min.time())
+            elif "this month" in msg:
+                first = today.replace(day=1)
+                # next month
+                if first.month == 12:
+                    nm = first.replace(year=first.year+1, month=1)
+                else:
+                    nm = first.replace(month=first.month+1)
+                start_dt = datetime.combine(first, datetime.min.time())
+                end_dt   = datetime.combine(nm,    datetime.min.time())
+            else:
+                # 3) "past N days" or "N days ago"
+                m2 = re.search(r"(\d+)\s*(?:days?\s*(?:ago|past)?)", msg)
+                if m2:
+                    n = int(m2.group(1))
+                    start_dt = datetime.combine(today - timedelta(days=n), datetime.min.time())
+                    end_dt   = datetime.combine(today + timedelta(days=1), datetime.min.time())
+                else:
+                    return None  # no timeframe found
+            start, end = start_dt.isoformat(), end_dt.isoformat()
+
+        # 4) fetch and filter
+        history_json = Tools.get_chat_history(1000, start)
+        try:
+            results = json.loads(history_json).get("results", [])
+        except Exception:
+            return None
+
+        # only keep those before `end`
+        filtered = [
+            r for r in results
+            if r.get("timestamp", "") < end
+        ]
+        if not filtered:
+            out = "I couldn't find any messages in that time frame."
+        else:
+            lines = [
+                f"{r['timestamp']}  {r['role'].capitalize()}: {r['content']}"
+                for r in filtered
+            ]
+            out = "\n".join(lines)
+
+        # speak & print
+        print(out)
+        log_message(f"History time‐frame ({start}→{end}): {len(filtered)} messages", "INFO")
+        self.tts_manager.enqueue(out)
+        return out
+
 
     # NEW: External Knowledge Retrieval (RAG)
     # ----------------------------------------
@@ -1622,6 +1799,54 @@ class ChatManager:
             print(assembled[:500] + "…")
             input("Press Enter to continue automatically…")
         return True
+    
+    # ----------------------------------------
+    # NEW: Chain-of-Thought Agent
+    # ----------------------------------------
+    def _chain_of_thought(self,
+                          user_message: str,
+                          context_analysis: str,
+                          external_facts: str,
+                          memory_summary: str,
+                          planning_summary: str,
+                          tool_summaries: list[str],
+                          final_response: str) -> str:
+        """
+        Stitch together all stage outputs into a coherent narrative.
+        """
+        system = (
+            "You are a Chain-of-Thought Agent.  "
+            "Given the following conversation stages, write a single cohesive paragraph "
+            "that narrates how each step led to the final response."
+        )
+        # build the “user” payload
+        stages = [
+            f"User message: {user_message}",
+            f"Context analysis: {context_analysis}",
+        ]
+        if external_facts:
+            stages.append(f"External facts: {external_facts}")
+        if memory_summary:
+            stages.append(f"Memory summary: {memory_summary}")
+        if planning_summary:
+            stages.append(f"Planning summary: {planning_summary}")
+        if tool_summaries:
+            stages.append("Tool outputs:\n" + "\n".join(tool_summaries))
+        stages.append(f"Final response: {final_response}")
+
+        user_payload = "\n\n".join(stages)
+
+        cot = chat(
+            model=self.config_manager.config["secondary_model"],
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user_payload}
+            ],
+            stream=False
+        )["message"]["content"].strip()
+
+        log_message(f"Chain-of-Thought generated.", "DEBUG")
+        return cot
 
     # ----------------------------------------
     # NEW: Notification & Audit
@@ -1695,6 +1920,7 @@ class ChatManager:
         except Exception as e:
             log_message(f"Primary-model non-stream error: {e}", "ERROR")
             return ""
+        
     def process_text(self, text, skip_tts=False):
         import re
         log_message("process_text: Starting...", "DEBUG")
@@ -1779,6 +2005,7 @@ class ChatManager:
             self.current_thread.start()
         self.current_thread.join()
         return holder[0] if holder else ""
+    
     def run_tool(self, tool_code: str) -> str:
         """
         Execute a Tools.<func>(...) invocation, supporting:
@@ -1865,13 +2092,18 @@ class ChatManager:
         except Exception as e:
             log_message(f"run_tool error: {e}", "ERROR")
             return f"Error executing `{tool_code}`: {e}"
-
         
     def new_request(self, user_message, skip_tts=False):
         import re, json
         from bs4 import BeautifulSoup
 
+        # --- Timeframe‐History Query Stage ---
+        tf_out = self._history_timeframe_query(user_message)
+        if tf_out is not None:
+            return tf_out  # already printed & enqueued
+
         log_message("new_request: Received user message.", "INFO")
+
         # 1) Record raw user message
         self.history_manager.add_entry("user", user_message)
         _ = Utils.embed_text(user_message)
@@ -1885,91 +2117,78 @@ class ChatManager:
         ctx_txt = "".join(ctx_parts)
         log_message(f"Context analysis result: {ctx_txt!r}", "DEBUG")
 
-        # --- New Stage: Intent Clarification ---
+        # --- Intent Clarification Stage ---
         clarification = self._clarify_intent(user_message)
         if clarification:
             print(clarification)
             log_message(f"Asked for clarification: {clarification}", "INFO")
             self.tts_manager.enqueue(clarification)
-            return  # wait for user's clarification
+            return  # pause until clarified
 
-        # --- New Stage: External Knowledge Retrieval ---
+        # --- External Knowledge Retrieval Stage ---
         ext_facts = self._fetch_external_knowledge(user_message)
         if ext_facts:
             log_message("Fetched external facts", "DEBUG")
             ctx_txt += "\n" + ext_facts
 
-        # --- New Stage: Memory Summarization ---
+        # --- Memory Summarization Stage ---
         mem_sum = self._memory_summarize()
         if mem_sum:
             log_message("Appended memory summary", "DEBUG")
             ctx_txt += "\nMemory summary:\n" + mem_sum
 
-        # --- Intermediate Planning Summary ---
-        # Peek at tool decision
+        # --- Planning Summary Stage (peek) ---
         peek_parts = []
         for tok, done in self._stream_tool(user_message):
             peek_parts.append(tok)
             if done:
                 break
         raw_decision = "".join(peek_parts).strip()
-        raw_decision = re.sub(r"^```tool_code\s*|\s*```$", "", raw_decision,
-                              flags=re.DOTALL).strip().strip("`")
+        raw_decision = re.sub(r"^```tool_code\s*|\s*```$", "", raw_decision, flags=re.DOTALL).strip().strip("`")
         planned_call = Tools.parse_tool_call(raw_decision)
 
+        plan_response = ""
         if planned_call:
-            summary_system = (
-                "You are a Planning Agent. When you see a tool call, "
-                "produce one concise, natural-sounding sentence describing "
-                "the action you will take—no code, just plain language."
-            )
-            summary_user = (
-                f"The user said: “{user_message}”. I will now run `{planned_call}`. "
-                "In one casual sentence, explain what I’m about to do."
-            )
             plan_response = chat(
                 model=self.config_manager.config["secondary_model"],
                 messages=[
-                    {"role": "system", "content": summary_system},
-                    {"role": "user",   "content": summary_user}
+                    {"role": "system", "content":
+                        "You are a Planning Agent. Describe in one casual sentence what tool call you will make next."},
+                    {"role": "user", "content":
+                        f"The user said: “{user_message}”. I will now run `{planned_call}`."}
                 ],
                 stream=False
             )["message"]["content"].strip()
-
-            # Notify & speak
             print(plan_response)
             log_message(f"Planning summary: {plan_response}", "INFO")
             self.tts_manager.enqueue(plan_response)
 
-        # Reset and continue into Phase 2
+        # reset stop flag before tool chaining
         self.stop_flag = False
 
         # 3) Phase 2: Tool chaining & execution
         tool_context = ctx_txt
-        summaries = []
-        invoked_fns = set()
-        MAX_TOOL_CALLS = 3
-
-        for i in range(MAX_TOOL_CALLS):
-            tool_parts = []
+        summaries    = []
+        invoked_fns  = set()
+        for i in range(3):
+            tp = []
             for tok, done in self._stream_tool(tool_context):
-                tool_parts.append(tok)
+                tp.append(tok)
                 if done:
                     break
-            raw_tool = "".join(tool_parts).strip()
-            raw_tool = re.sub(r"^```tool_code\s*|\s*```$", "", raw_tool,
-                              flags=re.DOTALL).strip().strip("`")
-            log_message(f"Raw tool-decision output (iter {i+1}): {raw_tool!r}", "DEBUG")
+            raw_tool = "".join(tp).strip()
+            raw_tool = re.sub(r"^```tool_code\s*|\s*```$", "", raw_tool, flags=re.DOTALL).strip().strip("`")
+            log_message(f"Raw tool‐decision output (iter {i+1}): {raw_tool!r}", "DEBUG")
 
             code = Tools.parse_tool_call(raw_tool)
             if not code or code.upper() == "NO_TOOL":
                 log_message("No tool selected; ending chain.", "INFO")
                 break
 
-            m = re.match(r"\s*([A-Za-z_]\w*)\s*\(", code)
-            fn = m.group(1) if m else None
+            fn_m = re.match(r"\s*([A-Za-z_]\w*)\s*\(", code)
+            fn   = fn_m.group(1) if fn_m else None
             if not fn or fn in invoked_fns:
-                log_message(f"Tool '{fn}' already invoked or invalid; stopping.", "INFO")
+                log_message(f"Tool '{fn}' invalid or duplicate; stopping.", "INFO")
                 break
             invoked_fns.add(fn)
             log_message(f"Invoking tool: {code}", "INFO")
@@ -1977,43 +2196,30 @@ class ChatManager:
             out = self.run_tool(code)
             log_message(f"Tool '{fn}' output: {out!r}", "INFO")
 
-            # Summarize tool output
+            # summarize
             summary = None
             try:
                 data = json.loads(out)
                 if fn in ("search_internet", "brave_search"):
-                    results = data.get("web", {}).get("results", [])[:3]
-                    lines = []
-                    for r in results:
-                        title = r.get("title") or r.get("name") or "(no title)"
-                        desc  = r.get("description", "")
-                        url   = r.get("url") or r.get("link", "")
-                        lines.append(f"- {title}: {desc} ({url})")
+                    lines = [f"- {r.get('title','')} ({r.get('url','')})"
+                            for r in data.get("web", {}).get("results", [])[:3]]
                     summary = "Top results:\n" + "\n".join(lines)
                 elif fn == "get_current_location":
-                    city   = data.get("city", "?")
-                    region = data.get("regionName", "?")
-                    lat    = data.get("lat")
-                    lon    = data.get("lon")
-                    summary = f"Location: {city}, {region} (lat {lat}, lon {lon})"
+                    summary = f"Location: {data.get('city')}, {data.get('regionName')}"
             except Exception:
                 pass
             if summary is None:
                 summary = f"{fn} result: {out}"
-            log_message(f"Summary for '{fn}': {summary}", "DEBUG")
-
             summaries.append(summary)
             tool_context += "\n" + summary
 
-        # 4) Assemble final prompt
-        assembled = (
-            "```context_analysis\n" + ctx_txt.strip() + "\n```"
-        )
+        # 4) Assemble prompt for primary
+        assembled = f"```context_analysis\n{ctx_txt.strip()}\n```"
         if summaries:
             assembled += "\n```tool_output\n" + "\n\n".join(summaries) + "\n```"
         assembled += "\n" + user_message
 
-        # Record & embed
+        # record & embed
         self.history_manager.add_entry("user", assembled)
         _ = Utils.embed_text(assembled)
         log_message(f"Final prompt: {assembled!r}", "DEBUG")
@@ -2023,16 +2229,35 @@ class ChatManager:
         response = self.run_inference(assembled, skip_tts)
         log_message(f"Final inference response: {response!r}", "INFO")
 
-        # --- New Stage: Human-in-the-Loop Review ---
-        #self._human_review(assembled)
+        # --- Chain‐of‐Thought Reflection Stage ---
+        cot = self._chain_of_thought(
+            user_message=user_message,
+            context_analysis=ctx_txt,
+            external_facts=ext_facts or "",
+            memory_summary=mem_sum or "",
+            planning_summary=plan_response,
+            tool_summaries=summaries,
+            final_response=response
+        )
+        # always record it under a valid role
+        self.history_manager.add_entry("assistant", f"[chain_of_thought]\n{cot}")
 
-        # --- New Stage: Notification & Audit ---
+        # --- Optionally speak the chain‐of‐thought ---
+        if self.config_manager.config.get("speak_chain_of_thought", False):
+            # strip any code fences or markup
+            cot_clean = re.sub(r"```.*?```", "", cot, flags=re.DOTALL)
+            cot_clean = cot_clean.replace("`", "")
+            cot_clean = re.sub(r"[*_]", "", cot_clean).strip()
+            self.tts_manager.enqueue(cot_clean)
+
+        # --- Notification & Audit ---
         self._emit_event("assistant_response", {
-            "input": user_message,
+            "input":  user_message,
             "output": response
         })
 
         return response
+
 
 def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
     import re, json, time
