@@ -700,13 +700,21 @@ def consensus_whisper_transcribe_helper(audio_array, language="en", rms_threshol
 
 # ----- Transcription Validation Helper -----
 def validate_transcription(text):
-    if not any(ch.isalpha() for ch in text):
-        log_message("Transcription validation failed: no alphabetic characters.", "WARNING")
+    """
+    Accept any transcript that contains at least one letter or digit
+    and at least one non‐whitespace token.
+    """
+    # must contain at least one alpha or digit character
+    if not any(ch.isalpha() or ch.isdigit() for ch in text):
+        log_message("Transcription validation failed: no alphanumeric characters.", "WARNING")
         return False
-    words = text.split()
-    if len(words) < 2:
-        log_message("Transcription validation failed: fewer than 2 words.", "WARNING")
+
+    # split on whitespace to count words/tokens
+    words = text.strip().split()
+    if len(words) < 1:
+        log_message("Transcription validation failed: no words detected.", "WARNING")
         return False
+
     log_message("Transcription validated successfully.", "SUCCESS")
     return True
 
@@ -780,6 +788,7 @@ class Utils:
         result = emoji_pattern.sub(r'', text)
         log_message("Emojis removed from text.", "DEBUG")
         return result
+    
     @staticmethod
     def convert_numbers_to_words(text):
         def replace_num(match):
@@ -791,11 +800,13 @@ class Utils:
         converted = re.sub(r'\b\d+\b', replace_num, text)
         log_message("Numbers converted to words in text.", "DEBUG")
         return converted
+    
     @staticmethod
     def get_current_time():
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_message("Current time retrieved.", "DEBUG")
         return current_time
+    
     @staticmethod
     def cosine_similarity(vec1, vec2):
         if np.linalg.norm(vec1) == 0 or np.linalg.norm(vec2) == 0:
@@ -804,6 +815,7 @@ class Utils:
         similarity = float(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
         log_message("Cosine similarity computed.", "DEBUG")
         return similarity
+    
     @staticmethod
     def safe_load_json_file(path, default):
         if not path:
@@ -821,6 +833,7 @@ class Utils:
         except Exception:
             log_message(f"Failed to load JSON file from {path}, returning default.", "ERROR")
             return default
+        
     @staticmethod
     def load_format_schema(fmt):
         if not fmt:
@@ -839,6 +852,7 @@ class Utils:
                 return None
         log_message("No valid format schema found.", "WARNING")
         return None
+    
     @staticmethod
     def monitor_script(interval=5):
         script_path = os.path.abspath(__file__)
@@ -853,6 +867,7 @@ class Utils:
                     os.execv(sys.executable, [sys.executable] + sys.argv)
             except Exception:
                 pass
+
     @staticmethod
     def embed_text(text):
         """
@@ -978,31 +993,31 @@ class Tools:
         import os, re, json
         from datetime import datetime, timedelta
 
-        # --- load on-disk session logs ---
+        # 1) Load on-disk session logs (one session.txt per dated folder)
         script_dir   = os.path.dirname(os.path.abspath(__file__))
         sessions_dir = os.path.join(script_dir, "chat_sessions")
         disk_entries = []
         if os.path.isdir(sessions_dir):
             for sub in os.listdir(sessions_dir):
-                path = os.path.join(sessions_dir, sub, "session.txt")
-                if os.path.isfile(path):
+                session_file = os.path.join(sessions_dir, sub, "session.txt")
+                if os.path.isfile(session_file):
                     try:
-                        with open(path, "r", encoding="utf-8") as f:
+                        with open(session_file, "r", encoding="utf-8") as f:
                             for line in f:
                                 try:
                                     e = json.loads(line)
-                                    if "timestamp" in e and "role" in e and "content" in e:
+                                    if all(k in e for k in ("timestamp", "role", "content")):
                                         disk_entries.append(e)
                                 except:
-                                    pass
+                                    continue
                     except:
-                        pass
+                        continue
 
-        # --- grab in-memory entries ---
+        # 2) Grab in-memory entries
         hm = Tools._history_manager
         mem_entries = hm.history if hm else []
 
-        # merge (disk first so more recent in-memory can overwrite)
+        # 3) Merge (disk first so in-memory can override if identical timestamps)
         all_entries = disk_entries + mem_entries
 
         # --- 1) TIMEFRAME-ONLY MODE ---
@@ -1010,8 +1025,8 @@ class Tools:
             period = arg1.lower().strip()
             now    = datetime.now()
             today  = now.date()
+            start = end = None
 
-            # compute start/end
             if period == "today":
                 start = datetime.combine(today, datetime.min.time())
                 end   = start + timedelta(days=1)
@@ -1024,8 +1039,6 @@ class Tools:
                     days = int(m.group(1))
                     start = datetime.combine(today - timedelta(days=days), datetime.min.time())
                     end   = datetime.combine(today + timedelta(days=1), datetime.min.time())
-                else:
-                    start = None
 
             if start is not None:
                 results = []
@@ -1047,7 +1060,7 @@ class Tools:
         since_dt = None
         query    = None
 
-        # pure integer -> last N messages (optionally since a relative period)
+        # If arg1 is a number → last N messages (with optional period arg2)
         if isinstance(arg1, (int, str)) and re.match(r'^\d+$', str(arg1)):
             top_n = int(arg1)
             if arg2:
@@ -1069,7 +1082,7 @@ class Tools:
                     except:
                         since_dt = None
         else:
-            # semantic search: arg1 is query string
+            # Otherwise interpret arg1 as a query string
             if arg1 is not None:
                 query = str(arg1)
                 if arg2 and re.match(r'^\d+$', str(arg2)):
@@ -1077,10 +1090,11 @@ class Tools:
             if top_n is None:
                 top_n = 5
 
+        # Default if still unset
         if top_n is None:
             top_n = 5
 
-        # filter by since_dt if given
+        # 3) Filter by since_dt
         filtered = []
         for e in all_entries:
             try:
@@ -1091,25 +1105,25 @@ class Tools:
                 continue
             filtered.append(e)
 
-        # --- 3) RESULTS ---
+        # 4) Build results list
         scored = []
-
         if query:
-            # only look at the most recent 100 entries to limit embedding overhead
+            # cap to last 100 for embedding efficiency
             candidates = filtered[-100:]
             q_vec = Utils.embed_text(query)
             for e in candidates:
                 text  = e.get("content", "")
-                score = (1.0 if query.lower() in text.lower() else 0.0)
+                score = 1.0 if query.lower() in text.lower() else 0.0
                 v     = Utils.embed_text(text)
                 score += Utils.cosine_similarity(q_vec, v)
                 scored.append((score, e))
             scored.sort(key=lambda x: x[0], reverse=True)
         else:
-            # just reverse-chronological
+            # reverse-chronological for no-query
             for e in reversed(filtered):
                 scored.append((0.0, e))
 
+        # 5) Take top_n and format
         top = scored[:top_n]
         out = []
         for score, e in top:
@@ -1122,6 +1136,15 @@ class Tools:
 
         return json.dumps({"results": out}, indent=2)
 
+    @staticmethod
+    def get_current_time():
+        from datetime import datetime
+        # Grab current local time
+        now = datetime.now()
+        current_time = now.strftime("%Y-%m-%d %H:%M:%S")
+        # Log the exact timestamp we’re returning
+        log_message(f"Current time retrieved: {current_time}", "DEBUG")
+        return current_time
         
     @staticmethod
     def capture_screen_and_annotate():
@@ -1812,17 +1835,53 @@ class ChatManager:
                           tool_summaries: list[str],
                           final_response: str) -> str:
         """
-        Stitch together all stage outputs into a coherent narrative.
+        Build an incremental chain-of-thought that builds on prior reflections,
+        weaving in just the new stages for this turn.
         """
+
+        import os, json
+        from datetime import datetime
+
+        # 1) Load previous reflections (if any)
+        thoughts_path = os.path.join(session_folder, "thoughts.json")
+        prior = []
+        if os.path.isfile(thoughts_path):
+            try:
+                with open(thoughts_path, "r", encoding="utf-8") as f:
+                    prior = json.load(f)
+            except:
+                prior = []
+
+        # 2) Prepare the prompt for the reflection agent
         system = (
-            "You are a Chain-of-Thought Agent.  "
-            "Given the following conversation stages, write a single cohesive paragraph "
-            "that narrates how each step led to the final response."
+            "You are the Reflection Agent, an expert metacognitive overseer embedded in "
+            "this conversational system. Your singular mission is to maintain and evolve a "
+            "running narrative of the assistant’s reasoning process over time. You will be "
+            "provided with: (a) a bullet-list of *all prior reflection entries* you have "
+            "written, and (b) a bullet-list of *new stages* from the current turn (context "
+            "analysis, external facts, memory summary, planning summary, tool outputs, final "
+            "response).  \n\n"
+            "Your task is to produce **one** concise reflection—exactly 2–3 sentences—that "
+            "**appends** to the end of the existing narrative. Do **not** rehash old content. "
+            "Do **not** number your response. Focus purely on weaving the new stages into "
+            "the overarching story of how the assistant arrived at its response.  "
+            "Be precise, avoid filler, and use direct, active language."
         )
-        # build the “user” payload
+
+
+        # Format prior reflections as bullets
+        if prior:
+            prior_block = "\n".join(
+                f"{i+1}. {entry['chain_of_thought']}"
+                for i, entry in enumerate(prior)
+            )
+        else:
+            prior_block = "(none so far)"
+
+        # Gather the new stages succinctly
         stages = [
             f"User message: {user_message}",
-            f"Context analysis: {context_analysis}",
+            f"Context analysis: {context_analysis}"
         ]
         if external_facts:
             stages.append(f"External facts: {external_facts}")
@@ -1834,19 +1893,23 @@ class ChatManager:
             stages.append("Tool outputs:\n" + "\n".join(tool_summaries))
         stages.append(f"Final response: {final_response}")
 
-        user_payload = "\n\n".join(stages)
+        new_block = "\n".join(f"- {s}" for s in stages)
 
-        cot = chat(
+        # 3) Call the secondary model
+        payload = [
+            {"role": "system",  "content": system},
+            {"role": "assistant", "content": f"Prior reflections:\n{prior_block}"},
+            {"role": "user",    "content": f"New stages:\n{new_block}\n\nPlease append the next reflection to the narrative."}
+        ]
+        resp = chat(
             model=self.config_manager.config["secondary_model"],
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user_payload}
-            ],
+            messages=payload,
             stream=False
         )["message"]["content"].strip()
 
-        log_message(f"Chain-of-Thought generated.", "DEBUG")
-        return cot
+        # 4) Return just the new reflection (no numbering)
+        #    The calling code will append it to thoughts.json.
+        return resp
 
     # ----------------------------------------
     # NEW: Notification & Audit
@@ -2094,21 +2157,41 @@ class ChatManager:
             return f"Error executing `{tool_code}`: {e}"
         
     def new_request(self, user_message, skip_tts=False):
-        import re, json
+        import os, re, json
+        from datetime import datetime
         from bs4 import BeautifulSoup
 
-        # --- Timeframe‐History Query Stage ---
+        # --- 0) Summary‐Request Stage ---
+        lower = user_message.lower()
+        if re.search(r'\b(summary|summarize|how was our conversation|feedback)\b', lower):
+            m = re.search(r'\b(today|yesterday|last\s+\d+\s+days?)\b', lower)
+            period = m.group(0) if m else "today"
+            hist = Tools.get_chat_history(period)
+            try:
+                entries = json.loads(hist).get("results", [])
+            except:
+                entries = []
+            chat_lines = "\n".join(f"{e['role'].capitalize()}: {e['content']}" for e in entries)
+            prompt = (
+                "Here is our conversation:\n\n"
+                f"{chat_lines}\n\n"
+                "Please provide a brief, high-level summary of what we discussed."
+            )
+            summary = Tools.secondary_agent_tool(prompt, temperature=0.5).strip()
+            return summary  # caller will print & TTS
+
+        # --- 1) Timeframe‐History Query Stage ---
         tf_out = self._history_timeframe_query(user_message)
         if tf_out is not None:
-            return tf_out  # already printed & enqueued
+            return tf_out  # already formatted & enqueued
 
         log_message("new_request: Received user message.", "INFO")
 
-        # 1) Record raw user message
+        # --- 2) Record raw user message ---
         self.history_manager.add_entry("user", user_message)
         _ = Utils.embed_text(user_message)
 
-        # 2) Phase 1: Context analysis
+        # --- 3) Context Analysis ---
         ctx_parts = []
         for tok, done in self._stream_context(user_message):
             ctx_parts.append(tok)
@@ -2117,36 +2200,34 @@ class ChatManager:
         ctx_txt = "".join(ctx_parts)
         log_message(f"Context analysis result: {ctx_txt!r}", "DEBUG")
 
-        # --- Intent Clarification Stage ---
+        # --- 4) Intent Clarification ---
         clarification = self._clarify_intent(user_message)
         if clarification:
-            print(clarification)
-            log_message(f"Asked for clarification: {clarification}", "INFO")
-            self.tts_manager.enqueue(clarification)
-            return  # pause until clarified
+            if not skip_tts:
+                self.tts_manager.enqueue(clarification)
+            return clarification  # pause until clarified
 
-        # --- External Knowledge Retrieval Stage ---
+        # --- 5) External Knowledge Retrieval ---
         ext_facts = self._fetch_external_knowledge(user_message)
         if ext_facts:
             log_message("Fetched external facts", "DEBUG")
             ctx_txt += "\n" + ext_facts
 
-        # --- Memory Summarization Stage ---
+        # --- 6) Memory Summarization ---
         mem_sum = self._memory_summarize()
         if mem_sum:
             log_message("Appended memory summary", "DEBUG")
             ctx_txt += "\nMemory summary:\n" + mem_sum
 
-        # --- Planning Summary Stage (peek) ---
-        peek_parts = []
+        # --- 7) Planning Summary (peek at next tool call) ---
+        peek = []
         for tok, done in self._stream_tool(user_message):
-            peek_parts.append(tok)
+            peek.append(tok)
             if done:
                 break
-        raw_decision = "".join(peek_parts).strip()
-        raw_decision = re.sub(r"^```tool_code\s*|\s*```$", "", raw_decision, flags=re.DOTALL).strip().strip("`")
+        raw_decision = re.sub(r"^```tool_code\s*|\s*```$", "",
+                              "".join(peek), flags=re.DOTALL).strip().strip("`")
         planned_call = Tools.parse_tool_call(raw_decision)
-
         plan_response = ""
         if planned_call:
             plan_response = chat(
@@ -2154,30 +2235,33 @@ class ChatManager:
                 messages=[
                     {"role": "system", "content":
                         "You are a Planning Agent. Describe in one casual sentence what tool call you will make next."},
-                    {"role": "user", "content":
+                    {"role": "user",   "content":
                         f"The user said: “{user_message}”. I will now run `{planned_call}`."}
                 ],
                 stream=False
             )["message"]["content"].strip()
-            print(plan_response)
             log_message(f"Planning summary: {plan_response}", "INFO")
-            self.tts_manager.enqueue(plan_response)
+            if not skip_tts and plan_response:
+                self.tts_manager.enqueue(plan_response)
+        # (do not return here—continue to tool execution)
 
-        # reset stop flag before tool chaining
+        # --- reset stop flag before tool chaining ---
         self.stop_flag = False
 
-        # 3) Phase 2: Tool chaining & execution
-        tool_context = ctx_txt
-        summaries    = []
-        invoked_fns  = set()
-        for i in range(3):
-            tp = []
+        # --- 8) Tool Chaining & Execution ---
+        tool_context   = ctx_txt
+        summaries      = []
+        invoked_fns    = set()
+        MAX_TOOL_CALLS = 3
+
+        for i in range(MAX_TOOL_CALLS):
+            buf = []
             for tok, done in self._stream_tool(tool_context):
-                tp.append(tok)
+                buf.append(tok)
                 if done:
                     break
-            raw_tool = "".join(tp).strip()
-            raw_tool = re.sub(r"^```tool_code\s*|\s*```$", "", raw_tool, flags=re.DOTALL).strip().strip("`")
+            raw_tool = re.sub(r"^```tool_code\s*|\s*```$", "",
+                              "".join(buf), flags=re.DOTALL).strip().strip("`")
             log_message(f"Raw tool‐decision output (iter {i+1}): {raw_tool!r}", "DEBUG")
 
             code = Tools.parse_tool_call(raw_tool)
@@ -2185,8 +2269,8 @@ class ChatManager:
                 log_message("No tool selected; ending chain.", "INFO")
                 break
 
-            fn_m = re.match(r"\s*([A-Za-z_]\w*)\s*\(", code)
-            fn   = fn_m.group(1) if fn_m else None
+            m  = re.match(r"\s*([A-Za-z_]\w*)\s*\(", code)
+            fn = m.group(1) if m else None
             if not fn or fn in invoked_fns:
                 log_message(f"Tool '{fn}' invalid or duplicate; stopping.", "INFO")
                 break
@@ -2196,24 +2280,27 @@ class ChatManager:
             out = self.run_tool(code)
             log_message(f"Tool '{fn}' output: {out!r}", "INFO")
 
-            # summarize
+            # Summarize tool output for context
             summary = None
             try:
                 data = json.loads(out)
                 if fn in ("search_internet", "brave_search"):
-                    lines = [f"- {r.get('title','')} ({r.get('url','')})"
-                            for r in data.get("web", {}).get("results", [])[:3]]
+                    lines = [
+                        f"- {r.get('title','')} ({r.get('url','')})"
+                        for r in data.get("web", {}).get("results", [])[:3]
+                    ]
                     summary = "Top results:\n" + "\n".join(lines)
                 elif fn == "get_current_location":
                     summary = f"Location: {data.get('city')}, {data.get('regionName')}"
-            except Exception:
+            except:
                 pass
             if summary is None:
                 summary = f"{fn} result: {out}"
+
             summaries.append(summary)
             tool_context += "\n" + summary
 
-        # 4) Assemble prompt for primary
+        # --- 9) Assemble prompt for the primary LLM ---
         assembled = f"```context_analysis\n{ctx_txt.strip()}\n```"
         if summaries:
             assembled += "\n```tool_output\n" + "\n\n".join(summaries) + "\n```"
@@ -2224,12 +2311,34 @@ class ChatManager:
         _ = Utils.embed_text(assembled)
         log_message(f"Final prompt: {assembled!r}", "DEBUG")
 
-        # 5) Phase 3: Final inference
+        # --- 10) Final inference ---
         log_message("Starting final inference with primary model...", "INFO")
-        response = self.run_inference(assembled, skip_tts)
-        log_message(f"Final inference response: {response!r}", "INFO")
+        raw_resp = self.run_inference(assembled, skip_tts)
+        log_message(f"Final inference response (raw): {raw_resp!r}", "INFO")
 
-        # --- Chain‐of‐Thought Reflection Stage ---
+        # clean out any code‐fences or markup
+        clean = re.sub(r"```.*?```", "", raw_resp, flags=re.DOTALL)
+        clean = clean.replace("`", "")
+        clean = re.sub(r"[*_]", "", clean).strip()
+
+        # record assistant’s reply
+        self.history_manager.add_entry("assistant", clean)
+        try:
+            from __main__ import session_log
+            session_log.write(json.dumps({
+                "role": "assistant",
+                "content": clean,
+                "timestamp": datetime.now().isoformat()
+            }) + "\n")
+            session_log.flush()
+        except Exception as e:
+            log_message(f"Failed to write assistant turn to session log: {e}", "ERROR")
+
+        # speak final output
+        if clean and not skip_tts:
+            self.tts_manager.enqueue(clean)
+
+        # --- 11) Internal Chain-of-Thought + persist to disk ---
         cot = self._chain_of_thought(
             user_message=user_message,
             context_analysis=ctx_txt,
@@ -2237,33 +2346,28 @@ class ChatManager:
             memory_summary=mem_sum or "",
             planning_summary=plan_response,
             tool_summaries=summaries,
-            final_response=response
+            final_response=clean
         )
-        # always record it under a valid role
-        self.history_manager.add_entry("assistant", f"[chain_of_thought]\n{cot}")
+        self.last_chain_of_thought = cot
+        try:
+            thoughts_path = os.path.join(session_folder, "thoughts.json")
+            bag = json.load(open(thoughts_path, "r", encoding="utf-8")) if os.path.exists(thoughts_path) else []
+            bag.append({"timestamp": datetime.now().isoformat(), "chain_of_thought": cot})
+            with open(thoughts_path, "w", encoding="utf-8") as f:
+                json.dump(bag, f, indent=2)
+            log_message(f"Appended chain_of_thought to {thoughts_path}", "SUCCESS")
+        except Exception as e:
+            log_message(f"Failed to save chain_of_thought: {e}", "ERROR")
 
-        # --- Optionally speak the chain‐of‐thought ---
-        if self.config_manager.config.get("speak_chain_of_thought", False):
-            # strip any code fences or markup
-            cot_clean = re.sub(r"```.*?```", "", cot, flags=re.DOTALL)
-            cot_clean = cot_clean.replace("`", "")
-            cot_clean = re.sub(r"[*_]", "", cot_clean).strip()
-            self.tts_manager.enqueue(cot_clean)
-
-        # --- Notification & Audit ---
+        # --- 12) Notification & Audit ---
         self._emit_event("assistant_response", {
             "input":  user_message,
-            "output": response
+            "output": clean
         })
 
-        return response
-
+        return clean  # caller will print & TTS
 
 def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
-    import re, json, time
-    from datetime import datetime
-    import numpy as np
-    import threading
 
     log_message("Voice-to-LLM loop started. Waiting for speech...", "INFO")
     last_response    = None
