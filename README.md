@@ -2,12 +2,17 @@
 
 ### Just Run This Line to install and deploy!
 ```bash
-( [ -f Whisper-Ollama-Piper-Chat/app.py ] || git clone https://github.com/robit-man/Whisper-Ollama-Piper-Chat.git ) && \
+cd "$HOME" && \
+{ [ -f Whisper-Ollama-Piper-Chat/app.py ] || git clone https://github.com/robit-man/Whisper-Ollama-Piper-Chat.git; } && \
 cd Whisper-Ollama-Piper-Chat && \
+{ [ -f .env ] || echo "BRAVE_API_KEY=" > .env; } && \
 if command -v apt-get >/dev/null; then dpkg -s portaudio19-dev &>/dev/null || { sudo apt-get update && sudo apt-get install -y portaudio19-dev libsndfile1; }; fi && \
 if command -v brew >/dev/null;   then brew ls --versions portaudio &>/dev/null || brew install portaudio;       fi && \
 python3 app.py
+
 ````
+
+Please note that you must populate the created .env with a free [brakve search api key](https://brave.com/search/api/)
 
 ## Input: [Whisper](https://pypi.org/project/openai-whisper/) + [Denoiser](https://github.com/facebookresearch/denoiser)
 ## Cognition: [Ollama](https://ollama.com/)
