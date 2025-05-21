@@ -327,6 +327,9 @@ denoiser_model = pretrained.dns64()   # Loads a pretrained DNS64 model from deno
 log_message("Denoiser model loaded.", "SUCCESS")
 
 # ----- Global Settings and Queues -----
+
+WORKSPACE_DIR = os.path.join(os.path.dirname(__file__), "workspace")
+os.makedirs(WORKSPACE_DIR, exist_ok=True)
 SAMPLE_RATE = 16000
 BUFFER_SIZE = 1024
 tts_queue = queue.Queue()
@@ -781,6 +784,7 @@ class DisplayState:
         
 display_state = DisplayState()
 
+
 class Utils:
     @staticmethod
     def remove_emojis(text):
@@ -880,7 +884,7 @@ class Utils:
         Embed into a 1-D numpy array of shape (768,).
         """
         try:
-            log_message("Embedding text for context.", "PROCESS")
+            #log_message("Embedding text for context.", "PROCESS")
             response = embed(model="nomic-embed-text", input=text)
             vec = np.array(response["embeddings"], dtype=float)
             # ensure 1-D
@@ -888,7 +892,7 @@ class Utils:
             norm = np.linalg.norm(vec)
             if norm > 0:
                 vec = vec / norm
-            log_message("Text embedding computed and normalized.", "SUCCESS")
+            #log_message("Text embedding computed and normalized.", "SUCCESS")
             return vec
         except Exception as e:
             log_message("Error during text embedding: " + str(e), "ERROR")
@@ -906,7 +910,7 @@ class Utils:
             log_message("One of the vectors has zero norm in cosine similarity calculation.", "WARNING")
             return 0.0
         sim = float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
-        log_message("Cosine similarity computed.", "DEBUG")
+        #log_message("Cosine similarity computed.", "DEBUG")
         return sim
 
 
@@ -985,6 +989,115 @@ class Tools:
         return code
     _driver = None
 
+
+
+    # --- FILESYSTEM AWARENESS ---
+    @staticmethod
+    def list_dir(path: str = ".") -> str:
+        """Returns a JSON list of files & dirs at `path`."""
+        try:
+            return json.dumps(os.listdir(path))
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @staticmethod
+    def read_file(path: str) -> str:
+        """Returns the contents of a text file."""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception as e:
+            return f"Error reading {path!r}: {e}"
+
+    @staticmethod
+    def write_file(path: str, content: str) -> str:
+        """Writes `content` to `path`, returns confirmation."""
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return f"Wrote {len(content)} chars to {path!r}"
+        except Exception as e:
+            return f"Error writing {path!r}: {e}"
+
+    # --- AGENT-STACK DISCOVERY & MANAGEMENT ---
+    @staticmethod
+    def discover_agent_stack() -> str:
+        """
+        Introspect all Tools methods and Agent classes in this module,
+        write them plus a default stage list to agent_stack.json.
+        """
+        module_path = os.path.dirname(os.path.abspath(__file__))
+        stack_path  = os.path.join(module_path, "agent_stack.json")
+
+        # find all public Tool methods
+        tools = [
+            name for name, fn in inspect.getmembers(Tools, predicate=callable)
+            if not name.startswith("_")
+        ]
+
+        # find all Agent classes in this module
+        agents = [
+            name for name, cls in inspect.getmembers(sys.modules[__name__], inspect.isclass)
+            if name.endswith("Manager") or name.endswith("ChatManager")
+        ]
+
+        default_stages = [
+            "summary_request",
+            "timeframe_history_query",
+            "record_user_message",
+            "context_analysis",
+            "intent_clarification",
+            "external_knowledge_retrieval",
+            "memory_summarization",
+            "planning_summary",
+            "tool_chaining",
+            "assemble_prompt",
+            "final_inference",
+            "chain_of_thought",
+            "notification_audit"
+        ]
+
+        config = {
+            "tools":    tools,
+            "agents":   agents,
+            "stages":   default_stages,
+            "updated":  datetime.now().isoformat()
+        }
+
+        with open(stack_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        return f"agent_stack.json created with {len(tools)} tools & {len(agents)} agents."
+
+    @staticmethod
+    def load_agent_stack() -> dict:
+        """
+        Loads agent_stack.json, or auto-discovers if missing.
+        """
+        module_path = os.path.dirname(os.path.abspath(__file__))
+        stack_path  = os.path.join(module_path, "agent_stack.json")
+        if not os.path.isfile(stack_path):
+            Tools.discover_agent_stack()
+        try:
+            with open(stack_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            # fallback to regeneration
+            return {"tools": [], "agents": [], "stages": []}
+
+    @staticmethod
+    def update_agent_stack(changes: dict) -> str:
+        """
+        Merge `changes` into agent_stack.json (e.g. new stages order).
+        """
+        module_path = os.path.dirname(os.path.abspath(__file__))
+        stack_path  = os.path.join(module_path, "agent_stack.json")
+        config = Tools.load_agent_stack()
+        config.update(changes)
+        config["updated"] = datetime.now().isoformat()
+        with open(stack_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        return f"agent_stack.json updated."
+    
     @staticmethod
     def open_browser(headless: bool = False) -> str:
         """
@@ -1525,6 +1638,13 @@ class Tools:
         except Exception as e:
             log_message(f"Error in secondary agent tool: {e}", "ERROR")
             return f"Error in secondary agent: {e}"
+
+# -------------------------------------------------------------------
+# Expose two module-level variables for LLM introspection
+# -------------------------------------------------------------------
+ALL_TOOLS  = Tools.load_agent_stack().get("tools", [])
+ALL_AGENTS = Tools.load_agent_stack().get("agents", [])
+
 
 class ChatManager:
     # ---------------------------------------------------------------- #
@@ -2171,9 +2291,57 @@ class ChatManager:
          - Name nodes (treated as their .id)
         """
         import ast, re
+
+        # Strip out any type annotations in keyword args (e.g. prompt: str="…" → prompt="…")
+        tool_code = re.sub(
+            r'(\b[A-Za-z_]\w*)\s*:\s*[A-Za-z_]\w*\s*=',
+            r'\1=',
+            tool_code
+        )
+
         log_message(f"run_tool: Executing {tool_code!r}", "DEBUG")
 
-        # 1) Regex fallback for single unquoted arg: func(foo bar) → treat "foo bar" as single string
+        # 0) Quick split-based parser to handle mixed positional & keyword args
+        m_quick = re.fullmatch(r'\s*([A-Za-z_]\w*)\s*\(\s*(.*?)\s*\)\s*', tool_code, re.DOTALL)
+        if m_quick:
+            func_name, body = m_quick.group(1), m_quick.group(2)
+            func = getattr(Tools, func_name, None)
+            if func:
+                args = []
+                kwargs = {}
+                # split on commas not inside quotes
+                parts = re.split(r'''\s*,\s*(?![^'"]*['"][^'"]*['"])''', body)
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if '=' in part:
+                        k, v = part.split('=', 1)
+                        k = k.strip()
+                        v = v.strip()
+                        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                            v = v[1:-1]
+                        kwargs[k] = v
+                    else:
+                        v = part
+                        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                            v = v[1:-1]
+                        args.append(v)
+
+                # default for get_chat_history()
+                if func_name == "get_chat_history" and not args and not kwargs:
+                    args = [5]
+
+                log_message(f"run_tool: Parsed {func_name} with args={args} kwargs={kwargs}", "DEBUG")
+                try:
+                    result = func(*args, **kwargs)
+                    log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
+                    return str(result)
+                except Exception as e:
+                    log_message(f"run_tool error: {e}", "ERROR")
+                    return f"Error executing `{func_name}`: {e}"
+
+        # 1) Regex fallback for single unquoted arg: func(foo bar) → treat whole body as one string
         m_simple = re.fullmatch(r"\s*([A-Za-z_]\w*)\(\s*([^)]+?)\s*\)\s*", tool_code)
         if m_simple:
             func_name, raw_arg = m_simple.group(1), m_simple.group(2)
@@ -2188,7 +2356,7 @@ class ChatManager:
                     log_message(f"run_tool error: {e}", "ERROR")
                     return f"Error executing `{func_name}`: {e}"
 
-        # 2) Full AST‐based parsing for richer calls
+        # 2) Full AST-based parsing for richer calls
         try:
             tree = ast.parse(tool_code.strip(), mode="eval")
             if not isinstance(tree, ast.Expression) or not isinstance(tree.body, ast.Call):
@@ -2210,7 +2378,6 @@ class ChatManager:
                 if isinstance(arg, ast.Constant):
                     args.append(arg.value)
                 elif isinstance(arg, ast.Name):
-                    # treat bare name as string
                     args.append(arg.id)
                 else:
                     seg = ast.get_source_segment(tool_code, arg)
@@ -2236,9 +2403,8 @@ class ChatManager:
                     else:
                         raise ValueError("Unsupported kwarg type")
 
-            # --- default for get_chat_history() with no args ---
+            # default for get_chat_history() with no args
             if func_name == "get_chat_history" and not args and not kwargs:
-                # default to last 5 messages
                 args = [5]
 
             log_message(f"run_tool: Calling {func_name} with args={args} kwargs={kwargs}", "DEBUG")
@@ -2250,225 +2416,366 @@ class ChatManager:
             log_message(f"run_tool error: {e}", "ERROR")
             return f"Error executing `{tool_code}`: {e}"
     
-    
-    def new_request(self, user_message, skip_tts=False):
-        import re
-        import json
-        import os
-        from datetime import datetime
+    # -------------------------------------------------------------------
+    # New workspace‐memory helpers
+    # -------------------------------------------------------------------
+    def _load_workspace_memory(self) -> dict:
+        os.makedirs(WORKSPACE_DIR, exist_ok=True)
+        path = os.path.join(WORKSPACE_DIR, "workspace_memory.json")
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
 
-        # --- 0) Summary‐Request Stage ---
-        lower = user_message.lower()
-        if re.search(r'\b(summary|summarize|how was our conversation|feedback)\b', lower):
-            m = re.search(r'\b(today|yesterday|last\s+\d+\s+days?)\b', lower)
+    def _save_workspace_memory(self, memory: dict) -> None:
+        path = os.path.join(WORKSPACE_DIR, "workspace_memory.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(memory, f, indent=2)
+        except Exception as e:
+            log_message(f"Failed to save workspace memory: {e}", "ERROR")
+
+    # -------------------------------------------------------------------
+    # Alias legacy "planning" stage
+    # -------------------------------------------------------------------
+    def _stage_planning(self, ctx):
+        return self._stage_planning_summary(ctx)
+
+    # -------------------------------------------------------------------
+    # Updated new_request
+    # -------------------------------------------------------------------
+    def new_request(self, user_message: str, skip_tts: bool = False) -> str:
+        stack  = Tools.load_agent_stack()
+        stages = stack.get("stages", []).copy()
+
+        # ensure we have workspace stages in the right place
+        if "workspace_setup"       not in stages: stages.insert(stages.index("record_user_message") + 1, "workspace_setup")
+        if "file_management"       not in stages: stages.insert(stages.index("workspace_setup")       + 1, "file_management")
+        if "workspace_save"        not in stages: stages.append("workspace_save")
+
+        ctx = {
+            "user_message":    user_message,
+            "skip_tts":        skip_tts,
+            "ctx_txt":         "",
+            "tool_summaries":  [],
+            "assembled":       "",
+            "final_response":  None,
+            "workspace_memory": self._load_workspace_memory(),
+            "ALL_TOOLS":       stack.get("tools", []),
+            "ALL_AGENTS":      stack.get("agents", [])
+        }
+
+        log_message(f"Pipeline stages: {stages}", "INFO")
+        for stage in stages:
+            handler = getattr(self, f"_stage_{stage}", None)
+            if not handler:
+                log_message(f"No handler for stage '{stage}', skipping.", "WARNING")
+                continue
+
+            log_message(f"→ Stage: {stage}", "DEBUG")
+            result = handler(ctx)
+
+            # immediate returns for summaries or history queries
+            if stage in ("summary_request", "timeframe_history_query") and isinstance(result, str):
+                return result
+
+            # stop once we've done final_inference
+            if stage == "final_inference" and ctx.get("final_response"):
+                break
+
+        # persist our workspace log
+        self._save_workspace_memory(ctx["workspace_memory"])
+        return ctx["final_response"] or "Sorry, I couldn't process that."
+
+    # ------------------------------
+    # Stage 0: summary_request
+    # ------------------------------
+    def _stage_summary_request(self, ctx):
+        msg = ctx["user_message"].lower()
+        if re.search(r'\b(summary|summarize|how was our conversation|feedback)\b', msg):
+            m = re.search(r'\b(today|yesterday|last\s+\d+\s+days?)\b', msg)
             period = m.group(0) if m else "today"
             hist = Tools.get_chat_history(period)
             try:
                 entries = json.loads(hist).get("results", [])
             except:
                 entries = []
-            chat_lines = "\n".join(
-                f"{e['role'].capitalize()}: {e['content']}"
-                for e in entries
-            )
+            lines = "\n".join(f"{e['role'].capitalize()}: {e['content']}" for e in entries)
             prompt = (
                 "Here is our conversation:\n\n"
-                f"{chat_lines}\n\n"
+                f"{lines}\n\n"
                 "Please provide a brief, high-level summary of what we discussed."
             )
             return Tools.secondary_agent_tool(prompt, temperature=0.5).strip()
+        return None
 
-        # --- 1) Timeframe‐History Query Stage ---
-        tf_out = self._history_timeframe_query(user_message)
-        if tf_out is not None:
-            return tf_out
+    # ------------------------------
+    # Stage 1: timeframe_history_query
+    # ------------------------------
+    def _stage_timeframe_history_query(self, ctx):
+        out = self._history_timeframe_query(ctx["user_message"])
+        if out is not None:
+            return out
+        return None
 
-        log_message("new_request: Received user message.", "INFO")
+    # ------------------------------
+    # Stage 2: record_user_message
+    # ------------------------------
+    def _stage_record_user_message(self, ctx):
+        um = ctx["user_message"]
+        self.history_manager.add_entry("user", um)
+        _ = Utils.embed_text(um)
+        return None
 
-        # --- 2) Record raw user message ---
-        self.history_manager.add_entry("user", user_message)
-        _ = Utils.embed_text(user_message)
-
-        # --- 3) Context Analysis ---
-        ctx_parts = []
-        for tok, done in self._stream_context(user_message):
-            ctx_parts.append(tok)
+    # ------------------------------
+    # Stage 3: context_analysis
+    # ------------------------------
+    def _stage_context_analysis(self, ctx):
+        buf = []
+        for tok, done in self._stream_context(ctx["user_message"]):
+            buf.append(tok)
             if done:
                 break
-        ctx_txt = "".join(ctx_parts)
-        log_message(f"Context analysis result: {ctx_txt!r}", "DEBUG")
+        ca = "".join(buf)
+        log_message(f"Context analysis: {ca!r}", "DEBUG")
+        ctx["ctx_txt"] += ca
+        return None
 
-        # --- 4) Intent Clarification & Auto-Info Loop ---
-        clarification = self._clarify_intent(user_message)
-        if clarification:
-            self.history_manager.add_entry("assistant", clarification)
-            if not skip_tts:
-                self.tts_manager.enqueue(clarification)
-            log_message(f"Clarification asked: {clarification}", "INFO")
-            ctx_txt += f"[Clarification asked]: {clarification}"
-            # Try auto-gather: call new_request recursively to fill missing info
-            auto_filled = self.new_request(clarification, skip_tts=True)
-            if auto_filled and auto_filled != clarification:
-                log_message(f"Auto-gathered info: {auto_filled}", "INFO")
-                ctx_txt += f"[Auto-gathered]: {auto_filled}"
+    # ------------------------------
+    # Stage 4: intent_clarification
+    # ------------------------------
+    def _stage_intent_clarification(self, ctx):
+        clar = self._clarify_intent(ctx["user_message"])
+        if clar:
+            # record & TTS
+            self.history_manager.add_entry("assistant", clar)
+            if not ctx["skip_tts"]:
+                self.tts_manager.enqueue(clar)
+            ctx["ctx_txt"] += f"\n[Clarification asked]: {clar}"
+            # auto-gather
+            auto = self.new_request(clar, skip_tts=True)
+            if auto and auto != clar:
+                ctx["ctx_txt"] += f"\n[Auto-gathered]: {auto}"
+        return None
 
-        # --- 5) External Knowledge Retrieval ---
-        ext_facts = self._fetch_external_knowledge(user_message)
-        if ext_facts:
-            log_message("Fetched external facts", "DEBUG")
-            ctx_txt += "\n" + ext_facts
+    # ------------------------------
+    # Stage 5: external_knowledge_retrieval
+    # ------------------------------
+    def _stage_external_knowledge_retrieval(self, ctx):
+        facts = self._fetch_external_knowledge(ctx["user_message"])
+        if facts:
+            ctx["ctx_txt"] += "\n" + facts
+        return None
 
-        # --- 6) Memory Summarization ---
-        mem_sum = self._memory_summarize()
-        if mem_sum:
-            log_message("Appended memory summary", "DEBUG")
-            ctx_txt += "\nMemory summary:\n" + mem_sum
+    # ------------------------------
+    # Stage 6: memory_summarization
+    # ------------------------------
+    def _stage_memory_summarization(self, ctx):
+        mem = self._memory_summarize()
+        if mem:
+            ctx["ctx_txt"] += "\nMemory summary:\n" + mem
+        return None
 
-        # --- 7) Planning Summary (peek at next tool call) ---
+    # ------------------------------
+    # Stage 7: planning_summary
+    # ------------------------------
+    def _stage_planning_summary(self, ctx):
         peek = []
-        for tok, done in self._stream_tool(user_message):
+        for tok, done in self._stream_tool(ctx["user_message"]):
             peek.append(tok)
             if done:
                 break
-        raw_decision = re.sub(r"^```tool_code\s*|\s*```$", "", "".join(peek), flags=re.DOTALL).strip().strip("`")
-        planned_call = Tools.parse_tool_call(raw_decision)
-        plan_response = ""
-        if planned_call:
-            plan_response = chat(
+        raw = re.sub(r"^```tool_code\s*|\s*```$", "", "".join(peek),
+                     flags=re.DOTALL).strip().strip("`")
+        call = Tools.parse_tool_call(raw)
+        if call:
+            plan = chat(
                 model=self.config_manager.config["secondary_model"],
                 messages=[
-                    {"role": "system", "content":
-                        "You are a Planning Agent. Describe in one casual sentence what tool call you will make next."},
-                    {"role": "user", "content":
-                        f"The user said: “{user_message}”. I will now run `{planned_call}`."}
+                    {"role":"system",
+                     "content":"You are a Planning Agent. Describe in one casual sentence what tool call you will make next."},
+                    {"role":"user", "content":
+                        f"The user said: “{ctx['user_message']}”. I will now run `{call}`."}
                 ],
                 stream=False
             )["message"]["content"].strip()
-            log_message(f"Planning summary: {plan_response}", "INFO")
-            if not skip_tts and plan_response:
-                self.tts_manager.enqueue(plan_response)
-            ctx_txt += f"\n[Planning summary]: {plan_response}"
+            log_message(f"Planning summary: {plan}", "INFO")
+            if not ctx["skip_tts"] and plan:
+                self.tts_manager.enqueue(plan)
+            ctx["ctx_txt"] += f"\n[Planning summary]: {plan}"
+        return None
 
-        # --- reset stop flag before tool chaining ---
-        self.stop_flag = False
-
-        # --- 8) Tool Chaining & Execution ---
-        tool_context = ctx_txt
+    # ------------------------------
+    # Stage 8: tool_chaining
+    # ------------------------------
+    def _stage_tool_chaining(self, ctx):
         summaries = []
-        invoked_fns = set()
-        MAX_TOOL_CALLS = 5
-
-        for i in range(MAX_TOOL_CALLS):
+        invoked   = set()
+        tc        = ctx["ctx_txt"]
+        for i in range(5):
             buf = []
-            for tok, done in self._stream_tool(tool_context):
+            for tok, done in self._stream_tool(tc):
                 buf.append(tok)
                 if done:
                     break
-            raw_tool = re.sub(r"^```tool_code\s*|\s*```$", "", "".join(buf), flags=re.DOTALL).strip().strip("`")
-            log_message(f"Raw tool‐decision output (iter {i+1}): {raw_tool!r}", "DEBUG")
-
-            code = Tools.parse_tool_call(raw_tool)
-            if not code or code.upper() == "NO_TOOL":
-                log_message("No tool selected; ending chain.", "INFO")
+            raw = re.sub(r"^```tool_code\s*|\s*```$", "", "".join(buf),
+                         flags=re.DOTALL).strip().strip("`")
+            code = Tools.parse_tool_call(raw)
+            if not code or code.upper()=="NO_TOOL":
                 break
-
             m = re.match(r"\s*([A-Za-z_]\w*)\s*\(", code)
             fn = m.group(1) if m else None
-            if not fn or fn in invoked_fns:
-                log_message(f"Tool '{fn}' invalid or duplicate; stopping.", "INFO")
+            if not fn or fn in invoked:
                 break
-            invoked_fns.add(fn)
-            log_message(f"Invoking tool: {code}", "INFO")
-
+            invoked.add(fn)
+            log_message(f"Invoking: {code}", "INFO")
             out = self.run_tool(code)
-            log_message(f"Tool '{fn}' output: {out!r}", "INFO")
+            log_message(f"{fn} → {out!r}", "INFO")
 
-            # Summarize tool output for context
+            # summarize
             summary = None
             try:
                 data = json.loads(out)
-                if fn in ("search_internet", "brave_search"):
-                    lines = [
-                        f"- {r.get('title','')} ({r.get('url','')})"
-                        for r in data.get("web", {}).get("results", [])[:3]
-                    ]
+                if fn in ("search_internet","brave_search"):
+                    lines = [f"- {r.get('title','')} ({r.get('url','')})"
+                             for r in data["web"]["results"][:3]]
                     summary = "Top results:\n" + "\n".join(lines)
-                elif fn == "get_current_location":
+                elif fn=="get_current_location":
                     summary = f"Location: {data.get('city')}, {data.get('regionName')}"
             except:
                 pass
             if summary is None:
                 summary = f"{fn} result: {out}"
-
             summaries.append(summary)
-            tool_context += "\n" + summary
+            tc += "\n" + summary
 
-        # --- 9) Assemble prompt for the primary LLM ---
-        assembled = f"```context_analysis\n{ctx_txt.strip()}\n```"
-        if summaries:
-            assembled += "\n```tool_output\n" + "\n\n".join(summaries) + "\n```"
-        assembled += "\n" + user_message
+        ctx["tool_summaries"] = summaries
+        ctx["ctx_txt"] += "\n" + "\n\n".join(summaries)
+        return None
 
-        # Record & embed
+    # ------------------------------
+    # Stage 9: assemble_prompt
+    # ------------------------------
+    def _stage_assemble_prompt(self, ctx):
+        assembled = f"```context_analysis\n{ctx['ctx_txt'].strip()}\n```"
+        if ctx["tool_summaries"]:
+            assembled += "\n```tool_output\n" + "\n\n".join(ctx["tool_summaries"]) + "\n```"
+        assembled += "\n" + ctx["user_message"]
+        # record & embed
         self.history_manager.add_entry("user", assembled)
         _ = Utils.embed_text(assembled)
-        log_message(f"Final prompt: {assembled!r}", "DEBUG")
+        log_message(f"Final prompt prepared", "DEBUG")
+        ctx["assembled"] = assembled
+        return None
 
-        # --- 10) Final inference ---
-        log_message("Starting final inference with primary model...", "INFO")
-        raw_response = self.run_inference(assembled, skip_tts)
-        log_message(f"Final inference response (raw): {raw_response!r}", "INFO")
-
-        # Clean out any code‐fences or markup
-        clean = re.sub(r"```.*?```", "", raw_response, flags=re.DOTALL)
-        clean = clean.replace("`", "")
-        clean = re.sub(r"[*_]", "", clean).strip()
-
-        # Record assistant’s reply
+    # ------------------------------
+    # Stage 10: final_inference
+    # ------------------------------
+    def _stage_final_inference(self, ctx):
+        resp = self.run_inference(ctx["assembled"], ctx["skip_tts"])
+        # clean markup
+        clean = re.sub(r"```.*?```", "", resp, flags=re.DOTALL)
+        clean = clean.replace("`","")
+        clean = re.sub(r"[*_]","", clean).strip()
+        # record
         self.history_manager.add_entry("assistant", clean)
         try:
             session_log.write(json.dumps({
-                "role":    "assistant",
+                "role":"assistant",
                 "content": clean,
                 "timestamp": datetime.now().isoformat()
-            }) + "\n")
+            })+"\n")
             session_log.flush()
-        except Exception as e:
-            log_message(f"Failed to write assistant turn to session log: {e}", "ERROR")
+        except:
+            pass
+        ctx["final_response"] = clean
+        return None
+    # -------------------------------------------------------------------
+    # New workspace-file stages
+    # -------------------------------------------------------------------
+    def _stage_workspace_setup(self, ctx):
+        """Ensure the workspace folder exists."""
+        os.makedirs(WORKSPACE_DIR, exist_ok=True)
+        log_message(f"Workspace ready at {WORKSPACE_DIR}", "DEBUG")
+        return None
 
-        # Speak final output
-        if clean:
-            self.tts_manager.enqueue(clean)
-
-        # --- 11) Internal Chain-of-Thought + persist to disk ---
-        cot = self._chain_of_thought(
-            user_message=user_message,
-            context_analysis=ctx_txt,
-            external_facts=ext_facts or "",
-            memory_summary=mem_sum or "",
-            planning_summary=plan_response,
-            tool_summaries=summaries,
-            final_response=clean
+    def _stage_file_management(self, ctx):
+        """
+        Ask the secondary model whether to do a file operation.
+        If so, run it and record it in workspace_memory.
+        """
+        prompt = (
+            "You may create, append to, delete or list files in the workspace.  "
+            "Use exactly one Tools call from:\n"
+            "  • create_file(filename, content)\n"
+            "  • append_file(filename, content)\n"
+            "  • delete_file(filename)\n"
+            "  • list_workspace()\n"
+            "If no file action is needed, respond with NO_OP."
         )
-        self.last_chain_of_thought = cot
+        decision = chat(
+            model=self.config_manager.config["secondary_model"],
+            messages=[
+                {"role":"system",  "content": prompt},
+                {"role":"user",    "content": ctx["user_message"]}
+            ],
+            stream=False
+        )["message"]["content"].strip()
+
+        call = Tools.parse_tool_call(decision)
+        if call and call.upper() != "NO_OP":
+            result = self.run_tool(call)
+            # track it
+            mem = ctx["workspace_memory"]
+            mem.setdefault("operations", []).append({
+                "call":      call,
+                "result":    result,
+                "timestamp": datetime.now().isoformat()
+            })
+            ctx["ctx_txt"] += f"\n[File op] {call} → {result}"
+        return None
+
+    def _stage_workspace_save(self, ctx):
+        """Persist our in-memory record of workspace ops to disk."""
+        self._save_workspace_memory(ctx["workspace_memory"])
+        return None
+    # ------------------------------
+    # Stage 11: chain_of_thought
+    # ------------------------------
+    def _stage_chain_of_thought(self, ctx):
+        cot = self._chain_of_thought(
+            user_message=ctx["user_message"],
+            context_analysis=ctx["ctx_txt"],
+            external_facts="",      # already baked in ctx_txt
+            memory_summary="",
+            planning_summary="",
+            tool_summaries=ctx["tool_summaries"],
+            final_response=ctx["final_response"]
+        )
+        # append to disk
         try:
-            thoughts_path = os.path.join(session_folder, "thoughts.json")
-            bag = json.load(open(thoughts_path, "r", encoding="utf-8")) if os.path.exists(thoughts_path) else []
+            path = os.path.join(session_folder, "thoughts.json")
+            bag  = json.load(open(path)) if os.path.exists(path) else []
             bag.append({"timestamp": datetime.now().isoformat(), "chain_of_thought": cot})
-            with open(thoughts_path, "w", encoding="utf-8") as f:
+            with open(path,"w") as f:
                 json.dump(bag, f, indent=2)
-            log_message(f"Appended chain_of_thought to {thoughts_path}", "SUCCESS")
-        except Exception as e:
-            log_message(f"Failed to save chain_of_thought: {e}", "ERROR")
+        except:
+            pass
+        return None
 
-        # --- 12) Notification & Audit ---
+    # ------------------------------
+    # Stage 12: notification_audit
+    # ------------------------------
+    def _stage_notification_audit(self, ctx):
         self._emit_event("assistant_response", {
-            "input":  user_message,
-            "output": clean
+            "input":  ctx["user_message"],
+            "output": ctx["final_response"]
         })
-
-        return clean
-
+        # this is our final return value
+        return ctx["final_response"]
 
 def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
 
