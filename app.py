@@ -1994,9 +1994,17 @@ class ChatManager:
     # ---------------------------------------------------------------- #
     #                           INITIALISATION                         #
     # ---------------------------------------------------------------- #
-    def __init__(self, config_manager: ConfigManager, history_manager: HistoryManager,
-                 tts_manager: TTSManager, tools_data, format_schema,
-                 memory_manager: MemoryManager, mode_manager: ModeManager):
+    def __init__(self,
+                 config_manager: ConfigManager,
+                 history_manager: HistoryManager,
+                 tts_manager: TTSManager,
+                 tools_data,
+                 format_schema,
+                 memory_manager: MemoryManager,
+                 mode_manager: ModeManager):
+        from datetime import datetime
+        import threading
+
         self.config_manager   = config_manager
         self.history_manager  = history_manager
         self.tts_manager      = tts_manager
@@ -2006,12 +2014,25 @@ class ChatManager:
         self.mode_manager     = mode_manager
 
         Tools._history_manager = history_manager
-        
+
+        # inference control
         self.stop_flag       = False
         self.inference_lock  = threading.Lock()
         self.current_thread  = None
 
-        log_message("ChatManager initialized.", "DEBUG")
+        # idle-handling
+        # record the time of the last user interaction
+        self.last_interaction = datetime.now()
+        # interval (seconds) after which we consider ourselves idle
+        self.idle_interval = self.config_manager.config.get("idle_interval_sec", 300)
+        # event to signal the monitor thread to stop if ChatManager is torn down
+        self._idle_stop = threading.Event()
+        # background thread that checks for idle timeouts
+        self._idle_thread = threading.Thread(target=self._idle_monitor, daemon=True)
+        self._idle_thread.start()
+
+        log_message("ChatManager initialized with idle monitor.", "DEBUG")
+
 
     def _stream_context(self, user_msg: str):
         log_message("Phase 1: Starting context-analysis stream...", "INFO")
@@ -2407,7 +2428,94 @@ class ChatManager:
             input("Press Enter to continue automatically…")
         return True
         
+    def _idle_monitor(self):
+        """
+        Runs in the background. Logs a countdown every few seconds,
+        and if no new_request() happens for self.idle_interval seconds,
+        triggers an internal “mull over tasks” request.
+        """
+        from datetime import datetime
+        import time
 
+        while not self._idle_stop.is_set():
+            interval = self.idle_interval
+            start_ts = time.time()
+
+            # countdown loop
+            while not self._idle_stop.is_set():
+                elapsed = time.time() - start_ts
+                remaining = interval - elapsed
+                if remaining <= 0:
+                    break
+                mins, secs = divmod(int(remaining), 60)
+                print(f"[Idle Monitor] Next idle check in {mins}m {secs}s…", flush=True)
+                # sleep in shorter chunks so we can update the countdown
+                time.sleep(min(remaining, 10))
+
+            if self._idle_stop.is_set():
+                break
+
+            idle_secs = (datetime.now() - self.last_interaction).total_seconds()
+            if idle_secs >= interval:
+                # we've been idle long enough
+                log_message(f"No user input for {int(idle_secs)}s — auto-mulling over tasks", "INFO")
+                print(f"[Idle Monitor] Idle detected ({int(idle_secs)}s) — self-prompting", flush=True)
+                # fire off an internal, silent request
+                self.new_request(
+                    "I haven't heard from you in a while—what should I work on next?",
+                    skip_tts=True
+                )
+            else:
+                # user came back before timeout
+                log_message("Idle monitor: activity detected—resetting countdown", "DEBUG")
+                print(f"[Idle Monitor] Activity detected ({int(idle_secs)}s idle) — countdown reset", flush=True)
+
+        log_message("Idle monitor thread exiting.", "DEBUG")
+
+
+    # -------------------------------------------------------------------
+    # 3) The idle‐mull loop
+    # -------------------------------------------------------------------
+    def _start_idle_mull(self):
+        """
+        Background thread: after a random idle interval, if no user input arrived,
+        schedule a new_request(...) on the executor to “mull over pending tasks.”
+        """
+        import threading, random, time
+        from datetime import datetime
+
+        stop_evt = threading.Event()
+        self._idle_stop_event = stop_evt
+
+        def _mull_loop():
+            while not stop_evt.is_set():
+                interval = random.uniform(self.idle_min, self.idle_max)
+                time.sleep(interval)
+                # if still idle, schedule a mull
+                idle_time = (datetime.now() - self.last_interaction).total_seconds()
+                if idle_time >= interval:
+                    log_message("Idle detected: scheduling background mull", "INFO")
+                    # skip TTS so it doesn’t speak to an empty room
+                    self._executor.submit(
+                        self.new_request,
+                        "Please review pending tasks and decide what to do next.",
+                        True
+                    )
+
+        thread = threading.Thread(target=_mull_loop, daemon=True)
+        thread.start()
+        self._idle_thread = thread
+
+    # -------------------------------------------------------------------
+    # 4) Optional: stop the idle‐mull if you ever shut down
+    # -------------------------------------------------------------------
+    def stop_idle_mull(self):
+        """
+        Stop the background idle‐mull loop.
+        """
+        if hasattr(self, "_idle_stop_event"):
+            self._idle_stop_event.set()
+            log_message("Idle mull loop stopped.", "INFO")
     # ----------------------------------------
     # NEW: Chain-of-Thought Agent
     # ----------------------------------------
@@ -2847,7 +2955,11 @@ class ChatManager:
     # Updated new_request with task_management stage
     # -------------------------------------------------------------------
     def new_request(self, user_message: str, skip_tts: bool = False) -> str:
+        from datetime import datetime
         import json
+
+        # reset idle tracker
+        self.last_interaction = datetime.now()
 
         # load the canonical pipeline
         stack  = Tools.load_agent_stack()
@@ -2902,7 +3014,6 @@ class ChatManager:
         # persist workspace ops
         self._save_workspace_memory(ctx["workspace_memory"])
         return ctx["final_response"] or "Sorry, I couldn't process that."
-
 
     # ------------------------------
     # Stage 0: summary_request
