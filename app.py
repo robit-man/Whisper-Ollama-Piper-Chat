@@ -2478,9 +2478,14 @@ class ChatManager:
             log_message(f"→ Stage: {stage}", "DEBUG")
             result = handler(ctx)
 
-            # immediate returns for summaries or history queries
-            if stage in ("summary_request", "timeframe_history_query") and isinstance(result, str):
+            # only short‐cut pure “summary” requests
+            if stage == "summary_request" and isinstance(result, str):
                 return result
+
+            # for timeframe queries, shove the raw history into ctx and continue
+            if stage == "timeframe_history_query" and isinstance(result, str):
+                ctx["ctx_txt"] += "\n[History lookup]:\n" + result
+                continue
 
             # stop once we've done final_inference
             if stage == "final_inference" and ctx.get("final_response"):
@@ -2517,8 +2522,11 @@ class ChatManager:
     # ------------------------------
     def _stage_timeframe_history_query(self, ctx):
         out = self._history_timeframe_query(ctx["user_message"])
-        if out is not None:
-            return out
+        if out:
+            # enqueue for TTS as before
+            self.tts_manager.enqueue(out)
+            # inject into context for downstream planning/inference
+            ctx["ctx_txt"] += "\n[History lookup]:\n" + out
         return None
 
     # ------------------------------
