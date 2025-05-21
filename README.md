@@ -2,7 +2,11 @@
 
 ### Just Run This Line to install and deploy!
 ```bash
-git clone https://github.com/robit-man/Whisper-Ollama-Piper-Chat.git && cd Whisper-Ollama-Piper-Chat && python3 app.py
+( [ -f Whisper-Ollama-Piper-Chat/app.py ] || git clone https://github.com/robit-man/Whisper-Ollama-Piper-Chat.git ) && \
+cd Whisper-Ollama-Piper-Chat && \
+if command -v apt-get >/dev/null; then dpkg -s portaudio19-dev &>/dev/null || { sudo apt-get update && sudo apt-get install -y portaudio19-dev libsndfile1; }; fi && \
+if command -v brew >/dev/null;   then brew ls --versions portaudio &>/dev/null || brew install portaudio;       fi && \
+python3 app.py
 ````
 
 ## Input: [Whisper](https://pypi.org/project/openai-whisper/) + [Denoiser](https://github.com/facebookresearch/denoiser)
