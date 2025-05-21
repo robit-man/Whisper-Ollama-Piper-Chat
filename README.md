@@ -1,5 +1,10 @@
 # A standalone natural communication stack with local LLM's
 
+### Just Run This Line!
+```bash
+git clone https://github.com/robit-man/Whisper-Ollama-Piper-Chat.git && cd Whisper-Ollama-Piper-Chat && python3 app.py
+````
+
 ## Input: [Whisper](https://pypi.org/project/openai-whisper/) + [Denoiser](https://github.com/facebookresearch/denoiser)
 ## Cognition: [Ollama](https://ollama.com/)
 ## Output: [Piper](https://github.com/rhasspy/piper/releases/tag/2023.11.14-2)
