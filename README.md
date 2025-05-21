@@ -1,6 +1,6 @@
 # A standalone natural communication stack with local LLM's
 
-### Just Run This Line!
+### Just Run This Line to install and deploy!
 ```bash
 git clone https://github.com/robit-man/Whisper-Ollama-Piper-Chat.git && cd Whisper-Ollama-Piper-Chat && python3 app.py
 ````
