@@ -988,6 +988,52 @@ class Tools:
     _process_registry: dict[int, subprocess.Popen] = {}
     
     @staticmethod
+    def add_task(text: str) -> str:
+        import json, os
+        path = os.path.join(WORKSPACE_DIR, "tasks.json")
+        tasks = json.loads(open(path).read()) if os.path.exists(path) else []
+        new_id = max((t["id"] for t in tasks), default=0) + 1
+        tasks.append({"id": new_id, "text": text})
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(tasks, f, indent=2)
+        return f"Task {new_id} added."
+
+    @staticmethod
+    def update_task(task_id: int, text: str) -> str:
+        import json, os
+        path = os.path.join(WORKSPACE_DIR, "tasks.json")
+        if not os.path.exists(path):
+            return "No tasks yet."
+        tasks = json.loads(open(path).read())
+        for t in tasks:
+            if t["id"] == task_id:
+                t["text"] = text
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(tasks, f, indent=2)
+                return f"Task {task_id} updated."
+        return f"No task with id={task_id}."
+
+    @staticmethod
+    def remove_task(task_id: int) -> str:
+        import json, os
+        path = os.path.join(WORKSPACE_DIR, "tasks.json")
+        if not os.path.exists(path):
+            return "No tasks yet."
+        tasks = json.loads(open(path).read())
+        new = [t for t in tasks if t["id"] != task_id]
+        if len(new) == len(tasks):
+            return f"No task with id={task_id}."
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(new, f, indent=2)
+        return f"Task {task_id} removed."
+
+    @staticmethod
+    def list_tasks() -> str:
+        import json, os
+        path = os.path.join(WORKSPACE_DIR, "tasks.json")
+        tasks = json.loads(open(path).read()) if os.path.exists(path) else []
+        return json.dumps(tasks)
+    @staticmethod
     def run_script(
         script_path: str,
         args: str = "",
@@ -1070,7 +1116,50 @@ class Tools:
             return f"Stopped script with PID {pid}"
         except Exception as e:
             return f"Error stopping script {pid}: {e}"
+            
+    @staticmethod
+    def load_external_tools():
+        """
+        1) Ensure the `external_tools/` folder exists beside this file.
+        2) For each .py in that folder:
+           • Dynamically import it as a module.
+           • Reflect over its top‐level functions.
+           • Attach each function as a @staticmethod on Tools.
+        3) Re-run discover_agent_stack() so the new tools show up.
+        """
+        import os
+        import importlib.machinery
+        import importlib.util
+        import inspect
 
+        # 1) Create the folder if missing
+        external_dir = os.path.join(os.path.dirname(__file__), "external_tools")
+        os.makedirs(external_dir, exist_ok=True)
+
+        # 2) Scan and load each .py
+        for fname in os.listdir(external_dir):
+            if not fname.endswith(".py") or fname.startswith("_"):
+                continue
+
+            module_name = f"external_tools.{fname[:-3]}"
+            path = os.path.join(external_dir, fname)
+
+            # Load the module from its file
+            loader = importlib.machinery.SourceFileLoader(module_name, path)
+            spec = importlib.util.spec_from_loader(module_name, loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+
+            # 3) Reflect and attach functions
+            for name, fn in inspect.getmembers(module, inspect.isfunction):
+                if name.startswith("_") or hasattr(Tools, name):
+                    continue
+                setattr(Tools, name, staticmethod(fn))
+                log_message(f"Loaded external tool: {name}()", "INFO")
+
+        # 4) Refresh the agent stack so these show up downstream
+        Tools.discover_agent_stack()
+        
     @staticmethod
     def script_status(pid: int) -> str:
         """
@@ -1899,6 +1988,7 @@ class Tools:
 ALL_TOOLS  = Tools.load_agent_stack().get("tools", [])
 ALL_AGENTS = Tools.load_agent_stack().get("agents", [])
 
+Tools.load_external_tools()
 
 class ChatManager:
     # ---------------------------------------------------------------- #
@@ -1927,14 +2017,16 @@ class ChatManager:
         log_message("Phase 1: Starting context-analysis stream...", "INFO")
 
         # 1) Build the system prompt
-        #    — include both the normal instructions AND a list of Tools + signatures
+        #    — include both the enhanced instructions AND a list of Tools + signatures
         #    so the context agent can reason about which tools might be needed.
         # -----------------------------------------------------------------------
-        # Base instructions
         preamble = (
-            "You are the CONTEXT-ASSEMBLY AGENT. Your job is to analyze the user’s intent, goals, "
-            "and previous history to inform downstream agents.  Do **not** output any prose, "
-            "just produce a concise analysis (1–2 sentences for simple prompts, 3–4 for complex)."
+            "You are the CONTEXT-ASSEMBLY AGENT. Your mission is to synthesize the user’s latest message, "
+            "conversation history, and the system’s tool capabilities to generate a focused analysis. "
+            "In your analysis, identify the user’s explicit objective, any implicit or underlying goals, "
+            "relevant tools or operations that may be needed, and surface any ambiguities. "
+            "Output ONLY a concise, structured summary: 1–2 sentences for straightforward queries or "
+            "3–4 sentences for more complex requests. Do NOT include examples, suggestions, or extraneous commentary."
         )
 
         # Gather tool signatures
@@ -1946,7 +2038,6 @@ class ChatManager:
                     func_sigs.append(f"  • {attr}{sig}")
                 except (ValueError, TypeError):
                     func_sigs.append(f"  • {attr}(…)")
-
         tools_block = "AVAILABLE TOOLS:\n" + "\n".join(func_sigs)
 
         # 2) Grab the last 5 exchanges (strictly chronological)
@@ -1981,18 +2072,32 @@ class ChatManager:
         ]
         payload = self.build_payload(override_messages=messages, model_key="secondary_model")
 
-        # 6) Stream the model’s context analysis
+        # 6) Stream the model’s context analysis, with fallback on error
         print("⟳ Context: ", end="", flush=True)
         buf = ""
-        for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
-            if self.stop_flag:
-                log_message("Phase 1 aborted by stop flag.", "WARNING")
-                break
-            tok = part["message"]["content"]
-            buf += tok
-            print(tok, end="", flush=True)
-            yield tok, False
+        try:
+            for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
+                if self.stop_flag:
+                    log_message("Phase 1 aborted by stop flag.", "WARNING")
+                    break
+                tok = part["message"]["content"]
+                buf += tok
+                print(tok, end="", flush=True)
+                yield tok, False
+        except Exception as e:
+            log_message(f"Context-analysis streaming failed: {e}", "ERROR")
+            # fallback to non-streaming call
+            try:
+                resp = chat(model=payload["model"], messages=payload["messages"], stream=False)
+                content = resp.get("message", {}).get("content", "") or ""
+                print(content, end="", flush=True)
+                yield content, True
+            except Exception as e2:
+                log_message(f"Context-analysis non-stream fallback failed: {e2}", "ERROR")
+                yield "", True
+            return
 
+        # 7) Successful completion of stream
         print()
         log_message(f"Phase 1 complete: context analysis:\n{buf}", "INFO")
         yield "", True
@@ -2258,23 +2363,34 @@ class ChatManager:
     def _memory_summarize(self):
         """
         Every N turns compresses full history to a short summary stored in memory.
-        Returns a summary string (or None if not time yet).
+        Returns a summary string (or None if not time yet or on error).
         """
-        if len(self.history_manager.history) % 10 == 0:   # every 10 turns
-            full = "\n".join(m["content"] for m in self.history_manager.history)
-            summary = chat(
+        # only run every 10th turn
+        if len(self.history_manager.history) % 10 != 0:
+            return None
+
+        full = "\n".join(m["content"] for m in self.history_manager.history)
+        try:
+            resp = chat(
                 model=self.config_manager.config["secondary_model"],
                 messages=[
-                  {"role":"system","content":
-                   "You are a Memory Agent—summarize this conversation in one paragraph."},
-                  {"role":"user","content":full}
+                    {"role": "system", "content":
+                        "You are a Memory Agent—summarize this conversation in one paragraph."
+                    },
+                    {"role": "user", "content": full}
                 ],
                 stream=False
-            )["message"]["content"].strip()
-            # store or log it
+            )
+            # extract and log the summary
+            summary = resp["message"]["content"].strip()
             log_message("Memory summary: " + summary, "INFO")
             return summary
-        return None
+
+        except Exception as e:
+            # catch ResponseError, network errors, etc.
+            log_message(f"Memory summarization failed: {e}", "ERROR")
+            return None
+
 
     # ----------------------------------------
     # NEW: Human-in-the-Loop Review
@@ -2290,7 +2406,8 @@ class ChatManager:
             print(assembled[:500] + "…")
             input("Press Enter to continue automatically…")
         return True
-    
+        
+
     # ----------------------------------------
     # NEW: Chain-of-Thought Agent
     # ----------------------------------------
@@ -2696,6 +2813,7 @@ class ChatManager:
             return f"Error executing `{tool_code}`: {e}"
 
 
+
     
     # -------------------------------------------------------------------
     # New workspace‐memory helpers
@@ -2726,27 +2844,40 @@ class ChatManager:
         return self._stage_planning_summary(ctx)
 
     # -------------------------------------------------------------------
-    # Updated new_request
+    # Updated new_request with task_management stage
     # -------------------------------------------------------------------
     def new_request(self, user_message: str, skip_tts: bool = False) -> str:
+        import json
+
+        # load the canonical pipeline
         stack  = Tools.load_agent_stack()
         stages = stack.get("stages", []).copy()
 
-        # ensure we have workspace stages in the right place
-        if "workspace_setup"       not in stages: stages.insert(stages.index("record_user_message") + 1, "workspace_setup")
-        if "file_management"       not in stages: stages.insert(stages.index("workspace_setup")       + 1, "file_management")
-        if "workspace_save"        not in stages: stages.append("workspace_save")
+        # ensure our workspace + file + task stages are in the right spots
+        if "workspace_setup" not in stages:
+            idx = stages.index("record_user_message") + 1
+            stages.insert(idx, "workspace_setup")
+        if "file_management" not in stages:
+            idx = stages.index("workspace_setup") + 1
+            stages.insert(idx, "file_management")
+        if "task_management" not in stages:
+            idx = stages.index("file_management") + 1
+            stages.insert(idx, "task_management")
+        if "workspace_save" not in stages:
+            stages.append("workspace_save")
 
+        # prime our context
         ctx = {
-            "user_message":    user_message,
-            "skip_tts":        skip_tts,
-            "ctx_txt":         "",
-            "tool_summaries":  [],
-            "assembled":       "",
-            "final_response":  None,
+            "user_message":     user_message,
+            "skip_tts":         skip_tts,
+            "ctx_txt":          "",
+            "tool_summaries":   [],
+            "assembled":        "",
+            "final_response":   None,
             "workspace_memory": self._load_workspace_memory(),
-            "ALL_TOOLS":       stack.get("tools", []),
-            "ALL_AGENTS":      stack.get("agents", [])
+            "ALL_TOOLS":        stack.get("tools", []),
+            "ALL_AGENTS":       stack.get("agents", []),
+            "global_tasks":     json.loads(Tools.list_tasks()),
         }
 
         log_message(f"Pipeline stages: {stages}", "INFO")
@@ -2759,22 +2890,19 @@ class ChatManager:
             log_message(f"→ Stage: {stage}", "DEBUG")
             result = handler(ctx)
 
-            # only short‐cut pure “summary” requests
+            # short‐circuit summary & timeframe queries as before
             if stage == "summary_request" and isinstance(result, str):
                 return result
-
-            # for timeframe queries, shove the raw history into ctx and continue
             if stage == "timeframe_history_query" and isinstance(result, str):
                 ctx["ctx_txt"] += "\n[History lookup]:\n" + result
                 continue
-
-            # stop once we've done final_inference
             if stage == "final_inference" and ctx.get("final_response"):
                 break
 
-        # persist our workspace log
+        # persist workspace ops
         self._save_workspace_memory(ctx["workspace_memory"])
         return ctx["final_response"] or "Sorry, I couldn't process that."
+
 
     # ------------------------------
     # Stage 0: summary_request
@@ -2796,6 +2924,42 @@ class ChatManager:
                 "Please provide a brief, high-level summary of what we discussed."
             )
             return Tools.secondary_agent_tool(prompt, temperature=0.5).strip()
+        return None
+    # -------------------------------------------------------------------
+    # Stage: task_management
+    # -------------------------------------------------------------------
+    def _stage_task_management(self, ctx):
+        """
+        Let the secondary model decide whether to add/update/remove/list tasks.
+        Any successful Tools.* call is run and then recorded in ctx['global_tasks']
+        and in ctx['ctx_txt'].
+        """
+        prompt = (
+            "You may manage the GLOBAL TASK LIST.  Use exactly one Tools call from:\n"
+            "  • add_task(text)\n"
+            "  • update_task(id, text)\n"
+            "  • remove_task(id)\n"
+            "  • list_tasks()\n"
+            "If no task action is needed, respond with NO_OP."
+        )
+        decision = chat(
+            model=self.config_manager.config["secondary_model"],
+            messages=[
+                {"role": "system",  "content": prompt},
+                {"role": "user",    "content": ctx["user_message"]}
+            ],
+            stream=False
+        )["message"]["content"].strip()
+
+        call = Tools.parse_tool_call(decision)
+        if call and call.upper() != "NO_OP":
+            out = self.run_tool(call)
+            # refresh our in-memory view
+            try:
+                ctx["global_tasks"] = json.loads(Tools.list_tasks())
+            except:
+                pass
+            ctx["ctx_txt"] += f"\n[TASK_OP] {call} → {out}"
         return None
 
     # ------------------------------
@@ -3070,7 +3234,7 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
 
     log_message("Voice-to-LLM loop started. Waiting for speech...", "INFO")
     last_response    = None
-    max_words        = config.get("max_response_words", 100)
+    max_words        = config.get("max_response_words", 1000)
     rms_threshold    = config.get("rms_threshold", 0.01)
     silence_duration = 2.0  # seconds of sustained silence → end of speech
 
