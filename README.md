@@ -12,11 +12,14 @@ python3 app.py
 
 ````
 
-Please note that you must populate the created .env with a free [brakve search api key](https://brave.com/search/api/)
+Please note that you must populate the created .env with a free [brave search api key](https://brave.com/search/api/)
 
 ## Input: [Whisper](https://pypi.org/project/openai-whisper/) + [Denoiser](https://github.com/facebookresearch/denoiser)
 ## Cognition: [Ollama](https://ollama.com/)
 ## Output: [Piper](https://github.com/rhasspy/piper/releases/tag/2023.11.14-2)
+
+
+## OLD NOTES -----------------------------------------
 
 Just run ```python3 app.py``` in a folder on your system, it will automatically handle all installation steps, from ollama install if missing, all the way to pulling weights for each stage of transduction of data
 
