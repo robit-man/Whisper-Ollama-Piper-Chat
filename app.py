@@ -923,24 +923,23 @@ class Tools:
           2) An inline-backtick call: `func(arg1, arg2)`
           3) A bare call on its own line: func(arg1, arg2)
 
-        Supports:
-          - Zero-argument calls: func()
-          - Positional or keyword args of the form:
-              * "string" or 'string'
-              * integer literals (\d+)
-              * the literal None
-          - Keyword args written as key=value or key: value
-        Returns the raw call, e.g.:
-          'get_current_location()'
-          'get_chat_history("latest", 5)'
-          'secondary_agent_tool(prompt="Hi", temperature=0.5)'
-        or None if no valid tool invocation is found.
+        Strips out Python‐style type annotations (e.g. filename: str="x")
+        so that `file_info(filename: str = "F.gig")` becomes
+        `file_info(filename="F.gig")`.
         """
+        import re
 
-        # 1) Trim leading/trailing whitespace
         t = text.strip()
 
-        # 2) Normalize key: value → key=value
+        # 0) Remove type annotations before the '='
+        #    e.g. 'filename: str = "F.gig"' → 'filename = "F.gig"'
+        t = re.sub(
+            r'([A-Za-z_]\w*)\s*:\s*[A-Za-z_]\w*(?=\s*=)',
+            r'\1',
+            t
+        )
+
+        # 1) Normalize key: value → key=value (for older-style “key: 'val'”)
         t = re.sub(
             r'(\b[A-Za-z_]\w*\b)\s*:\s*'                 # key:
             r'("(?:[^"\\]|\\.)*"|'                      #   "quoted string"
@@ -950,22 +949,20 @@ class Tools:
             t
         )
 
-        # 3) Unwrap inline single-backticks if present
+        # 2) Unwrap inline single-backticks if present
         if t.startswith("`") and t.endswith("`"):
             t = t[1:-1].strip()
 
-        # Prepare a reusable piece for “literal” (string, number, None)
+        # 3) Prepare literal patterns
         LIT = r'(?:\"[^\"]*\"|\'[^\']*\'|\d+|None)'
-
-        # And optional key= prefix
         KV  = rf'(?:[A-Za-z_]\w*\s*=\s*)?{LIT}'
 
         # 4) Try fenced ```tool_code``` block
         fenced_re = re.compile(
             rf"```tool_code\s*"
-            rf"([A-Za-z_]\w*\s*\(\s*"                  # FuncName(
-            rf"(?:{KV}(?:\s*,\s*{KV})*)?\s*"           #   optional args...
-            rf"\)\s*)```",                            # )```
+            rf"([A-Za-z_]\w*\s*\(\s*"
+            rf"(?:{KV}(?:\s*,\s*{KV})*)?\s*"
+            rf"\)\s*)```",
             re.DOTALL
         )
         m = fenced_re.search(t)
@@ -987,22 +984,198 @@ class Tools:
         code = m.group(1).strip()
         log_message(f"Parsed tool call from text: {code!r}", "DEBUG")
         return code
-    _driver = None
-
-
-
-    # --- FILESYSTEM AWARENESS ---
+    
+    _process_registry: dict[int, subprocess.Popen] = {}
+    
     @staticmethod
-    def list_dir(path: str = ".") -> str:
-        """Returns a JSON list of files & dirs at `path`."""
+    def run_script(
+        script_path: str,
+        args: str = "",
+        base_dir: str = WORKSPACE_DIR,
+        window_title: str | None = None
+    ) -> str:
+        """
+        Launch a Python script in its own new terminal window and register its PID.
+
+        **Usage (from model)**:
+        - Call `run_script("myscript.py")` to start `workspace/myscript.py` with no args.
+        - Call `run_script("monitor.py", "--verbose", base_dir="/path/to/dir")` to run with args.
+        - Optionally supply `window_title="MyTask"` on Windows.
+
+        **Behavior**:
+        1. Resolves `script_path` (absolute or relative to `base_dir`).
+        2. Opens a new console/terminal window (platform‐specific).
+        3. Launches `python <script> <args>` inside it.
+        4. Stores the resulting `Popen` in `_process_registry` keyed by its PID.
+        5. Returns `"Started script <full_path> with PID <pid>"` or an error.
+        """
+        import subprocess, os, sys, platform
+
+        # Resolve full path
+        full_path = script_path if os.path.isabs(script_path) else os.path.join(base_dir, script_path)
+        if not os.path.isfile(full_path):
+            return f"Error: script not found at {full_path}"
+
+        cmd = [sys.executable, full_path] + (args.split() if args else [])
+        system = platform.system()
+
+        try:
+            if system == "Windows":
+                # Windows: new console window
+                flags = subprocess.CREATE_NEW_CONSOLE
+                if window_title:
+                    # Prepend a title command
+                    title_cmd = ["cmd", "/c", f"title {window_title} &&"] + cmd
+                    proc = subprocess.Popen(title_cmd, creationflags=flags)
+                else:
+                    proc = subprocess.Popen(cmd, creationflags=flags)
+
+            elif system == "Darwin":
+                # macOS: use AppleScript to open Terminal
+                osa_cmd = (
+                    f'tell application "Terminal" to do script "{" ".join(cmd)}"'
+                )
+                proc = subprocess.Popen(["osascript", "-e", osa_cmd])
+
+            else:
+                # Linux/Unix: open default terminal emulator (or xterm)
+                term = os.getenv("TERMINAL", "xterm")
+                proc = subprocess.Popen([term, "-hold", "-e"] + cmd)
+
+            pid = proc.pid
+            Tools._process_registry[pid] = proc
+            return f"Started script {full_path} with PID {pid}"
+
+        except Exception as e:
+            return f"Error launching script: {e}"
+
+    @staticmethod
+    def stop_script(pid: int) -> str:
+        """
+        Terminate a previously launched script by its PID.
+
+        **Usage (from model)**:
+        - After `run_script` returns a PID N, call `stop_script(N)` to kill it.
+        - Returns confirmation or an error if PID not managed.
+        """
+        import signal
+
+        proc = Tools._process_registry.get(pid)
+        if proc is None:
+            return f"No managed process with PID {pid}"
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+            del Tools._process_registry[pid]
+            return f"Stopped script with PID {pid}"
+        except Exception as e:
+            return f"Error stopping script {pid}: {e}"
+
+    @staticmethod
+    def script_status(pid: int) -> str:
+        """
+        Check the status of a managed script.
+
+        **Usage (from model)**:
+        - Call `script_status(N)` to see if process N is still running or its exit code.
+        - Automatically cleans up the registry entry when the process exits.
+        """
+        proc = Tools._process_registry.get(pid)
+        if proc is None:
+            return f"No managed process with PID {pid}"
+        rc = proc.poll()
+        if rc is None:
+            return f"Process {pid} is still running"
+        else:
+            # cleanup finished process
+            del Tools._process_registry[pid]
+            return f"Process {pid} exited with code {rc}"
+        
+    @staticmethod
+    def create_file(filename: str, content: str, base_dir: str = WORKSPACE_DIR) -> str:
+        """
+        Create or overwrite a file under base_dir (defaults to WORKSPACE_DIR).
+        """
+        path = os.path.join(base_dir, filename)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return f"Created file: {path}"
+        except Exception as e:
+            return f"Error creating file {path!r}: {e}"
+
+    @staticmethod
+    def append_file(filename: str, content: str, base_dir: str = WORKSPACE_DIR) -> str:
+        """
+        Append to a file under base_dir (creates it if missing).
+        """
+        path = os.path.join(base_dir, filename)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(content)
+            return f"Appended to file: {path}"
+        except Exception as e:
+            return f"Error appending to file {path!r}: {e}"
+
+    @staticmethod
+    def delete_file(filename: str, base_dir: str = WORKSPACE_DIR) -> str:
+        """
+        Delete a file under base_dir.
+        """
+        path = os.path.join(base_dir, filename)
+        try:
+            os.remove(path)
+            return f"Deleted file: {path}"
+        except FileNotFoundError:
+            return f"File not found: {path}"
+        except Exception as e:
+            return f"Error deleting file {path!r}: {e}"
+
+    @staticmethod
+    def list_workspace(base_dir: str = WORKSPACE_DIR) -> str:
+        """
+        List all files & dirs in base_dir.
+        """
+        try:
+            entries = os.listdir(base_dir)
+            return json.dumps(entries)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @staticmethod
+    def find_files(pattern: str, path: str = WORKSPACE_DIR) -> str:
+        """
+        Recursively search under `path` (defaults to WORKSPACE_DIR) for files
+        matching the glob `pattern` and return a JSON list of
+        {"file": filename, "dir": directory} objects.
+        """
+        import fnmatch
+        matches = []
+        for root, dirs, files in os.walk(path):
+            for fname in files:
+                if fnmatch.fnmatch(fname, pattern):
+                    matches.append({"file": fname, "dir": root})
+        return json.dumps(matches)
+
+    @staticmethod
+    def list_dir(path: str = WORKSPACE_DIR) -> str:
+        """
+        Returns a JSON list of files & dirs at `path` (defaults to WORKSPACE_DIR).
+        """
         try:
             return json.dumps(os.listdir(path))
         except Exception as e:
             return json.dumps({"error": str(e)})
 
     @staticmethod
-    def read_file(path: str) -> str:
-        """Returns the contents of a text file."""
+    def read_file(filepath: str, base_dir: str = None) -> str:
+        """
+        Read and return the contents of `filepath`. If `base_dir` is given,
+        `filepath` is relative to it; otherwise, `filepath` is treated as a full path.
+        """
+        path = os.path.join(base_dir, filepath) if base_dir else filepath
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return f.read()
@@ -1010,14 +1183,95 @@ class Tools:
             return f"Error reading {path!r}: {e}"
 
     @staticmethod
-    def write_file(path: str, content: str) -> str:
-        """Writes `content` to `path`, returns confirmation."""
+    def write_file(filepath: str, content: str, base_dir: str = None) -> str:
+        """
+        Write `content` to `filepath`. If `base_dir` is given,
+        `filepath` is relative to it; otherwise, `filepath` is treated as a full path.
+        """
+        path = os.path.join(base_dir, filepath) if base_dir else filepath
         try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
             return f"Wrote {len(content)} chars to {path!r}"
         except Exception as e:
             return f"Error writing {path!r}: {e}"
+
+    @staticmethod
+    def rename_file(old: str, new: str, base_dir: str = WORKSPACE_DIR) -> str:
+        """
+        Rename `old` → `new` under base_dir.
+        """
+        safe_old = os.path.normpath(old)
+        safe_new = os.path.normpath(new)
+        if safe_old.startswith("..") or safe_new.startswith(".."):
+            return "Error: Invalid path"
+        src = os.path.join(base_dir, safe_old)
+        dst = os.path.join(base_dir, safe_new)
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.rename(src, dst)
+            return f"Renamed {safe_old} → {safe_new}"
+        except Exception as e:
+            return f"Error renaming file: {e}"
+
+    @staticmethod
+    def copy_file(src: str, dst: str, base_dir: str = WORKSPACE_DIR) -> str:
+        """
+        Copy `src` → `dst` under base_dir.
+        """
+        import shutil
+        safe_src = os.path.normpath(src)
+        safe_dst = os.path.normpath(dst)
+        if safe_src.startswith("..") or safe_dst.startswith(".."):
+            return "Error: Invalid path"
+        src_path = os.path.join(base_dir, safe_src)
+        dst_path = os.path.join(base_dir, safe_dst)
+        try:
+            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+            shutil.copy(src_path, dst_path)
+            return f"Copied {safe_src} → {safe_dst}"
+        except Exception as e:
+            return f"Error copying file: {e}"
+
+    @staticmethod
+    def file_exists(filename: str, base_dir: str = WORKSPACE_DIR) -> bool:
+        """
+        Check existence of `filename` under base_dir.
+        """
+        safe = os.path.normpath(filename)
+        if safe.startswith(".."):
+            return False
+        return os.path.exists(os.path.join(base_dir, safe))
+
+    @staticmethod
+    def file_info(filename: str, base_dir: str = WORKSPACE_DIR) -> dict:
+        """
+        Return metadata for `filename` under base_dir.
+        """
+        safe = os.path.normpath(filename)
+        if safe.startswith(".."):
+            return {"error": "Invalid path"}
+        path = os.path.join(base_dir, safe)
+        try:
+            st = os.stat(path)
+            return {"size": st.st_size, "modified": st.st_mtime}
+        except Exception as e:
+            return {"error": str(e)}
+        
+    @staticmethod
+    def get_workspace_dir() -> str:
+        """
+        Return the absolute path of the current workspace directory.
+        """
+        return WORKSPACE_DIR
+
+    @staticmethod
+    def get_cwd() -> str:
+        """
+        Return the current working directory (where the script was launched).
+        """
+        return os.getcwd()
 
     # --- AGENT-STACK DISCOVERY & MANAGEMENT ---
     @staticmethod
@@ -2301,16 +2555,20 @@ class ChatManager:
 
         log_message(f"run_tool: Executing {tool_code!r}", "DEBUG")
 
-        # 0) Quick split-based parser to handle mixed positional & keyword args
-        m_quick = re.fullmatch(r'\s*([A-Za-z_]\w*)\s*\(\s*(.*?)\s*\)\s*', tool_code, re.DOTALL)
+        # 0) Quick split–based parser for simple, unquoted args
+        m_quick = re.fullmatch(
+            r'\s*([A-Za-z_]\w*)\s*\(\s*(.*?)\s*\)\s*',
+            tool_code,
+            re.DOTALL
+        )
         if m_quick:
             func_name, body = m_quick.group(1), m_quick.group(2)
             func = getattr(Tools, func_name, None)
-            if func:
+            # only use quick split if there are no quotes in the argument string
+            if func and not re.search(r'["\']', body):
                 args = []
                 kwargs = {}
-                # split on commas not inside quotes
-                parts = re.split(r'''\s*,\s*(?![^'"]*['"][^'"]*['"])''', body)
+                parts = re.split(r'\s*,\s*', body)
                 for part in parts:
                     part = part.strip()
                     if not part:
@@ -2327,47 +2585,62 @@ class ChatManager:
                         if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
                             v = v[1:-1]
                         args.append(v)
-
                 # default for get_chat_history()
                 if func_name == "get_chat_history" and not args and not kwargs:
                     args = [5]
-
-                log_message(f"run_tool: Parsed {func_name} with args={args} kwargs={kwargs}", "DEBUG")
+                log_message(
+                    f"run_tool: Parsed {func_name} with args={args} kwargs={kwargs}",
+                    "DEBUG"
+                )
                 try:
                     result = func(*args, **kwargs)
-                    log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
+                    log_message(
+                        f"run_tool: {func_name} returned {result!r}",
+                        "INFO"
+                    )
                     return str(result)
                 except Exception as e:
                     log_message(f"run_tool error: {e}", "ERROR")
                     return f"Error executing `{func_name}`: {e}"
 
-        # 1) Regex fallback for single unquoted arg: func(foo bar) → treat whole body as one string
-        m_simple = re.fullmatch(r"\s*([A-Za-z_]\w*)\(\s*([^)]+?)\s*\)\s*", tool_code)
+        # 1) Regex fallback for single unquoted arg: func(foo bar)
+        m_simple = re.fullmatch(
+            r'\s*([A-Za-z_]\w*)\(\s*([^)]+?)\s*\)\s*',
+            tool_code,
+            re.DOTALL
+        )
         if m_simple:
             func_name, raw_arg = m_simple.group(1), m_simple.group(2)
-            func = getattr(Tools, func_name, None)
-            if func:
-                log_message(f"run_tool: Fallback parse → {func_name}('{raw_arg}')", "DEBUG")
-                try:
-                    result = func(raw_arg)
-                    log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
-                    return str(result)
-                except Exception as e:
-                    log_message(f"run_tool error: {e}", "ERROR")
-                    return f"Error executing `{func_name}`: {e}"
+            # only use fallback if the raw_arg contains no quotes
+            if '"' not in raw_arg and "'" not in raw_arg:
+                func = getattr(Tools, func_name, None)
+                if func:
+                    log_message(
+                        f"run_tool: Fallback parse → {func_name}('{raw_arg}')",
+                        "DEBUG"
+                    )
+                    try:
+                        result = func(raw_arg)
+                        log_message(
+                            f"run_tool: {func_name} returned {result!r}",
+                            "INFO"
+                        )
+                        return str(result)
+                    except Exception as e:
+                        log_message(f"run_tool error: {e}", "ERROR")
+                        return f"Error executing `{func_name}`: {e}"
 
-        # 2) Full AST-based parsing for richer calls
+        # 2) Full AST–based parsing for all other cases (handles quoted strings, newlines, commas)
         try:
             tree = ast.parse(tool_code.strip(), mode="eval")
             if not isinstance(tree, ast.Expression) or not isinstance(tree.body, ast.Call):
                 raise ValueError("Not a function call")
-            call: ast.Call = tree.body
+            call = tree.body
 
             # get function name
-            if isinstance(call.func, ast.Name):
-                func_name = call.func.id
-            else:
+            if not isinstance(call.func, ast.Name):
                 raise ValueError("Unsupported function expression")
+            func_name = call.func.id
             func = getattr(Tools, func_name, None)
             if not func:
                 raise NameError(f"Unknown tool `{func_name}`")
@@ -2384,7 +2657,7 @@ class ChatManager:
                     if seg is not None:
                         args.append(seg.strip())
                     else:
-                        raise ValueError("Unsupported arg type")
+                        raise ValueError(f"Unsupported arg type: {ast.dump(arg)}")
 
             # keyword args
             kwargs = {}
@@ -2401,20 +2674,28 @@ class ChatManager:
                     if seg is not None:
                         kwargs[kw.arg] = seg.strip()
                     else:
-                        raise ValueError("Unsupported kwarg type")
+                        raise ValueError(f"Unsupported kwarg type: {ast.dump(v)}")
 
             # default for get_chat_history() with no args
             if func_name == "get_chat_history" and not args and not kwargs:
                 args = [5]
 
-            log_message(f"run_tool: Calling {func_name} with args={args} kwargs={kwargs}", "DEBUG")
+            log_message(
+                f"run_tool: Calling {func_name} with args={args} kwargs={kwargs}",
+                "DEBUG"
+            )
             result = func(*args, **kwargs)
-            log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
+            log_message(
+                f"run_tool: {func_name} returned {result!r}",
+                "INFO"
+            )
             return str(result)
 
         except Exception as e:
             log_message(f"run_tool error: {e}", "ERROR")
             return f"Error executing `{tool_code}`: {e}"
+
+
     
     # -------------------------------------------------------------------
     # New workspace‐memory helpers
