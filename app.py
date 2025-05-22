@@ -18,7 +18,7 @@ This script now integrates:
     whose output is then passed to the primary model.
 """
 
-import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib
+import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib, random, copy, statistics
 from datetime import datetime
 
 # Define ANSI terminal colors for verbose logging
@@ -248,10 +248,17 @@ session_folder, session_log = setup_chat_session()
 
 # ----- Import Additional Packages (after venv initialization and dependency installation) -----
 from sounddevice import InputStream
+import sounddevice as sd                       # audio playback / capture
+
 from scipy.io.wavfile import write
+from scipy.signal import butter, lfilter       # EQ enhancement
+import numpy as np
+
 import whisper
 from ollama import chat, embed
 from dotenv import load_dotenv
+
+# ── Selenium stack
 from selenium import webdriver
 from selenium.common.exceptions import WebDriverException, TimeoutException
 from selenium.webdriver.chrome.service import Service
@@ -262,21 +269,30 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver import ActionChains
 from webdriver_manager.chrome import ChromeDriverManager
+
+# ── Parsers / utilities
 from bs4 import BeautifulSoup
-import html, os, shutil, random, platform, json
-import html, textwrap
+import html, textwrap                          # (html imported only once)
+import os, shutil, random, platform, json
+import inspect
+
+# ── Wi-Fi control
 import pywifi
 from pywifi import const
+
+# ── System + numerics
 import psutil
 from num2words import num2words
-import sounddevice as sd  # For debug audio playback
-import numpy as np
-from scipy.signal import butter, lfilter  # For EQ enhancement
+from itertools import count
+from collections import defaultdict
+
+# ── Audio / speech enhancement
 import noisereduce as nr
 import torch
-from denoiser import pretrained  # For speech enhancement via denoiser
-from PIL import ImageGrab  # Ensure Pillow is installed
-import inspect
+from denoiser import pretrained
+
+# ── Screen & vision
+from PIL import ImageGrab
 import cv2
 import mss
 
@@ -2466,6 +2482,105 @@ class Tools:
         except Exception as e:
             log_message(f"Error in secondary agent tool: {e}", "ERROR")
             return f"Error in secondary agent: {e}"
+        
+
+class RLManager:
+    """
+    Keeps a rolling history of prompts/stage-lists and their
+    observed 'rewards' (here: success vs. error + optional metrics).
+    Provides simple APIs to suggest variations and pick the best.
+    """
+    WINDOW = 25        # how many recent runs to keep
+
+    def __init__(self):
+        self.history = []   # list[(prompt,str), stages,list[str], reward,float]
+
+    # ——— called by ChatManager at end of each run ———
+    def record(self, prompt: str, stages: list[str], reward: float):
+        self.history.append((prompt, stages, reward))
+        if len(self.history) > self.WINDOW:
+            self.history.pop(0)
+
+    # ——— produce a candidate (prompt, stages) tuple ———
+    def propose(self, base_prompt: str, base_stages: list[str]) -> tuple[str, list[str]]:
+        # 1) mutate the prompt (simple example: shuffle two instructions)
+        parts = base_prompt.split("\n")
+        if len(parts) > 1 and random.random() < 0.5:
+            i, j = random.sample(range(len(parts)), 2)
+            parts[i], parts[j] = parts[j], parts[i]
+        new_prompt = "\n".join(parts)
+
+        # 2) mutate the stage list: maybe drop or add
+        stages = base_stages.copy()
+        ops = ["drop", "add", "swap"]
+        op = random.choice(ops)
+        if op == "drop" and len(stages) > 5:
+            stages.pop(random.randrange(len(stages)))
+        elif op == "add":
+            extras = ["html_filtering", "chunk_and_summarize",
+                      "rl_experimentation", "prompt_optimization"]
+            stages.insert(random.randrange(len(stages)+1),
+                          random.choice(extras))
+        elif op == "swap" and len(stages) > 2:
+            i, j = random.sample(range(len(stages)), 2)
+            stages[i], stages[j] = stages[j], stages[i]
+        return new_prompt, stages
+
+    # ——— pick best prompt seen so far ———
+    def best_prompt(self, default: str) -> str:
+        if not self.history:
+            return default
+        best = max(self.history, key=lambda rec: rec[2])
+        return best[0]
+
+class Observer:
+    """
+    Lightweight run-time telemetry: tracks each pipeline run, every stage’s
+    status and timing, and exposes simple signals (e.g. recent failure rate)
+    that ChatManager can use to adjust its behaviour.
+    """
+    _ids = count(1)
+
+    def __init__(self):
+        self.runs: dict[int, dict] = {}
+
+    # ---------------- run lifecycle ----------------
+    def start_run(self, user_msg: str) -> int:
+        run_id = next(self._ids)
+        self.runs[run_id] = {
+            "user_msg": user_msg,
+            "start":    datetime.now(),
+            "stages":   defaultdict(dict),
+            "status":   "running"
+        }
+        return run_id
+
+    def log_stage_start(self, run_id: int, stage: str):
+        self.runs[run_id]["stages"][stage]["start"] = datetime.now()
+
+    def log_stage_end(self, run_id: int, stage: str):
+        self.runs[run_id]["stages"][stage]["end"]   = datetime.now()
+        self.runs[run_id]["stages"][stage]["status"] = "done"
+
+    def log_error(self, run_id: int, stage: str, err: Exception):
+        self.runs[run_id]["stages"][stage]["error"]  = str(err)
+        self.runs[run_id]["stages"][stage]["status"] = "error"
+
+    def complete_run(self, run_id: int):
+        self.runs[run_id]["end"]   = datetime.now()
+        self.runs[run_id]["status"] = "done"
+
+    # ---------------- signals ----------------
+    def recent_failure_ratio(self, n: int = 10) -> float:
+        """Return fraction of the last *n* runs that had any stage error."""
+        last = list(self.runs.values())[-n:]
+        if not last:
+            return 0.0
+        fails = sum(
+            1 for r in last
+            if any(s.get("status") == "error" for s in r["stages"].values())
+        )
+        return fails / len(last)
 
 # -------------------------------------------------------------------
 # Expose two module-level variables for LLM introspection
@@ -2497,7 +2612,9 @@ class ChatManager:
         self.format_schema    = format_schema
         self.memory_manager   = memory_manager
         self.mode_manager     = mode_manager
-
+        self.observer         = Observer()
+        self.rl_manager       = RLManager()
+        self._temp_bump       = 0.0     # adaptive temperature offset
         Tools._history_manager = history_manager
 
         # inference control
@@ -2508,6 +2625,10 @@ class ChatManager:
         # idle-handling
         # record the time of the last user interaction
         self.last_interaction = datetime.now()
+        
+        # ---------- observability ----------
+        self.observer         = Observer()
+        self.current_run_id   = None
         # interval (seconds) after which we consider ourselves idle
         self.idle_interval = self.config_manager.config.get("idle_interval_sec", 300)
         # event to signal the monitor thread to stop if ChatManager is torn down
@@ -2936,6 +3057,64 @@ class ChatManager:
             log_message(f"Memory summarization failed: {e}", "ERROR")
             return None
 
+    def _stage_html_filtering(self, ctx):
+        """
+        Strip tags & boilerplate from raw HTML so downstream agents
+        receive only meaningful text.  If no HTML present, do nothing.
+        """
+        raw = ctx["user_message"]
+        # quick heuristic: looks like HTML if it contains both "<" and "</"
+        if "<" in raw and "</" in raw:
+            try:
+                from bs4 import BeautifulSoup
+                clean_text = BeautifulSoup(raw, "html.parser").get_text(
+                    separator=" ",
+                    strip=True
+                )
+                # replace the user_message with clean text for all later stages
+                ctx["user_message"] = clean_text
+                ctx["ctx_txt"] += "\n[HTML stripped]"
+                log_message("HTML stripped successfully.", "DEBUG")
+            except Exception as e:
+                log_message(f"HTML filtering failed: {e}", "WARNING")
+        return None
+
+    def _stage_chunk_and_summarize(self, ctx):
+        """
+        When ctx['user_message'] is extremely large, break it into
+        manageable chunks, summarize each, and collapse the output
+        into ctx['user_message'] so later stages handle only the summary.
+        """
+        text = ctx["user_message"]
+        # threshold: only summarize if > 4 000 characters (~1 000 tokens)
+        if len(text) < 4000:
+            return None
+
+        chunk_size = 4000
+        chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+        summaries = []
+
+        for idx, chunk in enumerate(chunks, 1):
+            prompt = (
+                f"You are a world-class summarizer.  Summarize chunk {idx}/{len(chunks)} "
+                f"in 2–3 sentences, preserving every key fact and name:\n\n{chunk}"
+            )
+            try:
+                summ = chat(
+                    model=self.config_manager.config["secondary_model"],
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=False
+                )["message"]["content"].strip()
+                summaries.append(summ)
+            except Exception as e:
+                log_message(f"Chunk summarization failed: {e}", "ERROR")
+                continue
+
+        combined = "\n".join(summaries)
+        ctx["user_message"] = combined
+        ctx["ctx_txt"]     += "\n[Chunked summary created]"
+        log_message("Large text summarized into chunks.", "INFO")
+        return None
 
     # ----------------------------------------
     # NEW: Human-in-the-Loop Review
@@ -2987,6 +3166,7 @@ class ChatManager:
                 # fire off an internal, silent request
                 self.new_request(
                     "I haven't heard from you in a while—what should I work on next?",
+                    sender_role="assistant",
                     skip_tts=True
                 )
             else:
@@ -3023,7 +3203,8 @@ class ChatManager:
                     self._executor.submit(
                         self.new_request,
                         "Please review pending tasks and decide what to do next.",
-                        True
+                        sender_role="assistant",
+                        skip_tts=True
                     )
 
         thread = threading.Thread(target=_mull_loop, daemon=True)
@@ -3161,10 +3342,12 @@ class ChatManager:
             messages = [sys_msg, mem_msg] + self.history_manager.history
         else:
             messages = override_messages or []
-
+            
+        base_temp = cfg[f"{model_key.split('_')[0]}_temperature"]
+        temp      = base_temp + 0.5 * self.observer.recent_failure_ratio() + self._temp_bump
         payload = {
             "model":       cfg[model_key],
-            "temperature": cfg[f"{model_key.split('_')[0]}_temperature"],
+            "temperature": min(temp, 1.5),  # cap it
             "messages":    messages,
             "stream":      cfg["stream"]
         }
@@ -3443,8 +3626,37 @@ class ChatManager:
         except Exception as e:
             log_message(f"run_tool error: {e}", "ERROR")
             return f"Error executing `{tool_code}`: {e}"
-
-
+        
+    def _stage_prompt_optimization(self, ctx):
+        """
+        Replace the primary system prompt for this run with the best one
+        discovered so far.
+        """
+        base = self.config_manager.config.get("system", "")
+        best = self.rl_manager.best_prompt(base)
+        if best != base:
+            ctx.setdefault("ctx_txt", "")
+            ctx["ctx_txt"] += "\n[Prompt optimized]"
+            self.config_manager.config["system"] = best
+        return None
+    
+    def _stage_rl_experimentation(self, ctx):
+        """
+        With small probability, try a mutated prompt + stage list and mark the run
+        as 'exploratory'.  Record reward at the end.
+        """
+        if random.random() < 0.2:   # 20 % of turns are exploration
+            base_prompt  = self.config_manager.config.get("system", "")
+            base_stages  = ctx["ALL_AGENTS"] or []   # rough proxy
+            new_prompt, new_stages = self.rl_manager.propose(base_prompt, base_stages)
+            ctx["explore_prompt"]  = new_prompt
+            ctx["explore_stages"]  = new_stages
+            self.config_manager.config["system"] = new_prompt
+            # overwrite active stages for this run
+            ctx["pipeline_overridden"] = True
+            ctx["overridden_stages"]   = new_stages
+            ctx["ctx_txt"] += "\n[RL exploration enabled]"
+        return None
 
     
     # -------------------------------------------------------------------
@@ -3478,36 +3690,70 @@ class ChatManager:
     # -------------------------------------------------------------------
     # Updated new_request with task_management stage
     # -------------------------------------------------------------------
-    def new_request(self, user_message: str, skip_tts: bool = False) -> str:
+    # ─────────────────────────────────────────────────────────────
+    def new_request(self,
+                    user_message: str,
+                    sender_role: str = "user",
+                    skip_tts: bool = False) -> str:
+        """
+        Entry-point for every user (or agent-generated) turn.
+        Adds observability, automatic stage injections, prompt
+        optimisation + simple RL exploration, error-aware retry
+        and final reward logging.
+        """
         from datetime import datetime
-        import json
+        import json, random
 
-        # reset idle tracker
+        # ── 1. bookkeeping ───────────────────────────────
         self.last_interaction = datetime.now()
 
-        # load the canonical pipeline
+        run_id = self.observer.start_run(user_message)
+        self.current_run_id = run_id
+
+        # ── 2. base pipeline from stack.json ─────────────
         stack  = Tools.load_agent_stack()
         stages = stack.get("stages", []).copy()
 
-        # ensure our workspace + file + task stages are in the right spots
-        if "workspace_setup" not in stages:
-            idx = stages.index("record_user_message") + 1
-            stages.insert(idx, "workspace_setup")
-        if "file_management" not in stages:
-            idx = stages.index("workspace_setup") + 1
-            stages.insert(idx, "file_management")
-        if "task_management" not in stages:
-            idx = stages.index("file_management") + 1
-            stages.insert(idx, "task_management")
-        if "subtask_management" not in stages:
-            idx = stages.index("task_management") + 1
-            stages.insert(idx, "subtask_management")
-        if "workspace_save" not in stages:
-            stages.append("workspace_save")
+        # ► ensure core stages are present in sensible order
+        def _ensure(stage_name, after):
+            if stage_name not in stages:
+                stages.insert(stages.index(after) + 1, stage_name)
 
-        # prime our context
+        _ensure("workspace_setup",      "record_user_message")
+        _ensure("file_management",      "workspace_setup")
+        _ensure("html_filtering",       "file_management")        # NEW
+        _ensure("chunk_and_summarize",  "html_filtering")         # NEW
+        _ensure("task_management",      "file_management")
+        _ensure("subtask_management",   "task_management")
+        _ensure("workspace_save",       stages[-1])
+
+        # ► inject optimisation / RL stages
+        if "prompt_optimization" not in stages:
+            stages.insert(0, "prompt_optimization")               # runs first
+        if "rl_experimentation" not in stages:
+            # place immediately before assemble_prompt (or final_inference fallback)
+            anchor = "assemble_prompt" if "assemble_prompt" in stages else "final_inference"
+            stages.insert(stages.index(anchor), "rl_experimentation")
+
+        # ── 3. prompt optimisation & exploration (pre-loop) ───
+        base_system = self.config_manager.config.get("system", "")
+        # best prompt so far
+        best_system = self.rl_manager.best_prompt(base_system)
+        self.config_manager.config["system"] = best_system
+
+        # 20 % chance: explore mutated prompt + stage list
+        exploratory = random.random() < 0.20
+        if exploratory:
+            mutated_prompt, mutated_stages = self.rl_manager.propose(best_system, stages)
+            self.config_manager.config["system"] = mutated_prompt
+            stages = mutated_stages
+            log_message("RL exploration: mutated prompt/stage list chosen", "INFO")
+
+        # ── 4. build run context───────────────────────────
         ctx = {
             "user_message":     user_message,
+            "sender_role":      sender_role,
+            "run_id":           run_id,
             "skip_tts":         skip_tts,
             "ctx_txt":          "",
             "tool_summaries":   [],
@@ -3520,16 +3766,36 @@ class ChatManager:
         }
 
         log_message(f"Pipeline stages: {stages}", "INFO")
+
+        # ── 5. execute pipeline────────────────────────────
         for stage in stages:
             handler = getattr(self, f"_stage_{stage}", None)
             if not handler:
                 log_message(f"No handler for stage '{stage}', skipping.", "WARNING")
                 continue
 
+            self.observer.log_stage_start(run_id, stage)
             log_message(f"→ Stage: {stage}", "DEBUG")
-            result = handler(ctx)
 
-            # short‐circuit summary & timeframe queries as before
+            try:
+                result = handler(ctx)
+            except Exception as e:
+                self.observer.log_error(run_id, stage, e)
+                log_message(f"Stage '{stage}' failed: {e}", "ERROR")
+
+                # targeted retry for final inference
+                if stage == "final_inference":
+                    log_message("Retrying final_inference once with higher temperature", "INFO")
+                    if getattr(self, "_temp_bump", 0.0) == 0.0:
+                        self._temp_bump = 0.2
+                        result = handler(ctx)      # retry
+                        self._temp_bump = 0.0
+                    else:
+                        raise
+            else:
+                self.observer.log_stage_end(run_id, stage)
+
+            # fast exits
             if stage == "summary_request" and isinstance(result, str):
                 return result
             if stage == "timeframe_history_query" and isinstance(result, str):
@@ -3538,9 +3804,25 @@ class ChatManager:
             if stage == "final_inference" and ctx.get("final_response"):
                 break
 
-        # persist workspace ops
+        # ── 6. post-processing & reward────────────────────
         self._save_workspace_memory(ctx["workspace_memory"])
+        self.observer.complete_run(run_id)
+
+        # simple binary reward: 1 if no stage error, else 0
+        had_error = any(
+            s.get("status") == "error"
+            for s in self.observer.runs[run_id]["stages"].values()
+        )
+        reward = 0.0 if had_error else 1.0
+        self.rl_manager.record(
+            prompt=self.config_manager.config.get("system", ""),
+            stages=stages,
+            reward=reward
+        )
+
         return ctx["final_response"] or "Sorry, I couldn't process that."
+    # ─────────────────────────────────────────────────────────────
+
 
     # ------------------------------
     # Stage 0: summary_request
@@ -3617,7 +3899,8 @@ class ChatManager:
     # ------------------------------
     def _stage_record_user_message(self, ctx):
         um = ctx["user_message"]
-        self.history_manager.add_entry("user", um)
+        role = ctx.get("sender_role", "user")   # ← respect caller
+        self.history_manager.add_entry(role, um)
         _ = Utils.embed_text(um)
         return None
 
@@ -3647,7 +3930,7 @@ class ChatManager:
                 self.tts_manager.enqueue(clar)
             ctx["ctx_txt"] += f"\n[Clarification asked]: {clar}"
             # auto-gather
-            auto = self.new_request(clar, skip_tts=True)
+            auto = self.new_request(clar, sender_role="assistant", skip_tts=True)
             if auto and auto != clar:
                 ctx["ctx_txt"] += f"\n[Auto-gathered]: {auto}"
         return None
@@ -3756,7 +4039,7 @@ class ChatManager:
             assembled += "\n```tool_output\n" + "\n\n".join(ctx["tool_summaries"]) + "\n```"
         assembled += "\n" + ctx["user_message"]
         # record & embed
-        self.history_manager.add_entry("user", assembled)
+        self.history_manager.add_entry("assistant", assembled)
         _ = Utils.embed_text(assembled)
         log_message(f"Final prompt prepared", "DEBUG")
         ctx["assembled"] = assembled
