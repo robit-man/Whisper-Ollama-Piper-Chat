@@ -1517,24 +1517,32 @@ class Tools:
     @staticmethod
     def _find_system_chromedriver() -> str | None:
         """
-        Return the first executable chromedriver we can locate, or None.
-        Covers Debian/Ubuntu paths, snap installs, Home-brew, PATH, etc.
+        Return a path to a *working* chromedriver executable on this machine
+        (correct CPU arch + executable).  We try common locations first;
+        each candidate must:
+        1. Exist and be executable for the current user.
+        2. Run `--version` without raising OSError (catches x86-64 vs arm64).
+        If none pass, we return None so the caller can fall back to
+        webdriver-manager or raise.
         """
-        candidates = [
-            shutil.which("chromedriver"),                         # PATH
+        candidates: list[str | None] = [
+            shutil.which("chromedriver"),                         # Anything already in PATH
             "/usr/bin/chromedriver",
             "/usr/local/bin/chromedriver",
             "/snap/bin/chromium.chromedriver",
             "/usr/lib/chromium-browser/chromedriver",
-            "/opt/homebrew/bin/chromedriver",                    # macOS arm64
+            "/opt/homebrew/bin/chromedriver",                     # macOS arm64
         ]
-        for path in candidates:
-            if path and os.path.isfile(path):
+
+        for path in filter(None, candidates):
+            if os.path.isfile(path) and os.access(path, os.X_OK):
                 try:
-                    # make sure it’s actually executable *by us*
-                    st = os.stat(path)
-                    if st.st_mode & stat.S_IXUSR:
-                        return path
+                    # If this fails with Exec format error, we skip it.
+                    subprocess.run([path, "--version"],
+                                check=True,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+                    return path
                 except Exception:
                     continue
         return None
@@ -1637,22 +1645,55 @@ class Tools:
             except WebDriverException as e_sys:
                 log_message(f"[open_browser] System chromedriver failed: {e_sys}", "WARNING")
 
-        # 3️⃣  webdriver-manager fallback (arch-aware)
         try:
-            if arch in ("arm64", "aarch64", "armv7l"):
-                os.environ["WDM_ARCH"] = "arm64"
-                log_message("[open_browser] Set WDM_ARCH=arm64 for webdriver-manager", "DEBUG")
-            drv_path = ChromeDriverManager().install()
+            # ── figure out which driver we need ───────────────────────────────
+            # 1) detect CPU architecture
+            arch_alias = {
+                "aarch64": "arm64",
+                "arm64":   "arm64",
+                "armv8l":  "arm64",
+                "armv7l":  "arm",            # 32-bit
+            }
+            wdm_arch = arch_alias.get(arch)          # None on x86-64
+
+            # 2) detect the *installed* Chrome/Chromium major version
+            try:
+                raw_ver = (
+                    subprocess.check_output([chrome_bin, "--version"])
+                    .decode()
+                    .strip()
+                )                       # e.g. "Chromium 136.0.7103.92"
+                browser_major = raw_ver.split()[1].split(".")[0]
+            except Exception:
+                browser_major = ""      # let webdriver-manager pick “latest”
+
+            # 3) ask webdriver-manager for the matching driver
+            from webdriver_manager.chrome import ChromeDriverManager
+
+            log_message(
+                f"[open_browser] Requesting ChromeDriver {browser_major or 'latest'} "
+                f"for arch={wdm_arch or 'x86_64'}",
+                "DEBUG",
+            )
+
+            drv_path = ChromeDriverManager(
+                version=browser_major or "latest",
+                arch=wdm_arch,
+                os_type="linux",
+            ).install()
+
             log_message(f"[open_browser] webdriver-manager driver at {drv_path}", "DEBUG")
             Tools._driver = webdriver.Chrome(service=Service(drv_path), options=opts)
             log_message("[open_browser] Launched via webdriver-manager.", "SUCCESS")
             return "Browser launched (webdriver-manager)"
+
         except Exception as e_wdm:
             log_message(f"[open_browser] webdriver-manager failed: {e_wdm}", "ERROR")
             raise RuntimeError(
                 "All driver acquisition strategies failed. "
                 "Install a matching chromedriver and set PATH or CHROME_BIN."
             ) from e_wdm
+
 
     @staticmethod
     def close_browser() -> str:
