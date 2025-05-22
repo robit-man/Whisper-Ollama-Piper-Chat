@@ -252,11 +252,19 @@ from scipy.io.wavfile import write
 import whisper
 from ollama import chat, embed
 from dotenv import load_dotenv
-from bs4 import BeautifulSoup
 from selenium import webdriver
+from selenium.common.exceptions import WebDriverException, TimeoutException
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver import ActionChains
 from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+import html, os, shutil, random, platform, json
+import html, textwrap
 import pywifi
 from pywifi import const
 import psutil
@@ -915,6 +923,10 @@ class Utils:
 
 
 class Tools:
+    _driver = None          # always present, even before first browser launch
+    _poll   = 0.05                     
+    _short  = 3
+    
     @staticmethod
     def parse_tool_call(text: str) -> str | None:
         """
@@ -984,6 +996,63 @@ class Tools:
         code = m.group(1).strip()
         log_message(f"Parsed tool call from text: {code!r}", "DEBUG")
         return code
+    
+    @staticmethod
+    def add_subtask(parent_id: int, text: str) -> dict:
+        """
+        Create a new subtask under an existing task.
+        Returns the created subtask object.
+        """
+        tasks = Tools._load_tasks_dict()
+        parent = tasks.get(str(parent_id))
+        if not parent:
+            return {"error": f"No such parent task {parent_id}"}
+        # generate a new id
+        new_id = max(map(int, tasks.keys()), default=0) + 1
+        sub = {"id": new_id, "text": text, "status": "pending", "parent": parent_id}
+        tasks[str(new_id)] = sub
+        Tools._save_tasks_dict(tasks)
+        return sub
+
+    @staticmethod
+    def list_subtasks(parent_id: int) -> list:
+        """
+        Return all subtasks for the given parent task.
+        """
+        tasks = Tools._load_tasks_dict()
+        return [t for t in tasks.values() if t.get("parent") == parent_id]
+
+    @staticmethod
+    def set_task_status(task_id: int, status: str) -> dict:
+        """
+        Set status = 'pending'|'in_progress'|'done' on a task or subtask.
+        """
+        tasks = Tools._load_tasks_dict()
+        t = tasks.get(str(task_id))
+        if not t:
+            return {"error": f"No such task {task_id}"}
+        if status not in ("pending", "in_progress", "done"):
+            return {"error": f"Invalid status {status}"}
+        t["status"] = status
+        Tools._save_tasks_dict(tasks)
+        return t
+
+    # internal helpers for persistence
+    @staticmethod
+    def _load_tasks_dict() -> dict:
+        import json, os
+        path = os.path.join(WORKSPACE_DIR, "tasks.json")
+        if os.path.isfile(path):
+            return json.load(open(path, "r"))
+        return {}
+
+    @staticmethod
+    def _save_tasks_dict(tasks: dict) -> None:
+        import json, os
+        path = os.path.join(WORKSPACE_DIR, "tasks.json")
+        with open(path, "w") as f:
+            json.dump(tasks, f, indent=2)
+
     
     _process_registry: dict[int, subprocess.Popen] = {}
     
@@ -1441,81 +1510,414 @@ class Tools:
             json.dump(config, f, indent=2)
         return f"agent_stack.json updated."
     
-    @staticmethod
-    def open_browser(headless: bool = False) -> str:
-        """
-        Launches a Chrome instance.  Keep a reference in Tools._driver.
-        """
-        opts = Options()
-        if headless:
-            opts.add_argument("--headless")
-        # you can add other args: --disable-gpu, --no-sandbox, etc.
-        service = Service(ChromeDriverManager().install())
-        Tools._driver = webdriver.Chrome(service=service, options=opts)
-        return "Browser launched"
+    from selenium.common.exceptions import WebDriverException
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
 
     @staticmethod
+    def _find_system_chromedriver() -> str | None:
+        """
+        Return the first executable chromedriver we can find on the box, or None.
+        """
+        candidates = [
+            shutil.which("chromedriver"),
+            "/usr/bin/chromedriver",
+            "/snap/bin/chromium.chromedriver",
+            "/opt/homebrew/bin/chromedriver",         # mac-arm (brew)
+            "/usr/local/bin/chromedriver",
+        ]
+        for p in candidates:
+            if p and os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+        return None
+    
+    # ── internal helpers ──────────────────────────────────────────────
+    @staticmethod
+    def _wait_for_ready(drv, timeout=6):
+        """Block until document.readyState == 'complete'."""
+        WebDriverWait(drv, timeout).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+
+    @staticmethod
+    def _first_present(drv, selectors: list[str], timeout=4):
+        """
+        Return the first WebElement present+enabled out of a list of CSS selectors.
+        Returns None if none arrive within `timeout`.
+        """
+        end = WebDriverWait(drv, timeout)._timeout + 0  # absolute end time
+        for sel in selectors:
+            try:
+                return WebDriverWait(drv, timeout).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
+                )
+            except TimeoutException:
+                continue
+        return None
+
+    @staticmethod
+    def _visible_and_enabled(locator):
+        """condition: element is displayed *and* not disabled."""
+        def _cond(drv):
+            try:
+                el = drv.find_element(*locator)
+                return el.is_displayed() and el.is_enabled()
+            except Exception:
+                return False
+        return _cond
+
+    # ── session bootstrap ────────────────────────────────────────────
+    def open_browser(headless: bool = False, force_new: bool = False) -> str:
+        """
+        Launch Chrome/Chromium on x86-64 **and** ARM.
+        Tries Selenium-Manager → system chromedriver → webdriver-manager.
+        """
+        import os, platform, random, shutil
+        from selenium import webdriver
+        from selenium.webdriver.chrome.service import Service
+        from selenium.webdriver.chrome.options import Options
+        from webdriver_manager.chrome import ChromeDriverManager
+
+        if force_new and getattr(Tools, "_driver", None):
+            try:
+                Tools._driver.quit()
+            except Exception:
+                pass
+            Tools._driver = None
+
+        if getattr(Tools, "_driver", None):
+            return "Browser already open"
+
+        arch = platform.machine().lower()
+        log_message(f"[open_browser] Detected CPU arch = {arch}", "DEBUG")
+
+        chrome_bin = (
+            os.getenv("CHROME_BIN")
+            or shutil.which("google-chrome")
+            or shutil.which("chromium")
+            or "/usr/bin/chromium"
+        )
+
+        opts = Options()
+        opts.binary_location = chrome_bin
+        if headless:
+            opts.add_argument("--headless=new")
+        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--remote-allow-origins=*")
+        opts.add_argument(f"--remote-debugging-port={random.randint(45000, 65000)}")
+
+        # 1️⃣  Selenium-Manager (Chrome ≥115 ships its own driver)
+        try:
+            log_message("[open_browser] Trying Selenium-Manager auto-driver…", "DEBUG")
+            Tools._driver = webdriver.Chrome(options=opts)
+            log_message("[open_browser] Launched via Selenium-Manager.", "SUCCESS")
+            return "Browser launched (selenium-manager)"
+        except WebDriverException as e_mgr:
+            log_message(f"[open_browser] Selenium-Manager failed: {e_mgr}", "WARNING")
+
+        # 2️⃣  system-wide chromedriver?
+        sys_drv = Tools._find_system_chromedriver() if hasattr(Tools, "_find_system_chromedriver") else None
+        if sys_drv:
+            try:
+                log_message(f"[open_browser] Trying system chromedriver at {sys_drv}", "DEBUG")
+                Tools._driver = webdriver.Chrome(service=Service(sys_drv), options=opts)
+                log_message("[open_browser] Launched via system chromedriver.", "SUCCESS")
+                return "Browser launched (system chromedriver)"
+            except WebDriverException as e_sys:
+                log_message(f"[open_browser] System chromedriver failed: {e_sys}", "WARNING")
+
+        # 3️⃣  webdriver-manager fallback (arch-aware)
+        try:
+            if arch in ("arm64", "aarch64", "armv7l"):
+                os.environ["WDM_ARCH"] = "arm64"
+                log_message("[open_browser] Set WDM_ARCH=arm64 for webdriver-manager", "DEBUG")
+            drv_path = ChromeDriverManager().install()
+            log_message(f"[open_browser] webdriver-manager driver at {drv_path}", "DEBUG")
+            Tools._driver = webdriver.Chrome(service=Service(drv_path), options=opts)
+            log_message("[open_browser] Launched via webdriver-manager.", "SUCCESS")
+            return "Browser launched (webdriver-manager)"
+        except Exception as e_wdm:
+            log_message(f"[open_browser] webdriver-manager failed: {e_wdm}", "ERROR")
+            raise RuntimeError(
+                "All driver acquisition strategies failed. "
+                "Install a matching chromedriver and set PATH or CHROME_BIN."
+            ) from e_wdm
+
+    @staticmethod
+    def close_browser() -> str:
+        if Tools._driver:
+            try:
+                Tools._driver.quit()
+                log_message("[close_browser] Browser closed.", "DEBUG")
+            except Exception:
+                pass
+            Tools._driver = None
+            return "Browser closed"
+        return "No browser to close"
+
+    # ── low-level DOM helpers ────────────────────────────────────────
+    @staticmethod
     def navigate(url: str) -> str:
-        """
-        Navigates the open browser to `url`.
-        """
         if not Tools._driver:
             return "Error: browser not open"
+        log_message(f"[navigate] → {url}", "DEBUG")
         Tools._driver.get(url)
         return f"Navigated to {url}"
 
     @staticmethod
-    def click(selector: str) -> str:
-        """
-        Finds an element via CSS selector and clicks it.
-        """
+    def click(selector: str, timeout: int = 8) -> str:
         if not Tools._driver:
             return "Error: browser not open"
-        el = Tools._driver.find_element("css selector", selector)
-        el.click()
-        return f"Clicked element {selector}"
+        try:
+            drv = Tools._driver
+            el = WebDriverWait(drv, timeout).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+            )
+            drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            el.click()
+            focused = drv.execute_script("return document.activeElement === arguments[0];", el)
+            log_message(f"[click] {selector} clicked (focused={focused})", "DEBUG")
+            return f"Clicked {selector}"
+        except Exception as e:
+            log_message(f"[click] Error clicking {selector}: {e}", "ERROR")
+            return f"Error clicking {selector}: {e}"
 
     @staticmethod
-    def input(selector: str, text: str) -> str:
-        """
-        Finds an input via CSS selector, clears it, and types `text`.
-        """
+    def input(selector: str, text: str, timeout: int = 8) -> str:
         if not Tools._driver:
             return "Error: browser not open"
-        el = Tools._driver.find_element("css selector", selector)
-        el.clear()
-        el.send_keys(text)
-        return f"Filled {selector} with {text!r}"
+        try:
+            drv = Tools._driver
+            el = WebDriverWait(drv, timeout).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+            )
+            drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            el.clear()
+            el.send_keys(text + Keys.RETURN)
+            log_message(f"[input] Sent {text!r} to {selector}", "DEBUG")
+            return f"Sent {text!r} to {selector}"
+        except Exception as e:
+            log_message(f"[input] Error typing into {selector}: {e}", "ERROR")
+            return f"Error typing into {selector}: {e}"
+
 
     @staticmethod
     def get_html() -> str:
-        """
-        Returns the full page HTML of the current browser window.
-        """
         if not Tools._driver:
             return "Error: browser not open"
         return Tools._driver.page_source
 
     @staticmethod
     def screenshot(filename: str = "screenshot.png") -> str:
-        """
-        Takes a screenshot of the current window.
-        """
         if not Tools._driver:
             return "Error: browser not open"
         Tools._driver.save_screenshot(filename)
         return filename
 
+    # ───────────────────────────  DUCKDUCKGO SEARCH  ──────────────────────────
     @staticmethod
-    def close_browser() -> str:
+    def ddg_search(
+        topic: str,
+        num_results: int = 5,
+        wait_sec: int = 15,
+        deep_scrape: bool = True,
+    ) -> list:
         """
-        Gracefully quits the browser.
+        Perform a DuckDuckGo search *event-driven* (no fixed sleeps).
+        If results don’t appear within `wait_sec`, we still harvest any
+        HTML currently in the DOM so run_tool never explodes.
         """
-        if Tools._driver:
-            Tools._driver.quit()
-            Tools._driver = None
-            return "Browser closed"
-        return "No browser to close"
+        import html, traceback
+        from bs4 import BeautifulSoup
+
+        log_message(f"[ddg_search] ▶ {topic!r}", "INFO")
+
+        Tools.close_browser()
+        Tools.open_browser(headless=False)
+        drv = Tools._driver
+        wait = WebDriverWait(drv, wait_sec)
+
+        try:
+            # 1) Home page
+            drv.get("https://duckduckgo.com/")
+            wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+            log_message("[ddg_search] DuckDuckGo loaded.", "DEBUG")
+
+            # Cookie / GDPR banner
+            try:
+                wait.until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"))
+                ).click()
+                log_message("[ddg_search] Cookie banner dismissed.", "DEBUG")
+            except TimeoutException:
+                pass  # banner not shown
+
+            # 2) Search box
+            selectors = [
+                "input#search_form_input_homepage",
+                "input#searchbox_input",
+                "input[name='q']",
+            ]
+            box = None
+            for sel in selectors:
+                try:
+                    box = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
+                    break
+                except TimeoutException:
+                    continue
+            if not box:
+                raise RuntimeError("Search box not found on DuckDuckGo!")
+
+            # 3) Submit query
+            ActionChains(drv).move_to_element(box).click(box).send_keys(topic, Keys.ENTER).perform()
+            log_message("[ddg_search] Query submitted.", "DEBUG")
+
+            # Wait for navigation and (ideally) at least one result node
+            try:
+                wait.until(lambda d: "?q=" in d.current_url)
+                wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, "#links .result"))
+                log_message("[ddg_search] Results detected.", "DEBUG")
+            except TimeoutException:
+                log_message("[ddg_search] Timed-out waiting for results; parsing whatever is present.", "WARNING")
+
+            html_source = drv.page_source  # grab before we close the browser
+
+        except Exception as e:
+            html_source = drv.page_source
+            log_message(f"[ddg_search] Fatal error: {e}\n{traceback.format_exc()}", "ERROR")
+
+        finally:
+            Tools.close_browser()
+
+        # 4) Parse results (even if partial)
+        soup = BeautifulSoup(html_source, "html5lib")
+        entries = soup.select("#links .result")
+        if not entries:
+            # fallback selector for new DDG layout
+            entries = soup.select('#links [data-nr]')
+        results = []
+
+        for ent in entries[: num_results * 2]:  # over-fetch then trim blanks
+            a_tag = ent.select_one("a.result__a") or ent.select_one("a[data-testid='result-title-a']")
+            snip = ent.select_one(".result__snippet") or ent.select_one("span[data-testid='result-snippet']")
+            if not a_tag or not snip:
+                continue
+            title = html.unescape(a_tag.get_text(strip=True))
+            href = a_tag.get("href")
+            snippet = snip.get_text(strip=True)
+            summary = snippet
+
+            # optional deep scrape with graceful failure
+            if deep_scrape:
+                try:
+                    page_html = Tools.bs4_scrape(href)
+                    if not page_html.startswith("Error"):
+                        pg = BeautifulSoup(page_html, "html5lib")
+                        meta = pg.find("meta", {"name": "description"})
+                        if meta and meta.get("content"):
+                            summary = meta["content"].strip()
+                        else:
+                            p_tag = pg.find("p")
+                            if p_tag:
+                                summary = p_tag.get_text(strip=True)
+                except Exception as ex:
+                    log_message(f"[ddg_search] Deep-scrape failed for {href}: {ex}", "WARNING")
+
+            results.append(
+                {
+                    "title": title,
+                    "url": href,
+                    "snippet": snippet,
+                    "summary": summary,
+                }
+            )
+            if len(results) >= num_results:
+                break
+
+        log_message(f"[ddg_search] Collected {len(results)} results.", "SUCCESS")
+        return results
+
+
+    # ────────────────────────────────────────────────────────────────
+    #  selenium_extract_summary  (robust version)
+    # ────────────────────────────────────────────────────────────────
+    @staticmethod
+    def selenium_extract_summary(url: str, wait_sec: int = 8) -> str:
+        """
+        Fast two-stage page summariser:
+
+        1. Try a lightweight `Tools.bs4_scrape()` (no browser).
+        • If it yields HTML, grab <meta name="description"> or first <p>.
+        2. If bs4-scrape fails or returns an error string, fall back to a
+        *headless* Chrome session launched via Tools.open_browser().
+        • Uses the same resilient driver logic you just added.
+        3. Always cleans up the browser session.
+
+        Returns a short plain-text summary (may be empty string).
+        """
+        from bs4 import BeautifulSoup
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
+        # ── 1 ▸ quick request-based scrape ───────────────────────────
+        html_doc = Tools.bs4_scrape(url)
+        if html_doc and not html_doc.startswith("Error during scraping"):
+            soup = BeautifulSoup(html_doc, "html5lib")
+            meta = soup.find("meta", attrs={"name": "description"})
+            if meta and meta.get("content"):
+                return meta["content"].strip()
+
+            p = soup.find("p")
+            if p:
+                return p.get_text(strip=True)
+
+        # ── 2 ▸ fall back to headless Selenium ───────────────────────
+        try:
+            Tools.open_browser(headless=True)        # reuses your robust helper
+            drv   = Tools._driver
+            wait  = WebDriverWait(drv, wait_sec)
+
+            drv.get(url)
+            wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+            soup2 = BeautifulSoup(drv.page_source, "html5lib")
+            meta2 = soup2.find("meta", attrs={"name": "description"})
+            if meta2 and meta2.get("content"):
+                return meta2["content"].strip()
+
+            p2 = soup2.find("p")
+            if p2:
+                return p2.get_text(strip=True)
+
+            return ""   # nothing useful found
+        finally:
+            Tools.close_browser()
+
+    # ────────────────────────────────────────────────────────────────
+    #  summarize_local_search  (minor tweak → deep_scrape flag)
+    # ────────────────────────────────────────────────────────────────
+    @staticmethod
+    def summarize_local_search(topic: str, top_n: int = 3, deep: bool = False) -> str:
+        """
+        1) Call ddg_search() to get top_n results (optionally deep-scraped)
+        2) Return bullet list “1. Title — summary”
+        """
+        try:
+            entries = Tools.ddg_search(topic, num_results=top_n, deep_scrape=deep)
+        except Exception as e:
+            return f"Search error: {e}"
+
+        if not entries:
+            return "No results found."
+
+        return "\n".join(
+            f"{i}. {e['title']} — {e['summary'] or '(no summary)'}"
+            for i, e in enumerate(entries, 1)
+        )
     
     @staticmethod
     def get_chat_history(arg1=None, arg2=None) -> str:
@@ -1801,34 +2203,8 @@ class Tools:
         except Exception as e:
             log_message("Error reading battery voltage: " + str(e), "ERROR")
             raise RuntimeError(f"Error reading battery voltage: {e}")
+    
 
-    @staticmethod
-    def brave_search(topic):
-        api_key = brave_api_key
-        if not api_key:
-            log_message("BRAVE_API_KEY not set for brave search.", "ERROR")
-            return "Error: BRAVE_API_KEY not set."
-        endpoint = "https://api.search.brave.com/res/v1/web/search"
-        headers = {
-            "Accept": "application/json",
-            "Accept-Encoding": "gzip",
-            "x-subscription-token": api_key
-        }
-        params = {"q": topic, "count": 3}
-        try:
-            import requests
-            log_message(f"Performing brave search for topic: {topic}", "PROCESS")
-            response = requests.get(endpoint, headers=headers, params=params, timeout=5)
-            if response.status_code == 200:
-                log_message("Brave search successful.", "SUCCESS")
-                return response.text
-            else:
-                log_message(f"Error in brave search: {response.status_code}", "ERROR")
-                return f"Error {response.status_code}: {response.text}"
-        except Exception as e:
-            log_message("Error in brave search: " + str(e), "ERROR")
-            return f"Error: {e}"
-        
     @staticmethod
     def search_internet(topic):
         api_key = os.environ.get("BRAVE_API_KEY", "")
@@ -2262,6 +2638,45 @@ class ChatManager:
             end   = datetime.combine(today,                        datetime.min.time())
 
         return start.isoformat(), end.isoformat()
+
+    def _stage_subtask_management(self, ctx):
+        """
+        Allows the agent to break a parent task into subtasks,
+        list or update their status, or assemble results when done.
+        """
+        prompt = (
+            "You may manage SUBTASKS of existing tasks.  Use exactly one Tools call from:\n"
+            "  • list_subtasks(parent_id)\n"
+            "  • add_subtask(parent_id, text)\n"
+            "  • set_task_status(id, 'in_progress'|'done')\n"
+            "  • NO_OP (if no subtask action needed)\n"
+        )
+        decision = chat(
+            model=self.config_manager.config["secondary_model"],
+            messages=[
+                {"role":"system", "content": prompt},
+                {"role":"user",   "content": ctx["user_message"]}
+            ],
+            stream=False
+        )["message"]["content"].strip()
+
+        call = Tools.parse_tool_call(decision)
+        if call and call.upper() != "NO_OP":
+            out = self.run_tool(call)
+            # refresh both parent tasks and subtasks
+            try:
+                ctx["global_tasks"]   = json.loads(Tools.list_tasks())
+                # extract parent_id if relevant
+                import re
+                m = re.match(r"(\w+)\(\s*(\d+)", call)
+                if m and m.group(1) == "list_subtasks":
+                    pid = int(m.group(2))
+                    ctx["subtasks"] = Tools.list_subtasks(pid)
+            except:
+                pass
+            ctx["ctx_txt"] += f"\n[Subtask Op] {call} → {out}"
+        return None
+
     
     def _history_timeframe_query(self, user_message: str) -> str | None:
         """
@@ -2975,6 +3390,9 @@ class ChatManager:
         if "task_management" not in stages:
             idx = stages.index("file_management") + 1
             stages.insert(idx, "task_management")
+        if "subtask_management" not in stages:
+            idx = stages.index("task_management") + 1
+            stages.insert(idx, "subtask_management")
         if "workspace_save" not in stages:
             stages.append("workspace_save")
 
@@ -3387,7 +3805,7 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
             log_message("Invalid transcription; skipping.", "WARNING")
             continue
 
-        labeled = f"[SPEAKER_1] {transcription}"
+        labeled = f"{transcription}"
         log_message(f"Transcribed prompt: {labeled}", "INFO")
 
         # 4) Log user turn & clear pending TTS
