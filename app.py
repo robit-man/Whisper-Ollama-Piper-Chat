@@ -1017,40 +1017,84 @@ class Tools:
     def add_subtask(parent_id: int, text: str) -> dict:
         """
         Create a new subtask under an existing task.
+        If the parent_id does not exist (or is <= 0), the subtask will be top-level (parent=None).
         Returns the created subtask object.
         """
-        tasks = Tools._load_tasks_dict()
-        parent = tasks.get(str(parent_id))
-        if not parent:
-            return {"error": f"No such parent task {parent_id}"}
-        # generate a new id
-        new_id = max(map(int, tasks.keys()), default=0) + 1
-        sub = {"id": new_id, "text": text, "status": "pending", "parent": parent_id}
-        tasks[str(new_id)] = sub
-        Tools._save_tasks_dict(tasks)
+        import os, json
+
+        path = os.path.join(WORKSPACE_DIR, "tasks.json")
+
+        # 1) Safely load existing tasks (empty or invalid → [])
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    tasks = json.load(f)
+                if not isinstance(tasks, list):
+                    tasks = []
+            except (json.JSONDecodeError, ValueError):
+                tasks = []
+        else:
+            tasks = []
+
+        # 2) Determine whether the parent exists
+        parent = None
+        if isinstance(parent_id, int) and parent_id > 0:
+            parent = next((t for t in tasks if t.get("id") == parent_id), None)
+
+        # 3) Assign new ID
+        new_id = max((t.get("id", 0) for t in tasks), default=0) + 1
+
+        # 4) Build the subtask record
+        sub = {
+            "id":     new_id,
+            "text":   text,
+            "status": "pending",
+            # if parent was found use its id, otherwise None (top-level)
+            "parent": parent.get("id") if parent else None
+        }
+
+        # 5) Append and save
+        tasks.append(sub)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(tasks, f, indent=2)
+        except Exception as e:
+            # if saving fails, return an error dict
+            return {"error": f"Failed to save subtask: {e}"}
+
         return sub
+
 
     @staticmethod
     def list_subtasks(parent_id: int) -> list:
         """
         Return all subtasks for the given parent task.
         """
-        tasks = Tools._load_tasks_dict()
-        return [t for t in tasks.values() if t.get("parent") == parent_id]
+        import json, os
+        path = os.path.join(WORKSPACE_DIR, "tasks.json")
+        tasks = json.loads(open(path).read()) if os.path.exists(path) else []
+        return [t for t in tasks if t.get("parent") == parent_id]
 
     @staticmethod
     def set_task_status(task_id: int, status: str) -> dict:
         """
         Set status = 'pending'|'in_progress'|'done' on a task or subtask.
         """
-        tasks = Tools._load_tasks_dict()
-        t = tasks.get(str(task_id))
+        import json, os
+        path = os.path.join(WORKSPACE_DIR, "tasks.json")
+        if not os.path.exists(path):
+            return {"error": "No tasks yet."}
+        tasks = json.loads(open(path).read())
+        # find the task
+        t = next((t for t in tasks if t.get("id") == task_id), None)
         if not t:
             return {"error": f"No such task {task_id}"}
         if status not in ("pending", "in_progress", "done"):
             return {"error": f"Invalid status {status}"}
         t["status"] = status
-        Tools._save_tasks_dict(tasks)
+        # save list back
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(tasks, f, indent=2)
         return t
 
     # internal helpers for persistence
@@ -1118,158 +1162,144 @@ class Tools:
         path = os.path.join(WORKSPACE_DIR, "tasks.json")
         tasks = json.loads(open(path).read()) if os.path.exists(path) else []
         return json.dumps(tasks)
+# ───────── REPLACE TOOLS SECTION ─────────
+
     @staticmethod
     def run_script(
         script_path: str,
         args: str = "",
         base_dir: str = WORKSPACE_DIR,
+        capture_output: bool = False,
         window_title: str | None = None
-    ) -> str:
+    ) -> dict:
         """
-        Launch a Python script in its own new terminal window and register its PID.
+        Launch or run a Python script.
 
-        **Usage (from model)**:
-        - Call `run_script("myscript.py")` to start `workspace/myscript.py` with no args.
-        - Call `run_script("monitor.py", "--verbose", base_dir="/path/to/dir")` to run with args.
-        - Optionally supply `window_title="MyTask"` on Windows.
-
-        **Behavior**:
-        1. Resolves `script_path` (absolute or relative to `base_dir`).
-        2. Opens a new console/terminal window (platform‐specific).
-        3. Launches `python <script> <args>` inside it.
-        4. Stores the resulting `Popen` in `_process_registry` keyed by its PID.
-        5. Returns `"Started script <full_path> with PID <pid>"` or an error.
+        • If capture_output=False, opens in a new terminal (per OS) and registers PID.
+        • If capture_output=True, runs synchronously, captures stdout/stderr/rc.
+        Returns a dict:
+          - on new terminal: {"pid": <pid>} or {"error": "..."}
+          - on capture: {"stdout": "...", "stderr": "...", "returncode": <int>} or {"error": "..."}
         """
-        import subprocess, os, sys, platform
+        import os, sys, platform, subprocess, shlex
 
-        # Resolve full path
-        full_path = script_path if os.path.isabs(script_path) else os.path.join(base_dir, script_path)
+        full_path = script_path if os.path.isabs(script_path) \
+                    else os.path.join(base_dir, script_path)
         if not os.path.isfile(full_path):
-            return f"Error: script not found at {full_path}"
+            return {"error": f"Script not found at {full_path}"}
 
-        cmd = [sys.executable, full_path] + (args.split() if args else [])
+        cmd = [sys.executable, full_path] + (shlex.split(args) if args else [])
         system = platform.system()
 
         try:
+            if capture_output:
+                proc = subprocess.run(
+                    cmd, cwd=base_dir, text=True, capture_output=True
+                )
+                return {
+                    "stdout": proc.stdout,
+                    "stderr": proc.stderr,
+                    "returncode": proc.returncode
+                }
+
+            # non-capture → new terminal window
             if system == "Windows":
-                # Windows: new console window
                 flags = subprocess.CREATE_NEW_CONSOLE
                 if window_title:
-                    # Prepend a title command
                     title_cmd = ["cmd", "/c", f"title {window_title} &&"] + cmd
-                    proc = subprocess.Popen(title_cmd, creationflags=flags)
+                    p = subprocess.Popen(title_cmd, creationflags=flags)
                 else:
-                    proc = subprocess.Popen(cmd, creationflags=flags)
+                    p = subprocess.Popen(cmd, creationflags=flags)
 
             elif system == "Darwin":
-                # macOS: use AppleScript to open Terminal
-                osa_cmd = (
-                    f'tell application "Terminal" to do script "{" ".join(cmd)}"'
-                )
-                proc = subprocess.Popen(["osascript", "-e", osa_cmd])
+                osa = f'tell application "Terminal" to do script "{ " ".join(cmd) }"'
+                p = subprocess.Popen(["osascript", "-e", osa])
 
             else:
-                # Linux/Unix: open default terminal emulator (or xterm)
                 term = os.getenv("TERMINAL", "xterm")
-                proc = subprocess.Popen([term, "-hold", "-e"] + cmd)
+                p = subprocess.Popen([term, "-hold", "-e"] + cmd, cwd=base_dir)
 
-            pid = proc.pid
-            Tools._process_registry[pid] = proc
-            return f"Started script {full_path} with PID {pid}"
+            pid = p.pid
+            Tools._process_registry[pid] = p
+            return {"pid": pid}
 
         except Exception as e:
-            return f"Error launching script: {e}"
+            return {"error": str(e)}
+
 
     @staticmethod
-    def stop_script(pid: int) -> str:
+    def stop_script(pid: int) -> dict:
         """
         Terminate a previously launched script by its PID.
-
-        **Usage (from model)**:
-        - After `run_script` returns a PID N, call `stop_script(N)` to kill it.
-        - Returns confirmation or an error if PID not managed.
+        Returns {"stopped": pid} or {"error": "..."}.
         """
-        import signal
-
         proc = Tools._process_registry.get(pid)
-        if proc is None:
-            return f"No managed process with PID {pid}"
+        if not proc:
+            return {"error": f"No managed process with PID {pid}"}
         try:
             proc.terminate()
             proc.wait(timeout=5)
             del Tools._process_registry[pid]
-            return f"Stopped script with PID {pid}"
+            return {"stopped": pid}
         except Exception as e:
-            return f"Error stopping script {pid}: {e}"
-            
+            return {"error": str(e)}
+
+
+    @staticmethod
+    def script_status(pid: int) -> dict:
+        """
+        Check status of a managed PID.
+        Returns {"running": pid} if alive, or {"exit_code": <int>} if done,
+        or {"error": "..."} if unknown.
+        """
+        proc = Tools._process_registry.get(pid)
+        if not proc:
+            return {"error": f"No managed process with PID {pid}"}
+        rc = proc.poll()
+        if rc is None:
+            return {"running": pid}
+        # finished
+        del Tools._process_registry[pid]
+        return {"exit_code": rc}
+
+
     @staticmethod
     def load_external_tools():
         """
-        1) Ensure the `external_tools/` folder exists beside this file.
-        2) For each .py in that folder:
-           • Dynamically import it as a module.
-           • Reflect over its top‐level functions.
-           • Attach each function as a @staticmethod on Tools.
-        3) Re-run discover_agent_stack() so the new tools show up.
+        Dynamically load .py in external_tools/ as @staticmethods on Tools,
+        then refresh agent_stack.json.
         """
-        import os
-        import importlib.machinery
-        import importlib.util
-        import inspect
+        import os, sys, inspect, importlib.machinery, importlib.util
 
-        # 1) Create the folder if missing
         external_dir = os.path.join(os.path.dirname(__file__), "external_tools")
         os.makedirs(external_dir, exist_ok=True)
 
-        # 2) Scan and load each .py
         for fname in os.listdir(external_dir):
             if not fname.endswith(".py") or fname.startswith("_"):
                 continue
 
-            module_name = f"external_tools.{fname[:-3]}"
+            mod_name = f"external_tools.{fname[:-3]}"
             path = os.path.join(external_dir, fname)
-
-            # Load the module from its file
-            loader = importlib.machinery.SourceFileLoader(module_name, path)
-            spec = importlib.util.spec_from_loader(module_name, loader)
+            loader = importlib.machinery.SourceFileLoader(mod_name, path)
+            spec   = importlib.util.spec_from_loader(mod_name, loader)
             module = importlib.util.module_from_spec(spec)
             loader.exec_module(module)
 
-            # 3) Reflect and attach functions
             for name, fn in inspect.getmembers(module, inspect.isfunction):
                 if name.startswith("_") or hasattr(Tools, name):
                     continue
                 setattr(Tools, name, staticmethod(fn))
                 log_message(f"Loaded external tool: {name}()", "INFO")
 
-        # 4) Refresh the agent stack so these show up downstream
         Tools.discover_agent_stack()
-        
-    @staticmethod
-    def script_status(pid: int) -> str:
-        """
-        Check the status of a managed script.
 
-        **Usage (from model)**:
-        - Call `script_status(N)` to see if process N is still running or its exit code.
-        - Automatically cleans up the registry entry when the process exits.
-        """
-        proc = Tools._process_registry.get(pid)
-        if proc is None:
-            return f"No managed process with PID {pid}"
-        rc = proc.poll()
-        if rc is None:
-            return f"Process {pid} is still running"
-        else:
-            # cleanup finished process
-            del Tools._process_registry[pid]
-            return f"Process {pid} exited with code {rc}"
-        
+
     @staticmethod
     def create_file(filename: str, content: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Create or overwrite a file under base_dir (defaults to WORKSPACE_DIR).
+        Create or overwrite a file under base_dir.
         """
+        import os
         path = os.path.join(base_dir, filename)
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1279,11 +1309,13 @@ class Tools:
         except Exception as e:
             return f"Error creating file {path!r}: {e}"
 
+
     @staticmethod
     def append_file(filename: str, content: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Append to a file under base_dir (creates it if missing).
+        Append to or create a file under base_dir.
         """
+        import os
         path = os.path.join(base_dir, filename)
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1293,11 +1325,13 @@ class Tools:
         except Exception as e:
             return f"Error appending to file {path!r}: {e}"
 
+
     @staticmethod
     def delete_file(filename: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
         Delete a file under base_dir.
         """
+        import os
         path = os.path.join(base_dir, filename)
         try:
             os.remove(path)
@@ -1307,25 +1341,26 @@ class Tools:
         except Exception as e:
             return f"Error deleting file {path!r}: {e}"
 
+
     @staticmethod
     def list_workspace(base_dir: str = WORKSPACE_DIR) -> str:
         """
-        List all files & dirs in base_dir.
+        List entries under base_dir.
         """
+        import os, json
         try:
             entries = os.listdir(base_dir)
             return json.dumps(entries)
         except Exception as e:
             return json.dumps({"error": str(e)})
 
+
     @staticmethod
     def find_files(pattern: str, path: str = WORKSPACE_DIR) -> str:
         """
-        Recursively search under `path` (defaults to WORKSPACE_DIR) for files
-        matching the glob `pattern` and return a JSON list of
-        {"file": filename, "dir": directory} objects.
+        Recursively glob under path for files matching pattern.
         """
-        import fnmatch
+        import os, fnmatch, json
         matches = []
         for root, dirs, files in os.walk(path):
             for fname in files:
@@ -1333,22 +1368,25 @@ class Tools:
                     matches.append({"file": fname, "dir": root})
         return json.dumps(matches)
 
+
     @staticmethod
     def list_dir(path: str = WORKSPACE_DIR) -> str:
         """
-        Returns a JSON list of files & dirs at `path` (defaults to WORKSPACE_DIR).
+        JSON list of entries at path.
         """
+        import os, json
         try:
             return json.dumps(os.listdir(path))
         except Exception as e:
             return json.dumps({"error": str(e)})
 
+
     @staticmethod
-    def read_file(filepath: str, base_dir: str = None) -> str:
+    def read_file(filepath: str, base_dir: str | None = None) -> str:
         """
-        Read and return the contents of `filepath`. If `base_dir` is given,
-        `filepath` is relative to it; otherwise, `filepath` is treated as a full path.
+        Read and return the file’s contents.
         """
+        import os
         path = os.path.join(base_dir, filepath) if base_dir else filepath
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -1356,12 +1394,13 @@ class Tools:
         except Exception as e:
             return f"Error reading {path!r}: {e}"
 
+
     @staticmethod
-    def write_file(filepath: str, content: str, base_dir: str = None) -> str:
+    def write_file(filepath: str, content: str, base_dir: str | None = None) -> str:
         """
-        Write `content` to `filepath`. If `base_dir` is given,
-        `filepath` is relative to it; otherwise, `filepath` is treated as a full path.
+        Write content to filepath.
         """
+        import os
         path = os.path.join(base_dir, filepath) if base_dir else filepath
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1371,11 +1410,13 @@ class Tools:
         except Exception as e:
             return f"Error writing {path!r}: {e}"
 
+
     @staticmethod
     def rename_file(old: str, new: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Rename `old` → `new` under base_dir.
+        Rename old→new under base_dir.
         """
+        import os
         safe_old = os.path.normpath(old)
         safe_new = os.path.normpath(new)
         if safe_old.startswith("..") or safe_new.startswith(".."):
@@ -1389,12 +1430,13 @@ class Tools:
         except Exception as e:
             return f"Error renaming file: {e}"
 
+
     @staticmethod
     def copy_file(src: str, dst: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
-        Copy `src` → `dst` under base_dir.
+        Copy src→dst under base_dir.
         """
-        import shutil
+        import os, shutil
         safe_src = os.path.normpath(src)
         safe_dst = os.path.normpath(dst)
         if safe_src.startswith("..") or safe_dst.startswith(".."):
@@ -1408,21 +1450,25 @@ class Tools:
         except Exception as e:
             return f"Error copying file: {e}"
 
+
     @staticmethod
     def file_exists(filename: str, base_dir: str = WORKSPACE_DIR) -> bool:
         """
-        Check existence of `filename` under base_dir.
+        Check if filename exists under base_dir.
         """
+        import os
         safe = os.path.normpath(filename)
         if safe.startswith(".."):
             return False
         return os.path.exists(os.path.join(base_dir, safe))
 
+
     @staticmethod
     def file_info(filename: str, base_dir: str = WORKSPACE_DIR) -> dict:
         """
-        Return metadata for `filename` under base_dir.
+        Return metadata for filename.
         """
+        import os
         safe = os.path.normpath(filename)
         if safe.startswith(".."):
             return {"error": "Invalid path"}
@@ -1432,38 +1478,40 @@ class Tools:
             return {"size": st.st_size, "modified": st.st_mtime}
         except Exception as e:
             return {"error": str(e)}
-        
+
+
     @staticmethod
     def get_workspace_dir() -> str:
         """
-        Return the absolute path of the current workspace directory.
+        Absolute path of the workspace.
         """
         return WORKSPACE_DIR
+
 
     @staticmethod
     def get_cwd() -> str:
         """
-        Return the current working directory (where the script was launched).
+        Return current working directory.
         """
+        import os
         return os.getcwd()
 
-    # --- AGENT-STACK DISCOVERY & MANAGEMENT ---
+
     @staticmethod
     def discover_agent_stack() -> str:
         """
-        Introspect all Tools methods and Agent classes in this module,
-        write them plus a default stage list to agent_stack.json.
+        Introspect Tools + Agent classes, write agent_stack.json.
         """
+        import os, sys, json, inspect
+        from datetime import datetime
+
         module_path = os.path.dirname(os.path.abspath(__file__))
         stack_path  = os.path.join(module_path, "agent_stack.json")
 
-        # find all public Tool methods
         tools = [
             name for name, fn in inspect.getmembers(Tools, predicate=callable)
             if not name.startswith("_")
         ]
-
-        # find all Agent classes in this module
         agents = [
             name for name, cls in inspect.getmembers(sys.modules[__name__], inspect.isclass)
             if name.endswith("Manager") or name.endswith("ChatManager")
@@ -1486,10 +1534,10 @@ class Tools:
         ]
 
         config = {
-            "tools":    tools,
-            "agents":   agents,
-            "stages":   default_stages,
-            "updated":  datetime.now().isoformat()
+            "tools":   tools,
+            "agents":  agents,
+            "stages":  default_stages,
+            "updated": datetime.now().isoformat()
         }
 
         with open(stack_path, "w", encoding="utf-8") as f:
@@ -1693,7 +1741,7 @@ class Tools:
             )
 
             drv_path = ChromeDriverManager(
-                version=browser_major or "latest",
+                driver_version=browser_major or "latest",
                 arch=wdm_arch,
                 os_type="linux",
             ).install()
@@ -1914,12 +1962,20 @@ class Tools:
                         drv.switch_to.window(main_handle)
 
                     # record ---------------------------------------------------------------
+                    if page_content:
+                        clean_content = BeautifulSoup(
+                            page_content,
+                            "html.parser"
+                        ).get_text(separator=" ", strip=True)
+                    else:
+                        clean_content = ""
+
                     results.append({
                         "title":   title,
                         "url":     href,
                         "snippet": snippet,
                         "summary": summary,
-                        "content": page_content,
+                        "content": clean_content,
                     })
 
                     if len(results) >= num_results:
@@ -2482,8 +2538,81 @@ class Tools:
         except Exception as e:
             log_message(f"Error in secondary agent tool: {e}", "ERROR")
             return f"Error in secondary agent: {e}"
-        
 
+class WatchdogManager:
+    def __init__(self, model: str, threshold: float = 7.5, max_retries: int = 1):
+        self.model      = model
+        self.threshold  = threshold
+        self.max_retries = max_retries
+
+    def evaluate_run(self, ctx) -> tuple[float, list[str]]:
+        """
+        Returns (score, list_of_suggested_stage_list_modifications).
+        """
+        # Build a concise report of what happened
+        report = {
+            "stages":          ctx.stage_counts,
+            "ctx_txt":         ctx.ctx_txt[:2000],   # truncate if needed
+            "final_response":  ctx.final_response
+        }
+        system = (
+            "You are a Pipeline Watchdog.  Given a JSON report of a pipeline run (which stages ran, their counts, "
+            "the accumulated ctx_txt, and the final_response),\n"
+            " 1) rate overall run quality 0–10 (higher is better)\n"
+            " 2) if below threshold, propose 1–3 concrete adjustments to the stage list or parameters\n"
+            "Output a JSON object: {\"score\": <float>, \"suggestions\": [<string>,…]}."
+        )
+        user = f"Here is the run report:\n\n```json\n{json.dumps(report,indent=2)}\n```"
+        resp = chat(
+            model=self.model,
+            messages=[
+                {"role":"system","content":system},
+                {"role":"user","content":user}
+            ],
+            stream=False
+        )["message"]["content"]
+        try:
+            out = json.loads(resp)
+            return float(out.get("score",0)), out.get("suggestions",[])
+        except:
+            return 0.0, []
+
+class PromptEvaluator:
+    """
+    Tracks per-stage timing & success, and adjusts the system prompt
+    for any stage that repeatedly under-performs.
+    """
+    WINDOW = 10  # how many recent runs to consider
+
+    def __init__(self):
+        # stage → list of (duration, success)
+        self.metrics = defaultdict(list)
+
+    def record(self, stage: str, duration: float, success: bool):
+        m = self.metrics[stage]
+        m.append((duration, success))
+        if len(m) > self.WINDOW:
+            m.pop(0)
+
+    def should_adjust(self, stage: str) -> bool:
+        # if more than 30% failures in WINDOW
+        m = self.metrics.get(stage, [])
+        if len(m) < self.WINDOW:
+            return False
+        failures = sum(1 for d,s in m if not s)
+        return (failures / len(m)) > 0.3
+
+    def adjust(self, stage: str, current_system: str) -> str | None:
+        """
+        Returns a modified system prompt if needed, else None.
+        E.g. adds a clarifying instruction for that stage.
+        """
+        if not self.should_adjust(stage):
+            return None
+        # simple strategy: append a note to system prompt
+        note = f"\n[Note] Improve reliability of '{stage}' stage by being more explicit."
+        return current_system + note
+    
 class RLManager:
     """
     Keeps a rolling history of prompts/stage-lists and their
@@ -2590,63 +2719,158 @@ ALL_AGENTS = Tools.load_agent_stack().get("agents", [])
 
 Tools.load_external_tools()
 
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+@dataclass
+class Context:
+    name: str
+    history_manager: HistoryManager
+    tts_manager: TTSManager
+    workspace_memory: dict
+
+    # per-turn fields (seeded by new_request)
+    user_message: str = ""
+    sender_role: str  = "user"
+    skip_tts: bool    = False
+
+    ctx_txt: str = ""
+    tool_summaries: list[str] = field(default_factory=list)
+    assembled: str = ""
+    final_response: Optional[str] = None
+
+    stage_counts: dict[str,int] = field(default_factory=dict)
+
+    # values that some stages expect to find on ctx
+    run_id: Optional[int]     = None
+    global_tasks: list[Any]   = field(default_factory=list)
+    ALL_TOOLS: list[str]      = field(default_factory=list)
+    ALL_AGENTS: list[str]     = field(default_factory=list)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        setattr(self, key, value)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+
+
 class ChatManager:
     # ---------------------------------------------------------------- #
     #                           INITIALISATION                         #
     # ---------------------------------------------------------------- #
     def __init__(self,
-                 config_manager: ConfigManager,
-                 history_manager: HistoryManager,
-                 tts_manager: TTSManager,
-                 tools_data,
-                 format_schema,
-                 memory_manager: MemoryManager,
-                 mode_manager: ModeManager):
+                config_manager: ConfigManager,
+                history_manager: HistoryManager,
+                tts_manager: TTSManager,
+                tools_data,
+                format_schema,
+                memory_manager: MemoryManager,
+                mode_manager: ModeManager):
         from datetime import datetime
         import threading
 
+        # Core managers & tools
         self.config_manager   = config_manager
-        self.history_manager  = history_manager
-        self.tts_manager      = tts_manager
         self.tools_data       = tools_data
         self.format_schema    = format_schema
         self.memory_manager   = memory_manager
         self.mode_manager     = mode_manager
+
+        # Observability & learning
         self.observer         = Observer()
         self.rl_manager       = RLManager()
-        self._temp_bump       = 0.0     # adaptive temperature offset
-        Tools._history_manager = history_manager
+        self.prompt_evaluator = PromptEvaluator()
+        self._temp_bump       = 0.0
 
-        # inference control
-        self.stop_flag       = False
-        self.inference_lock  = threading.Lock()
-        self.current_thread  = None
+        # Context‐switching registry
+        self.contexts = {}
+        # Create and activate the default “global” context
+        self._activate_context("global", history_manager, tts_manager)
 
-        # idle-handling
-        # record the time of the last user interaction
+        # Inference streaming lock
+        self.stop_flag      = False
+        self.inference_lock = threading.Lock()
+        self.current_thread = None
+
+        # Idle‐handling
         self.last_interaction = datetime.now()
-        
-        # ---------- observability ----------
-        self.observer         = Observer()
         self.current_run_id   = None
-        # interval (seconds) after which we consider ourselves idle
-        self.idle_interval = self.config_manager.config.get("idle_interval_sec", 300)
-        # event to signal the monitor thread to stop if ChatManager is torn down
-        self._idle_stop = threading.Event()
-        # background thread that checks for idle timeouts
-        self._idle_thread = threading.Thread(target=self._idle_monitor, daemon=True)
+        self.idle_interval    = self.config_manager.config.get("idle_interval_sec", 300)
+        self._idle_stop       = threading.Event()
+        self._idle_thread     = threading.Thread(target=self._idle_monitor, daemon=True)
         self._idle_thread.start()
 
-        log_message("ChatManager initialized with idle monitor.", "DEBUG")
+        log_message("ChatManager initialized with context switching and idle monitor.", "DEBUG")
+
+
+    def _stage_flow_health_check(self, ctx):
+        """
+        At the very end, compute a simple health‐score for this run
+        (1 – recent_failure_ratio), log it, and—if it’s low—
+        ask the LLM for suggestions on how to reorder or tweak stages.
+        """
+        # how many of the last 10 runs failed anywhere?
+        failure_ratio = self.observer.recent_failure_ratio(n=10)
+        score = 1.0 - failure_ratio
+        suggestions = []
+
+        # if score is below 0.8, ask for improvements
+        if score < 0.8:
+            prompt = (
+                f"Our last pipeline run scored {score:.2f}/1.00 (lower is worse).\n"
+                f"Here’s the context‐analysis + tool outputs + critique:\n{ctx.ctx_txt}\n\n"
+                "Which changes to our stage list (by name) would you recommend to "
+                "produce more reliable answers?  Reply with a Python list of stage names."
+            )
+            raw = chat(
+                model=self.config_manager.config["secondary_model"],
+                messages=[{"role":"system","content":"You are a pipeline‐health advisor."},
+                          {"role":"user","content":prompt}],
+                stream=False
+            )["message"]["content"].strip()
+
+            try:
+                import ast
+                suggestions = ast.literal_eval(raw)
+                if not isinstance(suggestions, list):
+                    suggestions = []
+            except Exception:
+                suggestions = []
+
+        log_message(f"[Watchdog] run score={score:.2f}, suggestions={suggestions}", "INFO")
+
+        if suggestions:
+            ctx.ctx_txt += f"\n[Watchdog suggestions]: {suggestions}"
+
+        # we don’t automatically re-run here—you can inspect `suggestions`
+        # and feed them back into your next `new_request(...)` if you like.
+        return None
+    
+    def _activate_context(self, name: str, history_mgr=None, tts_mgr=None):
+        if name not in self.contexts:
+            self.contexts[name] = Context(
+                name=name,
+                history_manager=history_mgr or HistoryManager(),
+                tts_manager=tts_mgr or TTSManager(),
+                workspace_memory=self._load_workspace_memory()
+            )
+            log_message(f"Created new context '{name}'", "INFO")
+        # switch current context
+        self.current_ctx = self.contexts[name]
+        # make ChatManager use this context’s managers
+        self.history_manager = self.current_ctx.history_manager
+        self.tts_manager     = self.current_ctx.tts_manager
+        Tools._history_manager = self.current_ctx.history_manager
 
 
     def _stream_context(self, user_msg: str):
         log_message("Phase 1: Starting context-analysis stream...", "INFO")
 
         # 1) Build the system prompt
-        #    — include both the enhanced instructions AND a list of Tools + signatures
-        #    so the context agent can reason about which tools might be needed.
-        # -----------------------------------------------------------------------
         preamble = (
             "You are the CONTEXT-ASSEMBLY AGENT. Your mission is to synthesize the user’s latest message, "
             "conversation history, and the system’s tool capabilities to generate a focused analysis. "
@@ -2667,74 +2891,70 @@ class ChatManager:
                     func_sigs.append(f"  • {attr}(…)")
         tools_block = "AVAILABLE TOOLS:\n" + "\n".join(func_sigs)
 
-        # 2) Grab the last 5 exchanges (strictly chronological)
+        # 2) Grab the last 5 exchanges
         recent = "\n".join(
             f"{m['role'].upper()}: {m['content']}"
             for m in self.history_manager.history[-5:]
         )
 
-        # 3) Do a similarity search against the full history
+        # 3) Similarity search
         try:
-            sim_json = Tools.get_chat_history(user_msg, 5)  # top 5 by cosine + keyword
+            sim_json = Tools.get_chat_history(user_msg, 5)
             sim_results = json.loads(sim_json).get("results", [])
-            similar = "\n".join(
-                f"{e['role'].upper()}: {e['content']}"
-                for e in sim_results
-            )
+            similar = "\n".join(f"{e['role'].upper()}: {e['content']}" for e in sim_results)
         except Exception as e:
             log_message(f"Could not retrieve similar history: {e}", "WARNING")
             similar = ""
 
-        # 4) Assemble the combined context block
+        # 4) Assemble context
         context_block = ""
         if similar:
             context_block += "SIMILAR PAST MESSAGES:\n" + similar + "\n\n"
         if recent:
             context_block += "RECENT HISTORY:\n" + recent + "\n\n"
 
-        # 5) Build the Chat payload, merging instructions + tools + context
+        # 5) Build payload
         messages = [
             {"role": "system", "content": "\n\n".join([preamble, tools_block, context_block])},
             {"role": "user",   "content": user_msg}
         ]
         payload = self.build_payload(override_messages=messages, model_key="secondary_model")
 
-        # 6) Stream the model’s context analysis, with fallback on error
+        # 6) Stream with lock, fallback on error
         print("⟳ Context: ", end="", flush=True)
         buf = ""
-        try:
-            for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
-                if self.stop_flag:
-                    log_message("Phase 1 aborted by stop flag.", "WARNING")
-                    break
-                tok = part["message"]["content"]
-                buf += tok
-                print(tok, end="", flush=True)
-                yield tok, False
-        except Exception as e:
-            log_message(f"Context-analysis streaming failed: {e}", "ERROR")
-            # fallback to non-streaming call
+        with self.inference_lock:
             try:
-                resp = chat(model=payload["model"], messages=payload["messages"], stream=False)
-                content = resp.get("message", {}).get("content", "") or ""
-                print(content, end="", flush=True)
-                yield content, True
-            except Exception as e2:
-                log_message(f"Context-analysis non-stream fallback failed: {e2}", "ERROR")
-                yield "", True
-            return
+                for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
+                    if self.stop_flag:
+                        log_message("Phase 1 aborted by stop flag.", "WARNING")
+                        break
+                    tok = part["message"]["content"]
+                    buf += tok
+                    print(tok, end="", flush=True)
+                    yield tok, False
+            except Exception as e:
+                log_message(f"Context-analysis streaming failed: {e}", "ERROR")
+                # fallback
+                try:
+                    resp = chat(model=payload["model"], messages=payload["messages"], stream=False)
+                    content = resp.get("message", {}).get("content", "") or ""
+                    print(content, end="", flush=True)
+                    yield content, True
+                except Exception as e2:
+                    log_message(f"Context-analysis non-stream fallback failed: {e2}", "ERROR")
+                    yield "", True
+                return
 
-        # 7) Successful completion of stream
+        # 7) Complete
         print()
         log_message(f"Phase 1 complete: context analysis:\n{buf}", "INFO")
         yield "", True
 
-
-
     def _stream_tool(self, user_msg: str):
         log_message("Phase 2: Starting tool‐decision stream...", "INFO")
 
-        # 1) Build list of available tool names and their signatures
+        # Build list of tool signatures
         tool_names = []
         func_sigs = []
         for attr in dir(Tools):
@@ -2744,14 +2964,14 @@ class ChatManager:
                     sig = inspect.signature(getattr(Tools, attr))
                     func_sigs.append(f"{attr}{sig}")
                 except (ValueError, TypeError):
-                    func_sigs.append(f"{attr}(...)")
+                    func_sigs.append(f"{attr}(…)")
         tools_message = "AVAILABLE FUNCTIONS (name + signature only):\n" + "\n".join(func_sigs)
 
-        # 2) Instructions to output exactly one tool_code block or NO_TOOL
+        # Instructions
         preamble = (
-            "You are a TOOL‐CALLING agent. Your ONLY job is to choose exactly one of the functions below—no prose, no extra text. "
-            "If you choose a function with text input, include the full query as a double‐quoted string. "
-            "Output exactly one of:\n"
+            "You are a TOOL‐CALLING agent. Your ONLY job is to choose exactly one of the functions below—"
+            "no prose, no extra text. If you choose a function with text input, include the full query "
+            "as a double‐quoted string. Output exactly one of:\n"
             "```tool_code\n<FunctionName>(\"arg1\", ...)\n```\n"
             "or\n"
             "```tool_code\nNO_TOOL\n```"
@@ -2765,25 +2985,29 @@ class ChatManager:
             {"role": "user",   "content": user_msg}
         ]
 
-        # 3) Build payload for secondary model
+        # Build payload
         payload = self.build_payload(override_messages=messages, model_key="secondary_model")
         payload["temperature"] = self.config_manager.config.get("tool_temperature", payload["temperature"])
 
-        # 4) Stream the model’s decision
+        # Stream with lock
         print("⟳ Tool: ", end="", flush=True)
         buf = ""
-        for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
-            if self.stop_flag:
-                log_message("Phase 2 aborted by stop flag.", "WARNING")
-                break
-            tok = part["message"]["content"]
-            buf += tok
-            print(tok, end="", flush=True)
-            yield tok, False
+        with self.inference_lock:
+            try:
+                for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
+                    if self.stop_flag:
+                        log_message("Phase 2 aborted by stop flag.", "WARNING")
+                        break
+                    tok = part["message"]["content"]
+                    buf += tok
+                    print(tok, end="", flush=True)
+                    yield tok, False
+            except Exception as e:
+                log_message(f"Tool‐decision streaming failed: {e}", "ERROR")
+
+        # Log and extract
         print()
         log_message(f"Phase 2 complete: raw tool‐decision output:\n{buf}", "DEBUG")
-
-        # 5) Extract the tool call (fenced or bare)
         import re, ast
         pattern = (
             r"(?:```tool_code\s*(.*?)\s*```)"   # fenced block
@@ -2792,7 +3016,6 @@ class ChatManager:
         m = re.search(pattern, buf, re.DOTALL | re.MULTILINE)
         code = (m.group(1) or m.group(2) or "").strip() if m else None
 
-        # 6) Validate with AST: single function call, known tool, literal args
         if code and code.upper() != "NO_TOOL":
             try:
                 expr = ast.parse(code, mode="eval")
@@ -2801,11 +3024,9 @@ class ChatManager:
                 call = expr.body
                 if not isinstance(call.func, ast.Name) or call.func.id not in tool_names:
                     raise ValueError(f"Unknown function '{getattr(call.func, 'id', None)}'")
-                # check positional args are literals
                 for arg in call.args:
                     if not isinstance(arg, ast.Constant):
                         raise ValueError("All positional args must be literals")
-                # check keyword args are literals
                 for kw in call.keywords:
                     if not kw.arg or not isinstance(kw.value, ast.Constant):
                         raise ValueError("All keyword args must be literal")
@@ -2817,8 +3038,182 @@ class ChatManager:
             log_message("No valid tool_code detected; treating as NO_TOOL.", "INFO")
             code = None
 
-        # 7) End of tool stream
         yield "", True
+
+    def _stage_task_decomposition(self, ctx):
+        """
+        Break the user’s request into an ordered JSON list of exact tool calls.
+        """
+        import json
+        prompt = (
+            "You are a Task Decomposer.  Given the user's request:\n\n"
+            f"    \"{ctx.user_message}\"\n\n"
+            "Output a JSON array of the exact sequence of tool calls (as strings) "
+            "that will accomplish this request in order.  "
+            "Each element must look like:\n"
+            "    \"create_file(\\\"foo.py\\\", \\\"print('hi')\\\")\"\n"
+            "No other text."
+        )
+        resp = chat(
+            model=self.config_manager.config["secondary_model"],
+            messages=[
+                {"role":"system", "content": prompt},
+                {"role":"user",   "content": ctx.user_message}
+            ],
+            stream=False
+        )["message"]["content"].strip()
+        try:
+            plan = json.loads(resp)
+            if not isinstance(plan, list):
+                raise ValueError("not a list")
+        except Exception as e:
+            log_message(f"Task decomposition parse error: {e}", "ERROR")
+            plan = []
+        # store and log
+        setattr(ctx, "plan", plan)
+        ctx.ctx_txt += f"\n[Task Decomposition]: {plan}"
+        return None
+
+    def _stage_plan_validation(self, ctx):
+        """
+        Validate or refine the generated plan against the original request.
+        """
+        import json
+        plan = getattr(ctx, "plan", [])
+        prompt = (
+            "You are a Plan Validator.  The user asked:\n\n"
+            f"    \"{ctx.user_message}\"\n\n"
+            "The current plan (JSON list of tool calls) is:\n\n"
+            f"    {json.dumps(plan, indent=2)}\n\n"
+            "If this plan fully and correctly implements the request, reply with\n"
+            "    NO_CHANGES\n"
+            "Otherwise output a revised JSON array of tool‐call strings."
+        )
+        resp = chat(
+            model=self.config_manager.config["secondary_model"],
+            messages=[
+                {"role":"system",  "content": prompt},
+                {"role":"user",    "content": "Review the plan above."}
+            ],
+            stream=False
+        )["message"]["content"].strip()
+        if resp.upper() != "NO_CHANGES":
+            try:
+                new_plan = json.loads(resp)
+                if isinstance(new_plan, list):
+                    setattr(ctx, "plan", new_plan)
+                    ctx.ctx_txt += f"\n[Plan Validation] revised → {new_plan}"
+                else:
+                    raise ValueError("not a list")
+            except Exception as e:
+                log_message(f"Plan validation parse error: {e}", "ERROR")
+        return None
+
+    def _stage_execute_actions(self, ctx):
+        """
+        Execute each tool call in ctx.plan in sequence, collecting outputs.
+        """
+        plan = getattr(ctx, "plan", [])
+        results = []
+        for call_str in plan:
+            code = Tools.parse_tool_call(call_str)
+            if not code:
+                results.append((call_str, "Error: could not parse call"))
+                continue
+            try:
+                out = self.run_tool(code)
+            except Exception as e:
+                out = f"Error during execution: {e}"
+            results.append((code, out))
+        setattr(ctx, "action_results", results)
+        lines = "\n".join(f"{c} → {o}" for c,o in results)
+        ctx.ctx_txt += f"\n[Executed Actions]:\n{lines}"
+        return None
+
+    def _stage_verify_results(self, ctx):
+        """
+        Check each action’s output for errors and either retry or flag issues.
+        """
+        troubles = [ (c,o) for c,o in getattr(ctx, "action_results", []) if o.lower().startswith("error") ]
+        if not troubles:
+            return None
+
+        # simple retry logic: retry once
+        retry = []
+        for code, _ in troubles:
+            try:
+                out = self.run_tool(code)
+            except Exception as e:
+                out = f"Error during retry: {e}"
+            retry.append((code, out))
+        setattr(ctx, "retry_results", retry)
+        lines = "\n".join(f"{c} → {o}" for c,o in retry)
+        ctx.ctx_txt += f"\n[Verification Retries]:\n{lines}"
+
+        # if still errors, ask for fallback
+        still_bad = [ (c,o) for c,o in retry if o.lower().startswith("error") ]
+        if still_bad:
+            prompt = (
+                "The following actions failed twice:\n"
+                + "\n".join(f"  • {c}" for c,_ in still_bad)
+                + "\nPlease suggest an alternative approach or correct tool calls."
+            )
+            advice = chat(
+                model=self.config_manager.config["secondary_model"],
+                messages=[{"role":"system","content":prompt}],
+                stream=False
+            )["message"]["content"].strip()
+            ctx.ctx_txt += f"\n[Retry Advice]: {advice}"
+        return None
+
+    def _stage_adversarial_loop(self, ctx):
+        """
+        Run an adversarial “critic” over the assistant’s own response.
+        If it finds issues, it will re-invoke final_inference with those
+        criticisms baked into the prompt.
+        """
+        # only run once we have a candidate answer
+        if not ctx.final_response:
+            return None
+
+        # ask the secondary LLM to poke holes in our answer
+        system = (
+            "You are an adversarial critic.  "
+            "Given a user request, the context-analysis, and a candidate response, "
+            "identify any factual errors, missing steps, logical flaws or unclear points.  "
+            "If everything is correct, reply exactly NO_ISSUES."
+        )
+        user = (
+            f"User message: {ctx.user_message}\n\n"
+            f"Context analysis + tool outputs:\n{ctx.ctx_txt}\n\n"
+            f"Candidate response:\n{ctx.final_response.strip()}\n\n"
+            "List each issue as a bullet (– …)."
+        )
+
+        resp = chat(
+            model=self.config_manager.config["secondary_model"],
+            messages=[{"role":"system","content":system},
+                      {"role":"user",  "content":user}],
+            stream=False
+        )["message"]["content"].strip()
+
+        if resp.upper() == "NO_ISSUES":
+            return None
+
+        # log the critique
+        ctx.ctx_txt += f"\n[Adversarial critique]:\n{resp}"
+
+        # re-run final_inference, appending the critique to the prompt
+        revised_prompt = ctx.assembled + "\n\n[Adversarial critique]:\n" + resp
+        new_answer = self.run_inference(revised_prompt, ctx.skip_tts)
+
+        # overwrite with the improved answer
+        ctx.final_response = new_answer.strip()
+        self.history_manager.add_entry("assistant", ctx.final_response)
+        log_message(f"Adversarial loop produced revision: {ctx.final_response!r}", "INFO")
+        return None
+
+
 
     # ----------------------------------------
     # NEW: Intent Clarification
@@ -3472,11 +3867,12 @@ class ChatManager:
     def run_tool(self, tool_code: str) -> str:
         """
         Execute a Tools.<func>(...) invocation, supporting:
-         - keyword args with literal constants
-         - bare positional args (quoted or unquoted → treated as strings)
-         - Name nodes (treated as their .id)
+        - keyword args with literal constants
+        - bare positional args (quoted or unquoted → treated as strings)
+        - Name nodes (treated as their .id)
+        - automatic conversion of kwargs→args for positional-only tools
         """
-        import ast, re
+        import ast, re, inspect
 
         # Strip out any type annotations in keyword args (e.g. prompt: str="…" → prompt="…")
         tool_code = re.sub(
@@ -3496,7 +3892,6 @@ class ChatManager:
         if m_quick:
             func_name, body = m_quick.group(1), m_quick.group(2)
             func = getattr(Tools, func_name, None)
-            # only use quick split if there are no quotes in the argument string
             if func and not re.search(r'["\']', body):
                 args = []
                 kwargs = {}
@@ -3520,16 +3915,18 @@ class ChatManager:
                 # default for get_chat_history()
                 if func_name == "get_chat_history" and not args and not kwargs:
                     args = [5]
-                log_message(
-                    f"run_tool: Parsed {func_name} with args={args} kwargs={kwargs}",
-                    "DEBUG"
-                )
+                log_message(f"run_tool: Parsed {func_name} with args={args} kwargs={kwargs}", "DEBUG")
                 try:
+                    # if this tool is positional‐only, move kwargs into args
+                    sig = inspect.signature(func)
+                    param_names = [
+                        p.name for p in sig.parameters.values()
+                        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                    ]
+                    if not args and kwargs and all(n in kwargs for n in param_names):
+                        args = [kwargs.pop(n) for n in param_names]
                     result = func(*args, **kwargs)
-                    log_message(
-                        f"run_tool: {func_name} returned {result!r}",
-                        "INFO"
-                    )
+                    log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
                     return str(result)
                 except Exception as e:
                     log_message(f"run_tool error: {e}", "ERROR")
@@ -3543,33 +3940,26 @@ class ChatManager:
         )
         if m_simple:
             func_name, raw_arg = m_simple.group(1), m_simple.group(2)
-            # only use fallback if the raw_arg contains no quotes
             if '"' not in raw_arg and "'" not in raw_arg:
                 func = getattr(Tools, func_name, None)
                 if func:
-                    log_message(
-                        f"run_tool: Fallback parse → {func_name}('{raw_arg}')",
-                        "DEBUG"
-                    )
+                    log_message(f"run_tool: Fallback parse → {func_name}('{raw_arg}')", "DEBUG")
                     try:
                         result = func(raw_arg)
-                        log_message(
-                            f"run_tool: {func_name} returned {result!r}",
-                            "INFO"
-                        )
+                        log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
                         return str(result)
                     except Exception as e:
                         log_message(f"run_tool error: {e}", "ERROR")
                         return f"Error executing `{func_name}`: {e}"
 
-        # 2) Full AST–based parsing for all other cases (handles quoted strings, newlines, commas)
+        # 2) Full AST–based parsing for all other cases
         try:
             tree = ast.parse(tool_code.strip(), mode="eval")
             if not isinstance(tree, ast.Expression) or not isinstance(tree.body, ast.Call):
                 raise ValueError("Not a function call")
             call = tree.body
 
-            # get function name
+            # function lookup
             if not isinstance(call.func, ast.Name):
                 raise ValueError("Unsupported function expression")
             func_name = call.func.id
@@ -3608,24 +3998,29 @@ class ChatManager:
                     else:
                         raise ValueError(f"Unsupported kwarg type: {ast.dump(v)}")
 
-            # default for get_chat_history() with no args
+            # default for get_chat_history()
             if func_name == "get_chat_history" and not args and not kwargs:
                 args = [5]
 
-            log_message(
-                f"run_tool: Calling {func_name} with args={args} kwargs={kwargs}",
-                "DEBUG"
-            )
+            log_message(f"run_tool: Calling {func_name} with args={args} kwargs={kwargs}", "DEBUG")
+
+            # positional‐only adjustment
+            sig = inspect.signature(func)
+            param_names = [
+                p.name for p in sig.parameters.values()
+                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            ]
+            if not args and kwargs and all(n in kwargs for n in param_names):
+                args = [kwargs.pop(n) for n in param_names]
+
             result = func(*args, **kwargs)
-            log_message(
-                f"run_tool: {func_name} returned {result!r}",
-                "INFO"
-            )
+            log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
             return str(result)
 
         except Exception as e:
             log_message(f"run_tool error: {e}", "ERROR")
             return f"Error executing `{tool_code}`: {e}"
+
         
     def _stage_prompt_optimization(self, ctx):
         """
@@ -3658,7 +4053,83 @@ class ChatManager:
             ctx["ctx_txt"] += "\n[RL exploration enabled]"
         return None
 
-    
+    def _stage_execute_tasks(self, ctx):
+        """
+        Parallel‐execute each non-done task in its own thread, measure each 
+        mini-stage’s performance, and adjust prompts if needed.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        tasks = ctx.get("global_tasks", [])
+        if not tasks:
+            return None
+
+        def _run_one(task):
+            # build an isolated subctx
+            subctx = {
+                "user_message":     f"Work on task: {task['text']}",
+                "sender_role":      ctx.get("sender_role", "user"),
+                "run_id":           ctx["run_id"],
+                "skip_tts":         True,
+                "ctx_txt":          "",
+                "tool_summaries":   [],
+                "assembled":        "",
+                "final_response":   None,
+                "workspace_memory": ctx["workspace_memory"],
+                "ALL_TOOLS":        ctx["ALL_TOOLS"],
+                "ALL_AGENTS":       ctx["ALL_AGENTS"],
+                "global_tasks":     ctx["global_tasks"],
+            }
+
+            # mini‐pipeline stages
+            mini_stages = [
+                "context_analysis",
+                "planning_summary",
+                "tool_chaining",
+                "assemble_prompt",
+                "final_inference"
+            ]
+
+            for stage in mini_stages:
+                handler = getattr(self, f"_stage_{stage}", None)
+                if not handler:
+                    continue
+
+                start = time.time()
+                success = True
+                try:
+                    handler(subctx)
+                except Exception:
+                    success = False
+                    # still record failure timing, then re-raise to abort this subtask
+                    raise
+                finally:
+                    duration = time.time() - start
+                    # record and maybe adjust prompt
+                    self.prompt_evaluator.record(stage, duration, success)
+                    new_sys = self.prompt_evaluator.adjust(stage,
+                                                        self.config_manager.config["system"])
+                    if new_sys:
+                        self.config_manager.config["system"] = new_sys
+
+            # on success, record the result
+            result = subctx.get("final_response", "")
+            ctx["ctx_txt"] += f"\n[Task {task.get('id')} done]: {result}"
+            task["done"] = True
+
+        # run all tasks in parallel
+        with ThreadPoolExecutor(max_workers= min(4, len(tasks))) as ex:
+            futures = [ex.submit(_run_one, t) for t in tasks if not t.get("done")]
+            # optionally handle exceptions here:
+            for f in futures:
+                try:
+                    f.result()
+                except Exception as e:
+                    log_message(f"[execute_tasks] subtask failed: {e}", "ERROR")
+
+        return None
+
+
     # -------------------------------------------------------------------
     # New workspace‐memory helpers
     # -------------------------------------------------------------------
@@ -3687,164 +4158,197 @@ class ChatManager:
     def _stage_planning(self, ctx):
         return self._stage_planning_summary(ctx)
 
-    # -------------------------------------------------------------------
-    # Updated new_request with task_management stage
-    # -------------------------------------------------------------------
-    # ─────────────────────────────────────────────────────────────
-    def new_request(self,
-                    user_message: str,
-                    sender_role: str = "user",
-                    skip_tts: bool = False) -> str:
+    def _assemble_stage_list(self, user_message: str, base_stages: list[str]) -> list[str]:
         """
-        Entry-point for every user (or agent-generated) turn.
-        Adds observability, automatic stage injections, prompt
-        optimisation + simple RL exploration, error-aware retry
-        and final reward logging.
+        Dynamically adjust the pipeline based on the user’s task.
+        Example rules:
+        - If the user asks for a summary, ensure 'summary_request' runs first.
+        - If they mention tasks or subtasks, include task stages.
+        - If they reference files, include file management/validation early.
         """
-        from datetime import datetime
-        import json, random
+        import re
 
-        # ── 1. bookkeeping ───────────────────────────────
-        self.last_interaction = datetime.now()
+        stages = base_stages.copy()
 
+        # 1) Summaries → bump summary_request to front
+        if re.search(r'\b(summarize|summary|brief)\b', user_message, re.IGNORECASE):
+            if 'summary_request' in stages:
+                idx = stages.index('summary_request')
+                stages.insert(0, stages.pop(idx))
+
+        # 2) Task-related → append task stages if missing
+        if re.search(r'\b(task|todo|subtask|assign)\b', user_message, re.IGNORECASE):
+            for t in ('task_management', 'subtask_management'):
+                if t not in stages:
+                    stages.append(t)
+
+        # 3) File-related → move file stages to front
+        if re.search(r'\b(file|load|save|read|write)\b', user_message, re.IGNORECASE):
+            for t in ('file_management', 'file_validation'):
+                if t in stages:
+                    idx = stages.index(t)
+                    stages.insert(0, stages.pop(idx))
+
+        return stages
+
+    def new_request(self, user_message: str, sender_role: str = "user", skip_tts: bool = False) -> str:
+        """
+        Entry-point for a new user request.  
+        Handles context-switching, per-context state, dynamic stage-list assembly,
+        pipeline execution, and final response delivery.
+        """
+        import re
+
+        # 0) Context-switch detection: "/topic NAME" or "/ctx NAME"
+        m = re.match(r"^/(topic|ctx)\s+(.+)$", user_message.strip(), re.IGNORECASE)
+        if m:
+            topic = m.group(2).strip()
+            self._activate_context(topic)
+            return f"Switched to context '{topic}'."
+
+        # 1) Grab or create the current_ctx
+        ctx = getattr(self, "current_ctx", None)
+        if ctx is None:
+            self._activate_context("global")
+            ctx = self.current_ctx
+
+        # 1a) Rebind managers to this context
+        self.history_manager   = ctx.history_manager
+        self.tts_manager       = ctx.tts_manager
+        Tools._history_manager = ctx.history_manager
+
+        # 2) Seed or reset per-turn fields
+        ctx.user_message    = user_message
+        ctx.sender_role     = sender_role
+        ctx.skip_tts        = skip_tts
+        ctx.ctx_txt         = ""
+        ctx.tool_summaries  = []
+        ctx.assembled       = ""
+        ctx.final_response  = None
+        ctx.stage_counts.clear()
+
+        # 2a) Record the user’s message (no immediate TTS echo)
+        ctx.history_manager.add_entry(sender_role, user_message)
+
+        # 3) Telemetry: start a new run
         run_id = self.observer.start_run(user_message)
         self.current_run_id = run_id
+        ctx.run_id          = run_id
 
-        # ── 2. base pipeline from stack.json ─────────────
+        # 4) Load the base agent-stack stages and drop any old record stage
         stack  = Tools.load_agent_stack()
-        stages = stack.get("stages", []).copy()
+        stages = list(stack.get("stages", []))
+        if "record_user_message" in stages:
+            stages.remove("record_user_message")
 
-        # ► ensure core stages are present in sensible order
-        def _ensure(stage_name, after):
-            if stage_name not in stages:
-                stages.insert(stages.index(after) + 1, stage_name)
+        # 4.5) Dynamic stage assembly based on the user's message
+        stages = self._assemble_stage_list(user_message, stages)
 
-        _ensure("workspace_setup",      "record_user_message")
+        # 5) Ensure all core stages are present in proper order
+        def _ensure(name: str, after: str | None):
+            if name not in stages and after and after in stages:
+                stages.insert(stages.index(after) + 1, name)
+
+        _ensure("context_analysis",     stages[0] if stages else None)
+        _ensure("workspace_setup",      "context_analysis")
         _ensure("file_management",      "workspace_setup")
-        _ensure("html_filtering",       "file_management")        # NEW
-        _ensure("chunk_and_summarize",  "html_filtering")         # NEW
-        _ensure("task_management",      "file_management")
-        _ensure("subtask_management",   "task_management")
-        _ensure("workspace_save",       stages[-1])
+        _ensure("file_validation",      "file_management")
+        _ensure("html_filtering",       "file_management")
+        _ensure("chunk_and_summarize",  "html_filtering")
+        _ensure("intent_clarification", "context_analysis")
+        _ensure("external_knowledge_retrieval", "intent_clarification")
+        _ensure("memory_summarization", "external_knowledge_retrieval")
+        _ensure("planning_summary",     "memory_summarization")
+        _ensure("tool_chaining",        "planning_summary")
+        _ensure("assemble_prompt",      "tool_chaining")
+        _ensure("final_inference",      "assemble_prompt")
+        _ensure("chain_of_thought",     "final_inference")
+        _ensure("notification_audit",   "chain_of_thought")
+        _ensure("flow_health_check",    "notification_audit")
 
-        # ► inject optimisation / RL stages
-        if "prompt_optimization" not in stages:
-            stages.insert(0, "prompt_optimization")               # runs first
-        if "rl_experimentation" not in stages:
-            # place immediately before assemble_prompt (or final_inference fallback)
-            anchor = "assemble_prompt" if "assemble_prompt" in stages else "final_inference"
-            stages.insert(stages.index(anchor), "rl_experimentation")
+        # 6) Optionally insert adversarial_loop right after final_inference
+        if "final_inference" in stages and "adversarial_loop" not in stages:
+            idx = stages.index("final_inference") + 1
+            stages.insert(idx, "adversarial_loop")
 
-        # ── 3. prompt optimisation & exploration (pre-loop) ───
-        base_system = self.config_manager.config.get("system", "")
-        # best prompt so far
-        best_system = self.rl_manager.best_prompt(base_system)
-        self.config_manager.config["system"] = best_system
-
-        # 20 % chance: explore mutated prompt + stage list
-        exploratory = random.random() < 0.20
-        if exploratory:
-            mutated_prompt, mutated_stages = self.rl_manager.propose(best_system, stages)
-            self.config_manager.config["system"] = mutated_prompt
-            stages = mutated_stages
-            log_message("RL exploration: mutated prompt/stage list chosen", "INFO")
-
-        # ── 4. build run context───────────────────────────
-        ctx = {
-            "user_message":     user_message,
-            "sender_role":      sender_role,
-            "run_id":           run_id,
-            "skip_tts":         skip_tts,
-            "ctx_txt":          "",
-            "tool_summaries":   [],
-            "assembled":        "",
-            "final_response":   None,
-            "workspace_memory": self._load_workspace_memory(),
-            "ALL_TOOLS":        stack.get("tools", []),
-            "ALL_AGENTS":       stack.get("agents", []),
-            "global_tasks":     json.loads(Tools.list_tasks()),
-        }
-
-        log_message(f"Pipeline stages: {stages}", "INFO")
-
-        # ── 5. execute pipeline────────────────────────────
+        # 7) Execute the pipeline
+        log_message(f"[Context={ctx.name}] Pipeline stages: {stages}", "INFO")
         for stage in stages:
+            # runaway guard
+            cnt = ctx.stage_counts.get(stage, 0) + 1
+            ctx.stage_counts[stage] = cnt
+            if cnt > 1:
+                log_message(f"[{ctx.name}] Skipping repeated stage '{stage}'", "WARNING")
+                continue
+
             handler = getattr(self, f"_stage_{stage}", None)
             if not handler:
-                log_message(f"No handler for stage '{stage}', skipping.", "WARNING")
                 continue
 
             self.observer.log_stage_start(run_id, stage)
-            log_message(f"→ Stage: {stage}", "DEBUG")
-
             try:
                 result = handler(ctx)
             except Exception as e:
                 self.observer.log_error(run_id, stage, e)
-                log_message(f"Stage '{stage}' failed: {e}", "ERROR")
-
-                # targeted retry for final inference
-                if stage == "final_inference":
-                    log_message("Retrying final_inference once with higher temperature", "INFO")
-                    if getattr(self, "_temp_bump", 0.0) == 0.0:
-                        self._temp_bump = 0.2
-                        result = handler(ctx)      # retry
+                log_message(f"[{ctx.name}] Stage '{stage}' failed: {e}", "ERROR")
+                # retry final_inference once with bumped temp
+                if stage == "final_inference" and getattr(self, "_temp_bump", 0.0) == 0.0:
+                    log_message("Retrying final_inference with bumped temp", "INFO")
+                    self._temp_bump = 0.2
+                    try:
+                        result = handler(ctx)
+                    except Exception:
+                        pass
+                    finally:
                         self._temp_bump = 0.0
-                    else:
-                        raise
             else:
                 self.observer.log_stage_end(run_id, stage)
 
-            # fast exits
+            # fast-paths
             if stage == "summary_request" and isinstance(result, str):
                 return result
             if stage == "timeframe_history_query" and isinstance(result, str):
-                ctx["ctx_txt"] += "\n[History lookup]:\n" + result
+                ctx.ctx_txt += "\n[History lookup]:\n" + result
                 continue
-            if stage == "final_inference" and ctx.get("final_response"):
-                break
+            # allow adversarial_loop to run after final_inference
 
-        # ── 6. post-processing & reward────────────────────
-        self._save_workspace_memory(ctx["workspace_memory"])
+        # 8) Persist workspace memory & complete the run
+        self._save_workspace_memory(ctx.workspace_memory)
         self.observer.complete_run(run_id)
 
-        # simple binary reward: 1 if no stage error, else 0
-        had_error = any(
-            s.get("status") == "error"
-            for s in self.observer.runs[run_id]["stages"].values()
-        )
-        reward = 0.0 if had_error else 1.0
-        self.rl_manager.record(
-            prompt=self.config_manager.config.get("system", ""),
-            stages=stages,
-            reward=reward
-        )
-
-        return ctx["final_response"] or "Sorry, I couldn't process that."
-    # ─────────────────────────────────────────────────────────────
+        return ctx.final_response or "Sorry, I couldn't process that."
 
 
-    # ------------------------------
-    # Stage 0: summary_request
-    # ------------------------------
-    def _stage_summary_request(self, ctx):
-        msg = ctx["user_message"].lower()
+
+    def _stage_summary_request(self, ctx: Context):
+        import re, json
+
+        # use the Context field, not dict access
+        msg = ctx.user_message.lower()
         if re.search(r'\b(summary|summarize|how was our conversation|feedback)\b', msg):
+            # pick a period from the message, default to "today"
             m = re.search(r'\b(today|yesterday|last\s+\d+\s+days?)\b', msg)
             period = m.group(0) if m else "today"
+            # fetch and parse history
             hist = Tools.get_chat_history(period)
             try:
                 entries = json.loads(hist).get("results", [])
-            except:
+            except Exception:
                 entries = []
             lines = "\n".join(f"{e['role'].capitalize()}: {e['content']}" for e in entries)
+
             prompt = (
                 "Here is our conversation:\n\n"
                 f"{lines}\n\n"
                 "Please provide a brief, high-level summary of what we discussed."
             )
-            return Tools.secondary_agent_tool(prompt, temperature=0.5).strip()
+            summary = Tools.secondary_agent_tool(prompt, temperature=0.5).strip()
+            # short-circuit: set final_response too
+            ctx.final_response = summary
+            return summary
+
         return None
+
     # -------------------------------------------------------------------
     # Stage: task_management
     # -------------------------------------------------------------------
@@ -3885,13 +4389,11 @@ class ChatManager:
     # ------------------------------
     # Stage 1: timeframe_history_query
     # ------------------------------
-    def _stage_timeframe_history_query(self, ctx):
-        out = self._history_timeframe_query(ctx["user_message"])
+    def _stage_timeframe_history_query(self, ctx: Context):
+        out = self._history_timeframe_query(ctx.user_message)
         if out:
-            # enqueue for TTS as before
-            self.tts_manager.enqueue(out)
-            # inject into context for downstream planning/inference
-            ctx["ctx_txt"] += "\n[History lookup]:\n" + out
+            ctx.tts_manager.enqueue(out)
+            ctx.ctx_txt += "\n[History lookup]:\n" + out
         return None
 
     # ------------------------------
@@ -3907,32 +4409,64 @@ class ChatManager:
     # ------------------------------
     # Stage 3: context_analysis
     # ------------------------------
-    def _stage_context_analysis(self, ctx):
+    def _stage_context_analysis(self, ctx: Context):
         buf = []
-        for tok, done in self._stream_context(ctx["user_message"]):
+        for tok, done in self._stream_context(ctx.user_message):
             buf.append(tok)
             if done:
                 break
         ca = "".join(buf)
         log_message(f"Context analysis: {ca!r}", "DEBUG")
-        ctx["ctx_txt"] += ca
+        ctx.ctx_txt += ca
         return None
+
 
     # ------------------------------
     # Stage 4: intent_clarification
     # ------------------------------
     def _stage_intent_clarification(self, ctx):
-        clar = self._clarify_intent(ctx["user_message"])
-        if clar:
-            # record & TTS
-            self.history_manager.add_entry("assistant", clar)
-            if not ctx["skip_tts"]:
-                self.tts_manager.enqueue(clar)
-            ctx["ctx_txt"] += f"\n[Clarification asked]: {clar}"
-            # auto-gather
-            auto = self.new_request(clar, sender_role="assistant", skip_tts=True)
-            if auto and auto != clar:
-                ctx["ctx_txt"] += f"\n[Auto-gathered]: {auto}"
+        """
+        If the user’s request is ambiguous, ask ONE simple question to disambiguate.
+        BUT—before speaking to the user—first attempt to resolve that question
+        internally via your secondary_model.  Only if that “self-clarification”
+        comes back empty or unhelpful do you ask the user.
+        """
+        # 1) Ask Clarifier whether we need more info
+        clar = self._clarify_intent(ctx.user_message)
+        if not clar:
+            return None
+
+        # 2) Try to auto-answer that clarification internally
+        auto_sys = (
+            "You are the AUTOCLARIFIER AGENT.  "
+            "Use the existing conversation history to answer the question below.  "
+            "If you can answer it, respond with the answer.  "
+            "If it cannot be answered from context, respond with UNANSWERABLE."
+        )
+        auto_resp = chat(
+            model=self.config_manager.config["secondary_model"],
+            messages=[
+                {"role": "system",  "content": auto_sys},
+                {"role": "user",    "content": clar}
+            ],
+            stream=False
+        )["message"]["content"].strip()
+
+        # 3) Record what happened
+        ctx.ctx_txt += f"\n[Self-clarification attempt] Q: {clar!r} → A: {auto_resp!r}"
+
+        # 4) If we got a real answer, stitch it back into the user_message so downstream stages see it
+        if auto_resp and auto_resp.upper() != "UNANSWERABLE":
+            # inject the resolved detail
+            ctx.user_message = f"{ctx.user_message} {auto_resp}"
+            return None  # skip asking the user
+
+        # 5) Otherwise, genuinely ask the user
+        #    (fallback because we truly couldn't resolve it ourselves)
+        self.history_manager.add_entry("assistant", clar)
+        if not ctx.skip_tts:
+            self.tts_manager.enqueue(clar)
+        # we return None so pipeline just continues; user will reply with the needed detail
         return None
 
     # ------------------------------
@@ -3947,11 +4481,34 @@ class ChatManager:
     # ------------------------------
     # Stage 6: memory_summarization
     # ------------------------------
-    def _stage_memory_summarization(self, ctx):
-        mem = self._memory_summarize()
-        if mem:
-            ctx["ctx_txt"] += "\nMemory summary:\n" + mem
-        return None
+    def _stage_memory_summarization(self, ctx: Context):
+        """
+        Every N turns compress full history to a short summary stored in memory.
+        """
+        # only run every 10th turn
+        if len(ctx.history_manager.history) % 10 != 0:
+            return None
+
+        full = "\n".join(m["content"] for m in ctx.history_manager.history)
+        try:
+            resp = chat(
+                model=self.config_manager.config["secondary_model"],
+                messages=[
+                    {"role": "system", "content":
+                        "You are a Memory Agent—summarize this conversation in one paragraph."
+                    },
+                    {"role": "user", "content": full}
+                ],
+                stream=False
+            )
+            summary = resp["message"]["content"].strip()
+            log_message("Memory summary: " + summary, "INFO")
+            ctx.ctx_txt += "\nMemory summary:\n" + summary
+            return summary
+        except Exception as e:
+            log_message(f"Memory summarization failed: {e}", "ERROR")
+            return None
+
 
     # ------------------------------
     # Stage 7: planning_summary
@@ -3986,49 +4543,84 @@ class ChatManager:
     # Stage 8: tool_chaining
     # ------------------------------
     def _stage_tool_chaining(self, ctx):
+        """
+        1) Detect and run any “Next Action: Call `func()`” suggestion.
+        2) Otherwise do the normal streaming tool-chaining.
+        """
+        import re, json
+
+        run_id = ctx["run_id"]
+
+        # 1) Auto‐invoke any Next Action suggestion
+        m = re.search(r'Next Action:\s*Call\s*`([^`]+)`', ctx["ctx_txt"])
+        if m:
+            code = m.group(1)
+            log_message(f"Auto-invoking suggested tool: {code}", "INFO")
+            try:
+                out = self.run_tool(code)
+                ctx["ctx_txt"] += f"\n[Auto-run {code} → {out}]"
+            except Exception as e:
+                ctx["ctx_txt"] += f"\n[Suggestion {code} failed: {e}]"
+                log_message(f"Suggestion {code} failed: {e}", "ERROR")
+            # skip further chaining this turn
+            return None
+
+        # 2) Existing streaming‐based tool chaining
         summaries = []
         invoked   = set()
         tc        = ctx["ctx_txt"]
+
         for i in range(5):
             buf = []
-            for tok, done in self._stream_tool(tc):
-                buf.append(tok)
-                if done:
-                    break
-            raw = re.sub(r"^```tool_code\s*|\s*```$", "", "".join(buf),
-                         flags=re.DOTALL).strip().strip("`")
-            code = Tools.parse_tool_call(raw)
-            if not code or code.upper()=="NO_TOOL":
+            try:
+                for tok, done in self._stream_tool(tc):
+                    buf.append(tok)
+                    if done:
+                        break
+            except Exception as e:
+                log_message(f"Tool‐streaming failed: {e}", "ERROR")
                 break
-            m = re.match(r"\s*([A-Za-z_]\w*)\s*\(", code)
-            fn = m.group(1) if m else None
-            if not fn or fn in invoked:
+
+            raw = re.sub(r"^```tool_code\s*|\s*```$", "", "".join(buf), flags=re.DOTALL).strip()
+            code = Tools.parse_tool_call(raw)
+            if not code or code.upper() == "NO_TOOL":
+                break
+
+            fn = code.split("(")[0]
+            if fn in invoked:
                 break
             invoked.add(fn)
-            log_message(f"Invoking: {code}", "INFO")
-            out = self.run_tool(code)
-            log_message(f"{fn} → {out!r}", "INFO")
 
-            # summarize
+            log_message(f"Invoking via tool_chaining: {code}", "INFO")
+            try:
+                out = self.run_tool(code)
+            except Exception as e:
+                log_message(f"run_tool error on {code}: {e}", "ERROR")
+                break
+
+            # summarize that output
             summary = None
             try:
                 data = json.loads(out)
-                if fn in ("search_internet","brave_search"):
+                if fn in ("search_internet", "brave_search"):
                     lines = [f"- {r.get('title','')} ({r.get('url','')})"
-                             for r in data["web"]["results"][:3]]
+                            for r in data["web"]["results"][:3]]
                     summary = "Top results:\n" + "\n".join(lines)
-                elif fn=="get_current_location":
+                elif fn == "get_current_location":
                     summary = f"Location: {data.get('city')}, {data.get('regionName')}"
             except:
                 pass
             if summary is None:
-                summary = f"{fn} result: {out}"
+                summary = f"{fn} → {out}"
             summaries.append(summary)
             tc += "\n" + summary
 
-        ctx["tool_summaries"] = summaries
-        ctx["ctx_txt"] += "\n" + "\n\n".join(summaries)
+        if summaries:
+            ctx["tool_summaries"] = summaries
+            ctx["ctx_txt"] += "\n" + "\n\n".join(summaries)
         return None
+    # ────────────────────────────────────────────────
+
 
     # ------------------------------
     # Stage 9: assemble_prompt
