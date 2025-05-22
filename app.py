@@ -2809,46 +2809,62 @@ class ChatManager:
 
     def _stage_flow_health_check(self, ctx):
         """
-        At the very end, compute a simple health‐score for this run
-        (1 – recent_failure_ratio), log it, and—if it’s low—
-        ask the LLM for suggestions on how to reorder or tweak stages.
+        After notification_audit, compute a simple health‐score (1 − recent_failure_ratio),
+        log it, and—if it’s below 0.8—ask the secondary LLM for a recommended new stage list
+        (as a Python list).  If valid, persist via Tools.update_agent_stack.
         """
-        # how many of the last 10 runs failed anywhere?
+        # 1) Measure recent failures
         failure_ratio = self.observer.recent_failure_ratio(n=10)
         score = 1.0 - failure_ratio
-        suggestions = []
+        log_message(f"[Watchdog] run score={score:.2f}", "INFO")
 
-        # if score is below 0.8, ask for improvements
+        suggestions = []
+        # 2) If health poor, solicit LLM advice
         if score < 0.8:
             prompt = (
                 f"Our last pipeline run scored {score:.2f}/1.00 (lower is worse).\n"
                 f"Here’s the context‐analysis + tool outputs + critique:\n{ctx.ctx_txt}\n\n"
-                "Which changes to our stage list (by name) would you recommend to "
-                "produce more reliable answers?  Reply with a Python list of stage names."
+                "Which ordering of our full stage list (by exact stage names) would you "
+                "recommend to improve reliability?  Reply *exactly* with a Python list "
+                "of stage names, in the new desired order."
             )
-            raw = chat(
+            resp = chat(
                 model=self.config_manager.config["secondary_model"],
-                messages=[{"role":"system","content":"You are a pipeline‐health advisor."},
-                          {"role":"user","content":prompt}],
+                messages=[
+                    {"role":"system","content":"You are a pipeline‐health adviser."},
+                    {"role":"user","content":prompt}
+                ],
                 stream=False
             )["message"]["content"].strip()
 
+            # 3) Parse the LLM’s proposed list
             try:
                 import ast
-                suggestions = ast.literal_eval(raw)
-                if not isinstance(suggestions, list):
-                    suggestions = []
-            except Exception:
-                suggestions = []
+                cand = ast.literal_eval(resp)
+                if isinstance(cand, list) and all(isinstance(n, str) for n in cand):
+                    suggestions = cand
+                else:
+                    log_message("[Watchdog] ignored non-list suggestion", "WARNING")
+            except Exception as e:
+                log_message(f"[Watchdog] suggestion parse failed: {e}", "WARNING")
 
-        log_message(f"[Watchdog] run score={score:.2f}, suggestions={suggestions}", "INFO")
-
+        # 4) If we got a non-empty valid suggestion, persist it
         if suggestions:
-            ctx.ctx_txt += f"\n[Watchdog suggestions]: {suggestions}"
+            # Filter out any unknown stage names
+            current = Tools.load_agent_stack().get("stages", [])
+            valid = [s for s in suggestions if s in current]
+            if valid:
+                try:
+                    Tools.update_agent_stack({"stages": valid})
+                    log_message(f"[Watchdog] agent_stack.json updated to: {valid}", "INFO")
+                    ctx.ctx_txt += f"\n[Watchdog] Updated pipeline stages to: {valid}"
+                except Exception as e:
+                    log_message(f"[Watchdog] failed to update agent stack: {e}", "ERROR")
+            else:
+                log_message("[Watchdog] no valid overlap between suggestion and existing stages", "WARNING")
 
-        # we don’t automatically re-run here—you can inspect `suggestions`
-        # and feed them back into your next `new_request(...)` if you like.
         return None
+
     
     def _activate_context(self, name: str, history_mgr=None, tts_mgr=None):
         if name not in self.contexts:
@@ -3528,18 +3544,18 @@ class ChatManager:
         
     def _idle_monitor(self):
         """
-        Runs in the background. Logs a countdown every few seconds,
-        and if no new_request() happens for self.idle_interval seconds,
-        triggers an internal “mull over tasks” request.
+        Runs in the background. Every `self.idle_interval` seconds of silence,
+        builds a dynamic “idle prompt” from the last few actions/context and
+        triggers an internal new_request(...) to re-engage.
         """
         from datetime import datetime
         import time
 
         while not self._idle_stop.is_set():
-            interval = self.idle_interval
             start_ts = time.time()
+            interval = self.idle_interval
 
-            # countdown loop
+            # countdown loop (print every up to 10s)
             while not self._idle_stop.is_set():
                 elapsed = time.time() - start_ts
                 remaining = interval - elapsed
@@ -3547,7 +3563,6 @@ class ChatManager:
                     break
                 mins, secs = divmod(int(remaining), 60)
                 print(f"[Idle Monitor] Next idle check in {mins}m {secs}s…", flush=True)
-                # sleep in shorter chunks so we can update the countdown
                 time.sleep(min(remaining, 10))
 
             if self._idle_stop.is_set():
@@ -3555,30 +3570,37 @@ class ChatManager:
 
             idle_secs = (datetime.now() - self.last_interaction).total_seconds()
             if idle_secs >= interval:
-                # we've been idle long enough
+                # idle triggered → build dynamic message from recent context
+                ctx = self.current_ctx
+                # take the last 200 chars of ctx_txt for brevity
+                recent = (ctx.ctx_txt or "").replace("\n", " ")
+                recent_snip = (recent[-200:] + "...") if len(recent) > 200 else recent
+                prompt = (
+                    f"I've been idle for {int(idle_secs)} seconds. "
+                    f"Recent context: {recent_snip} "
+                    "What would you like me to do next?"
+                )
                 log_message(f"No user input for {int(idle_secs)}s — auto-mulling over tasks", "INFO")
                 print(f"[Idle Monitor] Idle detected ({int(idle_secs)}s) — self-prompting", flush=True)
-                # fire off an internal, silent request
+                # fire off an internal, silent request using that dynamic prompt
                 self.new_request(
-                    "I haven't heard from you in a while—what should I work on next?",
+                    prompt,
                     sender_role="assistant",
                     skip_tts=True
                 )
             else:
-                # user came back before timeout
+                # user returned before timeout
                 log_message("Idle monitor: activity detected—resetting countdown", "DEBUG")
                 print(f"[Idle Monitor] Activity detected ({int(idle_secs)}s idle) — countdown reset", flush=True)
 
         log_message("Idle monitor thread exiting.", "DEBUG")
 
 
-    # -------------------------------------------------------------------
-    # 3) The idle‐mull loop
-    # -------------------------------------------------------------------
     def _start_idle_mull(self):
         """
-        Background thread: after a random idle interval, if no user input arrived,
-        schedule a new_request(...) on the executor to “mull over pending tasks.”
+        Background thread: after a random idle interval between idle_min/idle_max,
+        if still silent, schedule a new_request(...) that pulls in latest context
+        similarly to _idle_monitor, but on a randomized cadence.
         """
         import threading, random, time
         from datetime import datetime
@@ -3590,14 +3612,22 @@ class ChatManager:
             while not stop_evt.is_set():
                 interval = random.uniform(self.idle_min, self.idle_max)
                 time.sleep(interval)
-                # if still idle, schedule a mull
                 idle_time = (datetime.now() - self.last_interaction).total_seconds()
                 if idle_time >= interval:
-                    log_message("Idle detected: scheduling background mull", "INFO")
+                    log_message("Random idle detected: scheduling background mull", "INFO")
+                    # build a dynamic prompt as above
+                    ctx = self.current_ctx
+                    recent = (ctx.ctx_txt or "").replace("\n", " ")
+                    snip = (recent[-200:] + "...") if len(recent) > 200 else recent
+                    prompt = (
+                        f"It's been {int(idle_time)}s since the last command. "
+                        f"Recent context: {snip} "
+                        "Anything you’d like me to pick up on?"
+                    )
                     # skip TTS so it doesn’t speak to an empty room
                     self._executor.submit(
                         self.new_request,
-                        "Please review pending tasks and decide what to do next.",
+                        prompt,
                         sender_role="assistant",
                         skip_tts=True
                     )
@@ -3606,16 +3636,18 @@ class ChatManager:
         thread.start()
         self._idle_thread = thread
 
-    # -------------------------------------------------------------------
-    # 4) Optional: stop the idle‐mull if you ever shut down
-    # -------------------------------------------------------------------
+
     def stop_idle_mull(self):
         """
-        Stop the background idle‐mull loop.
+        Stop the background idle‐mull loop and idle monitor.
         """
         if hasattr(self, "_idle_stop_event"):
             self._idle_stop_event.set()
             log_message("Idle mull loop stopped.", "INFO")
+        if hasattr(self, "_idle_stop"):
+            self._idle_stop.set()
+            log_message("Idle monitor stopped.", "INFO")
+
     # ----------------------------------------
     # NEW: Chain-of-Thought Agent
     # ----------------------------------------
@@ -3755,19 +3787,54 @@ class ChatManager:
         return payload
 
     def chat_completion_stream(self, processed_text):
+        """
+        Stream the primary‐model’s response to `processed_text` as a new user message.
+        Ensures the model sees a fresh user turn rather than two assistant turns in a row.
+        """
         log_message("Primary-model stream starting...", "DEBUG")
-        payload = self.build_payload(None, model_key="primary_model")
+
+        # 1) Build override messages so the LLM sees processed_text as a user turn
+        cfg = self.config_manager.config
+        sys_msg = {"role": "system", "content": cfg.get("system", "")}
+
+        # Optional: include a memory/context message if you use that pattern
+        mem_content = ""  # or pull from your memory manager
+        mem_msg = {"role": "system", "content": f"Memory Context:\n{mem_content}\n\n"} if mem_content else None
+
+        # 2) Stitch together:
+        override = [sys_msg]
+        if mem_msg:
+            override.append(mem_msg)
+        # add the full chat history so far
+        override.extend(self.history_manager.history)
+        # finally, our new “user” turn
+        override.append({"role": "user", "content": processed_text})
+
+        # 3) Build the payload with our override_messages
+        payload = self.build_payload(
+            override_messages=override,
+            model_key="primary_model"
+        )
+
+        # 4) Kick off streaming
         print("⟳ Reply: ", end="", flush=True)
-        for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
+        for part in chat(
+            model=payload["model"],
+            messages=payload["messages"],
+            stream=True
+        ):
             if self.stop_flag:
                 log_message("Primary-model stream aborted.", "WARNING")
                 yield "", True
                 return
+
             tok = part["message"]["content"]
             print(tok, end="", flush=True)
             yield tok, part.get("done", False)
+
         print()
         log_message("Primary-model stream finished.", "DEBUG")
+
 
     def chat_completion_nonstream(self, processed_text):
         log_message("Primary-model non-stream starting...", "DEBUG")
@@ -4631,7 +4698,7 @@ class ChatManager:
             assembled += "\n```tool_output\n" + "\n\n".join(ctx["tool_summaries"]) + "\n```"
         assembled += "\n" + ctx["user_message"]
         # record & embed
-        self.history_manager.add_entry("assistant", assembled)
+        self.history_manager.add_entry("user", assembled)
         _ = Utils.embed_text(assembled)
         log_message(f"Final prompt prepared", "DEBUG")
         ctx["assembled"] = assembled
