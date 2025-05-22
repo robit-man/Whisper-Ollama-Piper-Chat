@@ -2241,71 +2241,103 @@ class Tools:
             raise RuntimeError(f"Error reading battery voltage: {e}")
     
 
+    # ───────────────────────────  WEB SEARCH HELPERS  ─────────────────────────
     @staticmethod
-    def search_internet(topic):
+    def search_internet(topic: str) -> str:
+        """
+        Search the web.
+
+        1. If BRAVE_API_KEY is set → use Brave Search API.
+        2. Otherwise *or* upon any error → fall back to Tools.ddg_search().
+        3. Always return **JSON text** shaped as:
+           { "engine": "brave" | "duckduckgo",
+             "data":   <raw-Brave-JSON or list-of-DDG-dicts> }
+        """
+        import json, os, requests, traceback
+
         api_key = os.environ.get("BRAVE_API_KEY", "")
-        if not api_key:
-            log_message("BRAVE_API_KEY not set for brave search.", "ERROR")
-            return "Error: BRAVE_API_KEY not set."
         endpoint = "https://api.search.brave.com/res/v1/web/search"
-        headers = {
+        headers  = {
             "Accept": "application/json",
             "Accept-Encoding": "gzip",
             "x-subscription-token": api_key
         }
-        params = {"q": topic, "count": 3}
+        params   = {"q": topic, "count": 10}
+
+        # ── 1️⃣  Brave Search if possible ───────────────────────────────────
+        if api_key:
+            try:
+                log_message(f"Performing Brave search for topic: {topic}", "PROCESS")
+                resp = requests.get(endpoint, headers=headers, params=params, timeout=5)
+                if resp.status_code == 200:
+                    log_message("Brave search successful.", "SUCCESS")
+                    return json.dumps({"engine": "brave", "data": resp.json()})
+                else:
+                    log_message(f"Brave search error {resp.status_code}", "ERROR")
+            except Exception as e:
+                log_message(f"Brave search exception: {e}\n{traceback.format_exc()}", "ERROR")
+
+        # ── 2️⃣  Fallback → DuckDuckGo via Selenium helper ───────────────────
+        log_message("Falling back to DuckDuckGo search.", "WARNING")
         try:
-            import requests
-            log_message(f"Performing brave search for topic: {topic}", "PROCESS")
-            response = requests.get(endpoint, headers=headers, params=params, timeout=5)
-            if response.status_code == 200:
-                log_message("Brave search successful.", "SUCCESS")
-                return response.text
-            else:
-                log_message(f"Error in brave search: {response.status_code}", "ERROR")
-                return f"Error {response.status_code}: {response.text}"
+            ddg_results = Tools.ddg_search(topic, num_results=10, deep_scrape=False)
+            return json.dumps({"engine": "duckduckgo", "data": ddg_results})
         except Exception as e:
-            log_message("Error in brave search: " + str(e), "ERROR")
-            return f"Error: {e}"
-        
+            log_message(f"DuckDuckGo fallback failed: {e}", "ERROR")
+            return json.dumps({"engine": "error", "data": str(e)})
+
+    # ───────────────────────────  SEARCH → SUMMARY  ───────────────────────────
     @staticmethod
     def summarize_search(topic: str, top_n: int = 3) -> str:
         """
-        1) Search Brave for `topic`
-        2) Take the top_n web results
-        3) Scrape each URL
-        4) Summarize each page with the secondary agent
-        Returns a bullet-list summary.
+        1) Call search_internet() – Brave when available, DDG otherwise.
+        2) Take the first `top_n` results.
+        3) Scrape each URL with bs4_scrape().
+        4) Ask secondary_agent_tool() for a 2-3 sentence summary.
+        5) Return a neat bullet-list.
         """
+        import json, traceback
 
         try:
             raw = Tools.search_internet(topic)
-            data = json.loads(raw)
-            web_results = data.get("web", {}).get("results", [])[:top_n]
+            payload = json.loads(raw or "{}")
+            engine  = payload.get("engine")
+            data    = payload.get("data", {})
         except Exception as e:
             return f"Error parsing search results: {e}"
 
+        # ── normalise to a list of results with .url / .title ──────────────
+        if engine == "brave":
+            web_results = data.get("web", {}).get("results", [])[:top_n]
+        elif engine == "duckduckgo":
+            web_results = data[:top_n] if isinstance(data, list) else []
+        else:  # some error earlier
+            return f"No results – engine reported '{engine}'."
+
         summaries = []
         for idx, r in enumerate(web_results, start=1):
-            url   = r.get("url")
-            title = r.get("title", url)
+            url   = r.get("url") or r.get("url", "")
+            title = r.get("title") or r.get("title", url)
+            if not url:
+                continue
             try:
-                html = Tools.bs4_scrape(url)
-                # take only the first 2000 characters to stay under token limits
-                snippet = html[:2000].replace("\n"," ")  
-                prompt = (
+                html_doc = Tools.bs4_scrape(url)
+                snippet  = html_doc[:2000].replace("\n", " ") if isinstance(html_doc, str) else ""
+                prompt   = (
                     f"Here is the beginning of the page at {url}:\n\n"
                     f"{snippet}\n\n"
                     "Please give me a 2-3 sentence summary of the key points."
                 )
                 summary = Tools.secondary_agent_tool(prompt, temperature=0.3)
-            except Exception:
-                summary = "Failed to scrape or summarize that page."
+            except Exception as ex:
+                log_message(f"Summarisation failed for {url}: {ex}", "ERROR")
+                summary = "Failed to scrape or summarise that page."
             summaries.append(f"{idx}. {title} — {summary.strip()}")
 
         if not summaries:
             return "No web results found."
         return "\n".join(summaries)
+
 
     @staticmethod
     def bs4_scrape(url):
