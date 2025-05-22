@@ -1517,18 +1517,26 @@ class Tools:
     @staticmethod
     def _find_system_chromedriver() -> str | None:
         """
-        Return the first executable chromedriver we can find on the box, or None.
+        Return the first executable chromedriver we can locate, or None.
+        Covers Debian/Ubuntu paths, snap installs, Home-brew, PATH, etc.
         """
         candidates = [
-            shutil.which("chromedriver"),
+            shutil.which("chromedriver"),                         # PATH
             "/usr/bin/chromedriver",
-            "/snap/bin/chromium.chromedriver",
-            "/opt/homebrew/bin/chromedriver",         # mac-arm (brew)
             "/usr/local/bin/chromedriver",
+            "/snap/bin/chromium.chromedriver",
+            "/usr/lib/chromium-browser/chromedriver",
+            "/opt/homebrew/bin/chromedriver",                    # macOS arm64
         ]
-        for p in candidates:
-            if p and os.path.isfile(p) and os.access(p, os.X_OK):
-                return p
+        for path in candidates:
+            if path and os.path.isfile(path):
+                try:
+                    # make sure it’s actually executable *by us*
+                    st = os.stat(path)
+                    if st.st_mode & stat.S_IXUSR:
+                        return path
+                except Exception:
+                    continue
         return None
     
     # ── internal helpers ──────────────────────────────────────────────
@@ -1545,7 +1553,6 @@ class Tools:
         Return the first WebElement present+enabled out of a list of CSS selectors.
         Returns None if none arrive within `timeout`.
         """
-        end = WebDriverWait(drv, timeout)._timeout + 0  # absolute end time
         for sel in selectors:
             try:
                 return WebDriverWait(drv, timeout).until(
@@ -1567,6 +1574,7 @@ class Tools:
         return _cond
 
     # ── session bootstrap ────────────────────────────────────────────
+    @staticmethod
     def open_browser(headless: bool = False, force_new: bool = False) -> str:
         """
         Launch Chrome/Chromium on x86-64 **and** ARM.
@@ -1703,7 +1711,6 @@ class Tools:
             log_message(f"[input] Error typing into {selector}: {e}", "ERROR")
             return f"Error typing into {selector}: {e}"
 
-
     @staticmethod
     def get_html() -> str:
         if not Tools._driver:
@@ -1726,120 +1733,125 @@ class Tools:
         deep_scrape: bool = True,
     ) -> list:
         """
-        Perform a DuckDuckGo search *event-driven* (no fixed sleeps).
-        If results don’t appear within `wait_sec`, we still harvest any
-        HTML currently in the DOM so run_tool never explodes.
+        Ultra-quick DuckDuckGo search.
+        • No fixed sleeps – everything is event-driven.
+        • If results aren’t ready within `wait_sec` we still harvest whatever
+          is in the DOM so run_tool never crashes.
+        • Opens top N results in new tabs and extracts each page’s summary.
         """
         import html, traceback
         from bs4 import BeautifulSoup
+        from selenium.common.exceptions import TimeoutException
 
         log_message(f"[ddg_search] ▶ {topic!r}", "INFO")
 
+        # fresh browser session
         Tools.close_browser()
-        Tools.open_browser(headless=False)
+        Tools.open_browser(headless=False, force_new=True)
         drv = Tools._driver
-        wait = WebDriverWait(drv, wait_sec)
+        wait = WebDriverWait(drv, wait_sec, poll_frequency=0.2)
+
+        html_source = ""
+        result_records = []
 
         try:
-            # 1) Home page
+            # 1) Load homepage
             drv.get("https://duckduckgo.com/")
             wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-            log_message("[ddg_search] DuckDuckGo loaded.", "DEBUG")
+            log_message("[ddg_search] Home DOM ready.", "DEBUG")
 
-            # Cookie / GDPR banner
+            # 1b) Dismiss cookies if shown
             try:
-                wait.until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"))
-                ).click()
+                btn = wait.until(EC.element_to_be_clickable(
+                    (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler")
+                ))
+                btn.click()
                 log_message("[ddg_search] Cookie banner dismissed.", "DEBUG")
             except TimeoutException:
-                pass  # banner not shown
+                pass
 
-            # 2) Search box
+            # 2) Locate search box
             selectors = [
                 "input#search_form_input_homepage",
                 "input#searchbox_input",
                 "input[name='q']",
             ]
-            box = None
-            for sel in selectors:
-                try:
-                    box = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
-                    break
-                except TimeoutException:
-                    continue
+            box = Tools._first_present(drv, selectors, timeout=wait_sec/3)
             if not box:
                 raise RuntimeError("Search box not found on DuckDuckGo!")
 
-            # 3) Submit query
-            ActionChains(drv).move_to_element(box).click(box).send_keys(topic, Keys.ENTER).perform()
+            # 3) Type & submit
+            try:
+                ActionChains(drv).move_to_element(box).click(box)\
+                                .send_keys(topic, Keys.ENTER).perform()
+            except Exception:
+                # fallback JS form submit
+                drv.execute_script(
+                    "const q=arguments[0];"
+                    "const inp=document.querySelector('input[name=\"q\"]');"
+                    "if(inp){inp.value=q; inp.form && inp.form.submit();}",
+                    topic
+                )
             log_message("[ddg_search] Query submitted.", "DEBUG")
 
-            # Wait for navigation and (ideally) at least one result node
+            # 4) Wait for results container or timeout
             try:
                 wait.until(lambda d: "?q=" in d.current_url)
-                wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, "#links .result"))
+                wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, "#links .result, #links [data-nr]"))
                 log_message("[ddg_search] Results detected.", "DEBUG")
             except TimeoutException:
-                log_message("[ddg_search] Timed-out waiting for results; parsing whatever is present.", "WARNING")
+                log_message("[ddg_search] Timeout waiting for results – parsing partial DOM.", "WARNING")
 
-            html_source = drv.page_source  # grab before we close the browser
+            # 5) Parse results on first tab
+            soup = BeautifulSoup(drv.page_source, "html5lib")
+            entries = soup.select("#links .result") or soup.select('#links [data-nr]')
+            top_entries = entries[:num_results]
+
+            # 6) Open each in new tab, extract summary, close tab
+            main_handle = drv.current_window_handle
+            for ent in top_entries:
+                a = ent.select_one("a.result__a") or ent.select_one("a[data-testid='result-title-a']")
+                if not a or not a.get("href"):
+                    continue
+                href = a["href"]
+                title = html.unescape(a.get_text(strip=True))
+                snippet = ent.select_one(".result__snippet") or ent.select_one("span[data-testid='result-snippet']")
+                snippet_text = snippet.get_text(strip=True) if snippet else ""
+                summary = snippet_text
+
+                # open new tab
+                drv.execute_script("window.open(arguments[0], '_blank');", href)
+                drv.switch_to.window(drv.window_handles[-1])
+                # wait page load
+                Tools._wait_for_ready(drv, timeout=wait_sec/2)
+                page_soup = BeautifulSoup(drv.page_source, "html5lib")
+                meta = page_soup.find("meta", attrs={"name": "description"})
+                if meta and meta.get("content"):
+                    summary = meta["content"].strip()
+                else:
+                    p_tag = page_soup.find("p")
+                    if p_tag:
+                        summary = p_tag.get_text(strip=True)
+                # close tab
+                drv.close()
+                drv.switch_to.window(main_handle)
+
+                result_records.append({
+                    "title":   title,
+                    "url":     href,
+                    "snippet": snippet_text,
+                    "summary": summary,
+                })
+
+            html_source = drv.page_source
 
         except Exception as e:
-            html_source = drv.page_source
-            log_message(f"[ddg_search] Fatal error: {e}\n{traceback.format_exc()}", "ERROR")
-
+            log_message(f"[ddg_search] Error: {e}\n{traceback.format_exc()}", "ERROR")
         finally:
             Tools.close_browser()
 
-        # 4) Parse results (even if partial)
-        soup = BeautifulSoup(html_source, "html5lib")
-        entries = soup.select("#links .result")
-        if not entries:
-            # fallback selector for new DDG layout
-            entries = soup.select('#links [data-nr]')
-        results = []
-
-        for ent in entries[: num_results * 2]:  # over-fetch then trim blanks
-            a_tag = ent.select_one("a.result__a") or ent.select_one("a[data-testid='result-title-a']")
-            snip = ent.select_one(".result__snippet") or ent.select_one("span[data-testid='result-snippet']")
-            if not a_tag or not snip:
-                continue
-            title = html.unescape(a_tag.get_text(strip=True))
-            href = a_tag.get("href")
-            snippet = snip.get_text(strip=True)
-            summary = snippet
-
-            # optional deep scrape with graceful failure
-            if deep_scrape:
-                try:
-                    page_html = Tools.bs4_scrape(href)
-                    if not page_html.startswith("Error"):
-                        pg = BeautifulSoup(page_html, "html5lib")
-                        meta = pg.find("meta", {"name": "description"})
-                        if meta and meta.get("content"):
-                            summary = meta["content"].strip()
-                        else:
-                            p_tag = pg.find("p")
-                            if p_tag:
-                                summary = p_tag.get_text(strip=True)
-                except Exception as ex:
-                    log_message(f"[ddg_search] Deep-scrape failed for {href}: {ex}", "WARNING")
-
-            results.append(
-                {
-                    "title": title,
-                    "url": href,
-                    "snippet": snippet,
-                    "summary": summary,
-                }
-            )
-            if len(results) >= num_results:
-                break
-
-        log_message(f"[ddg_search] Collected {len(results)} results.", "SUCCESS")
-        return results
-
+        log_message(f"[ddg_search] Collected {len(result_records)} results.", "SUCCESS")
+        return result_records
 
     # ────────────────────────────────────────────────────────────────
     #  selenium_extract_summary  (robust version)
@@ -1850,50 +1862,42 @@ class Tools:
         Fast two-stage page summariser:
 
         1. Try a lightweight `Tools.bs4_scrape()` (no browser).
-        • If it yields HTML, grab <meta name="description"> or first <p>.
-        2. If bs4-scrape fails or returns an error string, fall back to a
-        *headless* Chrome session launched via Tools.open_browser().
-        • Uses the same resilient driver logic you just added.
+           If it yields HTML, grab <meta name="description"> or first <p>.
+        2. If bs4-scrape fails, fall back to *headless* Selenium.
+           Uses same driver logic.
         3. Always cleans up the browser session.
-
-        Returns a short plain-text summary (may be empty string).
         """
         from bs4 import BeautifulSoup
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
 
-        # ── 1 ▸ quick request-based scrape ───────────────────────────
+        # 1) quick request-based scrape
         html_doc = Tools.bs4_scrape(url)
-        if html_doc and not html_doc.startswith("Error during scraping"):
-            soup = BeautifulSoup(html_doc, "html5lib")
-            meta = soup.find("meta", attrs={"name": "description"})
-            if meta and meta.get("content"):
-                return meta["content"].strip()
-
-            p = soup.find("p")
+        if html_doc and not html_doc.startswith("Error"):
+            pg = BeautifulSoup(html_doc, "html5lib")
+            m = pg.find("meta", attrs={"name": "description"})
+            if m and m.get("content"):
+                return m["content"].strip()
+            p = pg.find("p")
             if p:
                 return p.get_text(strip=True)
 
-        # ── 2 ▸ fall back to headless Selenium ───────────────────────
+        # 2) fall back to headless Selenium
         try:
-            Tools.open_browser(headless=True)        # reuses your robust helper
-            drv   = Tools._driver
-            wait  = WebDriverWait(drv, wait_sec)
-
+            Tools.open_browser(headless=True)
+            drv = Tools._driver
+            wait = WebDriverWait(drv, wait_sec)
             drv.get(url)
             wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-
-            soup2 = BeautifulSoup(drv.page_source, "html5lib")
-            meta2 = soup2.find("meta", attrs={"name": "description"})
-            if meta2 and meta2.get("content"):
-                return meta2["content"].strip()
-
-            p2 = soup2.find("p")
+            pg2 = BeautifulSoup(drv.page_source, "html5lib")
+            m2 = pg2.find("meta", attrs={"name": "description"})
+            if m2 and m2.get("content"):
+                return m2["content"].strip()
+            p2 = pg2.find("p")
             if p2:
                 return p2.get_text(strip=True)
-
-            return ""   # nothing useful found
+            return ""
         finally:
             Tools.close_browser()
 
@@ -1910,14 +1914,13 @@ class Tools:
             entries = Tools.ddg_search(topic, num_results=top_n, deep_scrape=deep)
         except Exception as e:
             return f"Search error: {e}"
-
         if not entries:
             return "No results found."
-
         return "\n".join(
             f"{i}. {e['title']} — {e['summary'] or '(no summary)'}"
             for i, e in enumerate(entries, 1)
         )
+
     
     @staticmethod
     def get_chat_history(arg1=None, arg2=None) -> str:
