@@ -2608,6 +2608,7 @@ class StopStreamException(Exception):
 
 
 class WatchdogManager:
+    # ─── Replacement ───
     def __init__(self, quality_model: str, halluc_model: str = None,
                  quality_threshold: float = 7.5, halluc_threshold: float = 0.5,
                  max_retries: int = 1):
@@ -2615,13 +2616,19 @@ class WatchdogManager:
         quality_model: LLM to rate overall run quality (0–10)
         halluc_model: LLM to classify hallucination (if None, uses quality_model)
         quality_threshold: minimum acceptable run score
-        halluc_threshold: minimum hallucination probability to abort
+        halluc_threshold: minimum hallucination probability to flag
+        max_retries: how many run‐retries before giving up
         """
-        self.quality_model    = quality_model
-        self.halluc_model     = halluc_model or quality_model
+        self.quality_model     = quality_model
+        self.halluc_model      = halluc_model or quality_model
         self.quality_threshold = quality_threshold
         self.halluc_threshold  = halluc_threshold
-        self.max_retries      = max_retries
+        self.max_retries       = max_retries
+
+        # New controls to avoid flagging tiny or too‐frequent snippets:
+        self.min_snippet_tokens     = 3    # ignore snippets shorter than this
+        self.snippet_check_frequency = 2   # only check every Nth snippet
+
 
     def evaluate_run(self, ctx) -> tuple[float, list[str]]:
         """
@@ -2653,55 +2660,62 @@ class WatchdogManager:
         except Exception:
             return 0.0, []
 
+    # ─── Replacement ───
     def monitor_stream(self, stream_generator, ctx):
-        """
-        Wraps a (chunk, done) stream.  In parallel, samples each non-empty chunk,
-        dispatches a hallucination‐check LLM call, and aborts if hallucination
-        probability > self.halluc_threshold.
-        Usage:
-            for tok, done in watchdog.monitor_stream(self.chat_completion_stream(...), ctx):
-                ...
-        """
-        executor      = ThreadPoolExecutor(max_workers=2)
+        executor       = ThreadPoolExecutor(max_workers=2)
         pending_checks = []
-        recent        = deque(maxlen=5)
+        snippet_count  = 0
 
         def schedule_check(snippet):
             return executor.submit(self._detect_hallucination, snippet, ctx)
 
         try:
             for chunk, done in stream_generator:
-                # yield immediately to keep your UI/audio flowing
+                # 1) Always pass tokens through immediately
                 yield chunk, done
 
                 snippet = chunk.strip()
-                if snippet:
-                    recent.append(snippet)
-                    # schedule an async hallucination check
-                    pending_checks.append(schedule_check(snippet))
+                if not snippet:
+                    continue
 
-                # poll completed checks
+                # 2) Throttle: only check every Nth non-empty snippet
+                snippet_count += 1
+                if snippet_count % self.snippet_check_frequency != 0:
+                    continue
+
+                # 3) Ignore very short snippets (e.g. “My”, “Sorry”)
+                if len(snippet.split()) < self.min_snippet_tokens:
+                    continue
+
+                # 4) Schedule the hallucination check
+                pending_checks.append(schedule_check(snippet))
+
+                # 5) Process any completed checks
                 for f in pending_checks[:]:
                     if f.done():
                         score = f.result()
                         pending_checks.remove(f)
                         if score >= self.halluc_threshold:
                             log_message(
-                                f"[Watchdog] Hallucination detected "
-                                f"(score={score:.2f}) on snippet {snippet!r}; aborting.",
+                                f"[Watchdog] Hallucination flagged "
+                                f"(score={score:.2f}) on snippet {snippet!r}; continuing without abort.",
                                 "WARNING"
                             )
-                            raise StopStreamException()
-
+                            # note: no StopStreamException here
         finally:
-            # clean up threads
             executor.shutdown(wait=False)
 
+
+    # ─── Replacement ───
     def _detect_hallucination(self, snippet: str, ctx) -> float:
         """
         Returns a hallucination score 0–1 for this snippet, using self.halluc_model.
-        Higher means more likely hallucinated.
+        We skip very short or trivial snippets entirely.
         """
+        # 1) Skip trivial snippets
+        if len(snippet.split()) < self.min_snippet_tokens:
+            return 0.0
+
         system = (
             "You are a Hallucination Detector.  Given a short snippet of output and "
             "the conversation context, rate how likely it is that this snippet is "
@@ -2720,11 +2734,11 @@ class WatchdogManager:
             stream=False
         )["message"]["content"].strip()
         try:
-            # parse out the float
             return float(resp)
         except:
-            # on parse failure, be conservative: assume low hallucination
+            # on parse failure, assume no hallucination
             return 0.0
+
 
 class PromptEvaluator:
     """
