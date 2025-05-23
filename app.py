@@ -201,7 +201,7 @@ def load_config():
         "raw": False,
         "images": None,        # Now support passing images to the primary model
         "options": {},
-        "system": "You will receive a user message which may include tool_output. Respond only with the final answer—no context_analysis block, no apologies or filler, no meta commentary.",
+        "system": "You are the Primary Controller in a modular, tool-enabled agent pipeline. You have at your disposal a set of discrete stages (context_analysis, intent_clarification, external_knowledge_retrieval, planning_summary, tool_chaining, assemble_prompt, final_inference, chain_of_thought, flow_health_check, etc.) and a rich toolkit (web search, file operations, screen/webcam capture, subtask management, chat history queries, etc.).\n- **Be aggressively curious**: constantly probe for missing information, but always **self-clarify** internally first before asking the user.\n- **Streamline data flow**: each stage consumes exactly its predecessor’s output (via ctx.stage_outputs) and must explicitly pass along what downstream stages will need.\n- **Dynamically assemble and reorder** stages on every turn based on the user’s intent, dependencies, and watchdog feedback.\n- **Health-check every run** (flow_health_check): compute a reliability score, log it, and if it dips below your threshold, propose concrete adjustments to the stage list as a Python list of stage names.\n- **Chain-of-thought**: after each response, append a concise 2–3 sentence reflection explaining how you arrived at your answer.\n- **Idle mull**: when you’ve been idle, generate a context-aware “what should I work on next?” internally, summarize your pending tasks, and only speak if truly necessary.\n- **Tool accountability**: when you call a tool—especially file writes or searches—confirm in your final_response that the operation succeeded and follow through end-to-end.\n- **Never get stuck in loops**: if you detect recursion or repetition, immediately propose stack tweaks (“run external_knowledge earlier”, “merge html_filtering+chunk_and_summarize”, etc.) and test them.\n- **Learn and evolve**: search online, use your tools, and keep optimizing your own pipeline—upgrade, test, and repeat without stopping.\nYour sole focus is to use these instruments to deliver the most accurate, context-rich, and self-improving assistance possible. Respond only with your reasoning and final answer—no filler, no apologies, just action and insight.",
         "conversation_id": "default_convo",
         "rms_threshold": 0.01,
         "tts_volume": 0.5,  # Volume for TTS playback
@@ -253,6 +253,9 @@ import sounddevice as sd                       # audio playback / capture
 from scipy.io.wavfile import write
 from scipy.signal import butter, lfilter       # EQ enhancement
 import numpy as np
+
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import whisper
 from ollama import chat, embed
@@ -1380,6 +1383,20 @@ class Tools:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
+    @staticmethod
+    def list_files(path: str = WORKSPACE_DIR, pattern: str = "*") -> list:
+        """Alias for find_files(pattern, path)."""
+        return Tools.find_files(pattern, path)
+
+    @staticmethod
+    def read_files(path: str, *filenames: str) -> dict:
+        """
+        Read multiple files under `path` and return a dict { filename: content }.
+        """
+        out = {}
+        for fn in filenames:
+            out[fn] = Tools.read_file(fn, path)
+        return out
 
     @staticmethod
     def read_file(filepath: str, base_dir: str | None = None) -> str:
@@ -1561,18 +1578,39 @@ class Tools:
             return {"tools": [], "agents": [], "stages": []}
 
     @staticmethod
-    def update_agent_stack(changes: dict) -> str:
+    def update_agent_stack(changes: dict, justification: str | None = None) -> str:
         """
-        Merge `changes` into agent_stack.json (e.g. new stages order).
+        Merge `changes` into agent_stack.json, and if `justification` is provided,
+        append an entry to `change_history` with timestamp, changes, and justification.
         """
+        import os, json
+        from datetime import datetime
+
         module_path = os.path.dirname(os.path.abspath(__file__))
         stack_path  = os.path.join(module_path, "agent_stack.json")
+
+        # load existing stack (or discover a fresh one)
         config = Tools.load_agent_stack()
+
+        # apply the user‐requested changes
         config.update(changes)
-        config["updated"] = datetime.now().isoformat()
+        now = datetime.now().isoformat()
+        config["updated"] = now
+
+        # record a change_history entry
+        if justification:
+            entry = {
+                "timestamp":     now,
+                "changes":       changes,
+                "justification": justification
+            }
+            config.setdefault("change_history", []).append(entry)
+
+        # write back to disk
         with open(stack_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
-        return f"agent_stack.json updated."
+
+        return "agent_stack.json updated."
     
     from selenium.common.exceptions import WebDriverException
     from selenium.webdriver.chrome.service import Service
@@ -2539,43 +2577,130 @@ class Tools:
             log_message(f"Error in secondary agent tool: {e}", "ERROR")
             return f"Error in secondary agent: {e}"
 
+
+class StopStreamException(Exception):
+    """Raised to abort a runaway or hallucinating stream."""
+    pass
+
+
 class WatchdogManager:
-    def __init__(self, model: str, threshold: float = 7.5, max_retries: int = 1):
-        self.model      = model
-        self.threshold  = threshold
-        self.max_retries = max_retries
+    def __init__(self, quality_model: str, halluc_model: str = None,
+                 quality_threshold: float = 7.5, halluc_threshold: float = 0.5,
+                 max_retries: int = 1):
+        """
+        quality_model: LLM to rate overall run quality (0–10)
+        halluc_model: LLM to classify hallucination (if None, uses quality_model)
+        quality_threshold: minimum acceptable run score
+        halluc_threshold: minimum hallucination probability to abort
+        """
+        self.quality_model    = quality_model
+        self.halluc_model     = halluc_model or quality_model
+        self.quality_threshold = quality_threshold
+        self.halluc_threshold  = halluc_threshold
+        self.max_retries      = max_retries
 
     def evaluate_run(self, ctx) -> tuple[float, list[str]]:
         """
-        Returns (score, list_of_suggested_stage_list_modifications).
+        After the full pipeline, returns (score, suggestions).
         """
-        # Build a concise report of what happened
         report = {
-            "stages":          ctx.stage_counts,
-            "ctx_txt":         ctx.ctx_txt[:2000],   # truncate if needed
-            "final_response":  ctx.final_response
+            "stages":         ctx.stage_counts,
+            "ctx_txt":        ctx.ctx_txt[:2000],
+            "final_response": ctx.final_response
         }
         system = (
-            "You are a Pipeline Watchdog.  Given a JSON report of a pipeline run (which stages ran, their counts, "
-            "the accumulated ctx_txt, and the final_response),\n"
+            "You are a Pipeline Watchdog.  Given a JSON report of a pipeline run "
+            "(which stages ran, their counts, the accumulated ctx_txt, and the "
+            "final_response),\n"
             " 1) rate overall run quality 0–10 (higher is better)\n"
-            " 2) if below threshold, propose 1–3 concrete adjustments to the stage list or parameters\n"
+            " 2) if below threshold, propose 1–3 concrete adjustments to the stage list\n"
             "Output a JSON object: {\"score\": <float>, \"suggestions\": [<string>,…]}."
         )
-        user = f"Here is the run report:\n\n```json\n{json.dumps(report,indent=2)}\n```"
+        user = f"Here is the run report:\n\n```json\n{json.dumps(report, indent=2)}\n```"
         resp = chat(
-            model=self.model,
-            messages=[
-                {"role":"system","content":system},
-                {"role":"user","content":user}
-            ],
+            model=self.quality_model,
+            messages=[{"role":"system","content":system},
+                      {"role":"user","content":user}],
             stream=False
         )["message"]["content"]
         try:
             out = json.loads(resp)
-            return float(out.get("score",0)), out.get("suggestions",[])
-        except:
+            return float(out.get("score", 0.0)), out.get("suggestions", [])
+        except Exception:
             return 0.0, []
+
+    def monitor_stream(self, stream_generator, ctx):
+        """
+        Wraps a (chunk, done) stream.  In parallel, samples each non-empty chunk,
+        dispatches a hallucination‐check LLM call, and aborts if hallucination
+        probability > self.halluc_threshold.
+        Usage:
+            for tok, done in watchdog.monitor_stream(self.chat_completion_stream(...), ctx):
+                ...
+        """
+        executor      = ThreadPoolExecutor(max_workers=2)
+        pending_checks = []
+        recent        = deque(maxlen=5)
+
+        def schedule_check(snippet):
+            return executor.submit(self._detect_hallucination, snippet, ctx)
+
+        try:
+            for chunk, done in stream_generator:
+                # yield immediately to keep your UI/audio flowing
+                yield chunk, done
+
+                snippet = chunk.strip()
+                if snippet:
+                    recent.append(snippet)
+                    # schedule an async hallucination check
+                    pending_checks.append(schedule_check(snippet))
+
+                # poll completed checks
+                for f in pending_checks[:]:
+                    if f.done():
+                        score = f.result()
+                        pending_checks.remove(f)
+                        if score >= self.halluc_threshold:
+                            log_message(
+                                f"[Watchdog] Hallucination detected "
+                                f"(score={score:.2f}) on snippet {snippet!r}; aborting.",
+                                "WARNING"
+                            )
+                            raise StopStreamException()
+
+        finally:
+            # clean up threads
+            executor.shutdown(wait=False)
+
+    def _detect_hallucination(self, snippet: str, ctx) -> float:
+        """
+        Returns a hallucination score 0–1 for this snippet, using self.halluc_model.
+        Higher means more likely hallucinated.
+        """
+        system = (
+            "You are a Hallucination Detector.  Given a short snippet of output and "
+            "the conversation context, rate how likely it is that this snippet is "
+            "fabricated or unsupported by the context, on a scale from 0.0 to 1.0."
+        )
+        user = (
+            f"Context so far:\n{ctx.ctx_txt[-1000:]}\n\n"
+            f"Snippet to evaluate:\n\"\"\"\n{snippet}\n\"\"\"\n\n"
+            "Respond with a single float between 0.0 (no hallucination) and 1.0 "
+            "(definite hallucination)."
+        )
+        resp = chat(
+            model=self.halluc_model,
+            messages=[{"role":"system","content":system},
+                      {"role":"user",  "content":user}],
+            stream=False
+        )["message"]["content"].strip()
+        try:
+            # parse out the float
+            return float(resp)
+        except:
+            # on parse failure, be conservative: assume low hallucination
+            return 0.0
 
 class PromptEvaluator:
     """
@@ -2770,8 +2895,6 @@ class ChatManager:
                 format_schema,
                 memory_manager: MemoryManager,
                 mode_manager: ModeManager):
-        from datetime import datetime
-        import threading
 
         # Core managers & tools
         self.config_manager   = config_manager
@@ -2807,12 +2930,43 @@ class ChatManager:
         log_message("ChatManager initialized with context switching and idle monitor.", "DEBUG")
 
 
+    STAGES = [
+        ("context_analysis",             "_stage_context_analysis",          None),
+        ("intent_clarification",         "_stage_intent_clarification",      "context_analysis"),
+        ("external_knowledge_retrieval", "_stage_external_knowledge_retrieval","intent_clarification"),
+        ("planning_summary",             "_stage_planning_summary",          "external_knowledge_retrieval"),
+
+        # Complex‐task fulfilment pipeline:
+        ("define_criteria",              "_stage_define_criteria",           "planning_summary"),
+        ("task_decomposition",           "_stage_task_decomposition",        "define_criteria"),
+        ("plan_validation",              "_stage_plan_validation",           "task_decomposition"),
+        ("execute_actions",              "_stage_execute_actions",           "plan_validation"),
+        ("verify_results",               "_stage_verify_results",            "execute_actions"),
+
+        # Global task–list management:
+        ("task_management",              "_stage_task_management",           "verify_results"),
+        ("subtask_management",           "_stage_subtask_management",        "task_management"),
+        ("execute_tasks",                "_stage_execute_tasks",             "subtask_management"),
+
+        # Back to normal reply pipeline:
+        ("tool_chaining",                "_stage_tool_chaining",             "execute_tasks"),
+        ("assemble_prompt",              "_stage_assemble_prompt",           "tool_chaining"),
+        ("final_inference",              "_stage_final_inference",           "assemble_prompt"),
+        ("adversarial_loop",             "_stage_adversarial_loop",          "final_inference"),
+        ("notification_audit",           "_stage_notification_audit",        "adversarial_loop"),
+        ("flow_health_check",            "_stage_flow_health_check",         "notification_audit"),
+    ]
+
+
     def _stage_flow_health_check(self, ctx):
         """
-        After notification_audit, compute a simple health‐score (1 − recent_failure_ratio),
+        After notification_audit, compute a simple health-score (1 − recent_failure_ratio),
         log it, and—if it’s below 0.8—ask the secondary LLM for a recommended new stage list
-        (as a Python list).  If valid, persist via Tools.update_agent_stack.
+        (as a Python list).  If valid, persist via Tools.update_agent_stack (with justification).
         """
+        import ast
+        from datetime import datetime
+
         # 1) Measure recent failures
         failure_ratio = self.observer.recent_failure_ratio(n=10)
         score = 1.0 - failure_ratio
@@ -2823,7 +2977,7 @@ class ChatManager:
         if score < 0.8:
             prompt = (
                 f"Our last pipeline run scored {score:.2f}/1.00 (lower is worse).\n"
-                f"Here’s the context‐analysis + tool outputs + critique:\n{ctx.ctx_txt}\n\n"
+                f"Here’s the context-analysis + tool outputs + critique:\n{ctx.ctx_txt}\n\n"
                 "Which ordering of our full stage list (by exact stage names) would you "
                 "recommend to improve reliability?  Reply *exactly* with a Python list "
                 "of stage names, in the new desired order."
@@ -2831,15 +2985,14 @@ class ChatManager:
             resp = chat(
                 model=self.config_manager.config["secondary_model"],
                 messages=[
-                    {"role":"system","content":"You are a pipeline‐health adviser."},
-                    {"role":"user","content":prompt}
+                    {"role": "system", "content": "You are a pipeline-health adviser."},
+                    {"role": "user",   "content": prompt}
                 ],
                 stream=False
             )["message"]["content"].strip()
 
             # 3) Parse the LLM’s proposed list
             try:
-                import ast
                 cand = ast.literal_eval(resp)
                 if isinstance(cand, list) and all(isinstance(n, str) for n in cand):
                     suggestions = cand
@@ -2850,20 +3003,27 @@ class ChatManager:
 
         # 4) If we got a non-empty valid suggestion, persist it
         if suggestions:
-            # Filter out any unknown stage names
             current = Tools.load_agent_stack().get("stages", [])
             valid = [s for s in suggestions if s in current]
             if valid:
+                just = f"health_check run at {datetime.now().isoformat()} score={score:.2f}"
                 try:
-                    Tools.update_agent_stack({"stages": valid})
+                    Tools.update_agent_stack(
+                        {"stages": valid},
+                        justification=just
+                    )
                     log_message(f"[Watchdog] agent_stack.json updated to: {valid}", "INFO")
                     ctx.ctx_txt += f"\n[Watchdog] Updated pipeline stages to: {valid}"
                 except Exception as e:
                     log_message(f"[Watchdog] failed to update agent stack: {e}", "ERROR")
             else:
-                log_message("[Watchdog] no valid overlap between suggestion and existing stages", "WARNING")
+                log_message(
+                    "[Watchdog] no overlap between suggestion and existing stages; skipping update",
+                    "WARNING"
+                )
 
         return None
+
 
     
     def _activate_context(self, name: str, history_mgr=None, tts_mgr=None):
@@ -3058,43 +3218,83 @@ class ChatManager:
 
     def _stage_task_decomposition(self, ctx):
         """
-        Break the user’s request into an ordered JSON list of exact tool calls.
+        Break the user’s request into an ordered *list of tool-call strings*.
+        Extra fences / prose from the LLM are stripped automatically.
+        On failure, ctx.plan = [] and an explanatory note is appended.
         """
-        import json
+        import json, ast, re
+
         prompt = (
-            "You are a Task Decomposer.  Given the user's request:\n\n"
-            f"    \"{ctx.user_message}\"\n\n"
-            "Output a JSON array of the exact sequence of tool calls (as strings) "
-            "that will accomplish this request in order.  "
-            "Each element must look like:\n"
-            "    \"create_file(\\\"foo.py\\\", \\\"print('hi')\\\")\"\n"
-            "No other text."
+            "You are a Task-Decomposer.\n\n"
+            f'User request: "{ctx.user_message}"\n\n'
+            "Return **exactly** one line: valid JSON array (no markdown, no explanation), "
+            "where each element is a complete tool-call string, e.g.:\n"
+            '[  "create_file(\\"foo.py\\", \\"print(\'hi\')\\")",  '
+            '"run_script(\\"foo.py\\")" ]'
         )
-        resp = chat(
-            model=self.config_manager.config["secondary_model"],
-            messages=[
-                {"role":"system", "content": prompt},
-                {"role":"user",   "content": ctx.user_message}
-            ],
-            stream=False
-        )["message"]["content"].strip()
+
+        # build a minimal payload so we can set a low temperature
+        payload = {
+            "model":       self.config_manager.config["secondary_model"],
+            "messages":    [{"role": "system", "content": prompt}],
+            "stream":      False
+        }
+        raw = chat(**payload)["message"]["content"].strip()
+        log_message(f"[Task-Decomposer raw] {raw!r}", "DEBUG")
+
+        # strip fences & labels
+        cleaned = re.sub(r"```(?:json|tool_code)?", "", raw, flags=re.IGNORECASE).strip("` \n")
+        cleaned = re.sub(r"(?i)^(here is|the plan:?|output:)\s*", "", cleaned).strip()
+
+        plan: list[str] = []
+        error_msg = ""
+
+        # try strict JSON
         try:
-            plan = json.loads(resp)
+            plan = json.loads(cleaned)
             if not isinstance(plan, list):
-                raise ValueError("not a list")
-        except Exception as e:
-            log_message(f"Task decomposition parse error: {e}", "ERROR")
-            plan = []
-        # store and log
-        setattr(ctx, "plan", plan)
-        ctx.ctx_txt += f"\n[Task Decomposition]: {plan}"
-        return None
+                raise ValueError("decoded but not a list")
+        except Exception as e_json:
+            # try Python literal
+            try:
+                plan = ast.literal_eval(cleaned)
+                if not isinstance(plan, list):
+                    raise ValueError("literal_eval not list")
+            except Exception as e_py:
+                # fallback: grab lines that look like calls
+                candidates = [
+                    ln.strip().rstrip(",")
+                    for ln in cleaned.splitlines()
+                    if re.match(r"^[A-Za-z_]\w*\s*\(", ln)
+                ]
+                if candidates:
+                    plan = candidates
+                else:
+                    error_msg = f"parse failure ({e_json!s}; {e_py!s})"
+
+        # validate each element
+        valid = [c for c in plan if re.match(r'^[A-Za-z_]\w*\s*\(.*\)$', str(c).strip())]
+        if len(valid) != len(plan):
+            error_msg = "some elements did not look like tool calls"
+            plan = valid
+
+        # persist
+        ctx.plan = plan
+        if plan:
+            ctx.ctx_txt += f"\n[Task-Decomposition] {plan}"
+            log_message(f"Task plan accepted: {plan}", "INFO")
+        else:
+            ctx.ctx_txt += "\n[Task-Decomposition FAILED] " + error_msg
+            log_message(f"Task decomposition failed → {error_msg}", "ERROR")
+
+
 
     def _stage_plan_validation(self, ctx):
         """
         Validate or refine the generated plan against the original request.
         """
-        import json
+        import json, re
+
         plan = getattr(ctx, "plan", [])
         prompt = (
             "You are a Plan Validator.  The user asked:\n\n"
@@ -3103,27 +3303,36 @@ class ChatManager:
             f"    {json.dumps(plan, indent=2)}\n\n"
             "If this plan fully and correctly implements the request, reply with\n"
             "    NO_CHANGES\n"
-            "Otherwise output a revised JSON array of tool‐call strings."
+            "Otherwise output a revised JSON array of tool-call strings."
         )
         resp = chat(
             model=self.config_manager.config["secondary_model"],
             messages=[
-                {"role":"system",  "content": prompt},
-                {"role":"user",    "content": "Review the plan above."}
+                {"role": "system", "content": prompt},
+                {"role": "user",   "content": "Review the plan above."}
             ],
             stream=False
         )["message"]["content"].strip()
-        if resp.upper() != "NO_CHANGES":
-            try:
-                new_plan = json.loads(resp)
-                if isinstance(new_plan, list):
-                    setattr(ctx, "plan", new_plan)
-                    ctx.ctx_txt += f"\n[Plan Validation] revised → {new_plan}"
-                else:
-                    raise ValueError("not a list")
-            except Exception as e:
-                log_message(f"Plan validation parse error: {e}", "ERROR")
+
+        # strip any ```json``` fences or backticks
+        resp_clean = re.sub(r'```(?:json)?\s*|\s*```', '', resp, flags=re.DOTALL).strip()
+
+        # no change requested?
+        if not resp_clean or resp_clean.upper() == "NO_CHANGES":
+            return None
+
+        # try to parse JSON
+        try:
+            new_plan = json.loads(resp_clean)
+            if isinstance(new_plan, list):
+                setattr(ctx, "plan", new_plan)
+                ctx.ctx_txt += f"\n[Plan Validation] revised → {new_plan}"
+            else:
+                log_message(f"Plan validation ignored non-list output: {resp_clean!r}", "WARNING")
+        except json.JSONDecodeError as e:
+            log_message(f"Plan validation returned invalid JSON: {e}; output was: {resp_clean!r}", "WARNING")
         return None
+
 
     def _stage_execute_actions(self, ctx):
         """
@@ -3789,42 +3998,42 @@ class ChatManager:
     def chat_completion_stream(self, processed_text):
         """
         Stream the primary‐model’s response to `processed_text` as a new user message.
-        Ensures the model sees a fresh user turn rather than two assistant turns in a row.
+        Ensures the model sees a fresh user turn rather than two assistant turns in a row,
+        and aborts if it detects runaway repetition.
         """
+        from collections import deque
+
         log_message("Primary-model stream starting...", "DEBUG")
 
         # 1) Build override messages so the LLM sees processed_text as a user turn
-        cfg = self.config_manager.config
+        cfg     = self.config_manager.config
         sys_msg = {"role": "system", "content": cfg.get("system", "")}
 
         # Optional: include a memory/context message if you use that pattern
         mem_content = ""  # or pull from your memory manager
-        mem_msg = {"role": "system", "content": f"Memory Context:\n{mem_content}\n\n"} if mem_content else None
-
-        # 2) Stitch together:
         override = [sys_msg]
-        if mem_msg:
-            override.append(mem_msg)
+        if mem_content:
+            override.append({"role": "system", "content": f"Memory Context:\n{mem_content}\n\n"})
+
         # add the full chat history so far
         override.extend(self.history_manager.history)
         # finally, our new “user” turn
         override.append({"role": "user", "content": processed_text})
 
-        # 3) Build the payload with our override_messages
+        # 2) Build the payload with our override_messages
         payload = self.build_payload(
             override_messages=override,
             model_key="primary_model"
         )
 
-        # 4) Kick off streaming
+        # 3) Stream and watch for repetition
         print("⟳ Reply: ", end="", flush=True)
-        for part in chat(
-            model=payload["model"],
-            messages=payload["messages"],
-            stream=True
-        ):
+        recent_chunks = deque(maxlen=5)
+
+        for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
+            # immediate abort if external stop requested
             if self.stop_flag:
-                log_message("Primary-model stream aborted.", "WARNING")
+                log_message("Primary-model stream aborted by stop_flag.", "WARNING")
                 yield "", True
                 return
 
@@ -3832,9 +4041,18 @@ class ChatManager:
             print(tok, end="", flush=True)
             yield tok, part.get("done", False)
 
+            # repetition guard
+            snippet = tok.strip()
+            if snippet:
+                recent_chunks.append(snippet)
+                if len(recent_chunks) == recent_chunks.maxlen and len(set(recent_chunks)) == 1:
+                    log_message(f"Detected runaway repetition of {snippet!r}; aborting stream.", "WARNING")
+                    self.stop_flag = True
+                    yield "", True
+                    return
+
         print()
         log_message("Primary-model stream finished.", "DEBUG")
-
 
     def chat_completion_nonstream(self, processed_text):
         log_message("Primary-model non-stream starting...", "DEBUG")
@@ -3846,72 +4064,196 @@ class ChatManager:
             log_message(f"Primary-model non-stream error: {e}", "ERROR")
             return ""
         
-    def process_text(self, text, skip_tts=False):
+    from ollama._types import ResponseError
+
+    def process_text(self, text, skip_tts: bool = False):
+        """
+        Robust, self-adapting wrapper that keeps retrying until we obtain a
+        satisfactory LLM answer.  Each retry escalates through a predefined
+        list of tactics (temperature bumps, model switch, history-window trim,
+        non-stream fallback, etc.).  It NEVER gives up.
+        """
         import re
+        from contextlib import contextmanager
+
         log_message("process_text: Starting...", "DEBUG")
-        # Remove any asterisks from the incoming text
-        text = text.replace('*', '')
+
+        # ---------- helpers -------------------------------------------------
+        @contextmanager
+        def _temporary_history(window: int | None):
+            """
+            Temporarily clip self.history_manager.history to its last <window>
+            entries.  If window is None we leave history untouched.
+            """
+            if window is None:
+                yield
+                return
+
+            original = self.history_manager.history
+            try:
+                self.history_manager.history = original[-window:]
+                yield
+            finally:
+                self.history_manager.history = original
+
+        def _build_stream():
+            """(re)create a fresh monitored stream with current params."""
+            stream = self.chat_completion_stream(converted)
+            return self.watchdog.monitor_stream(stream, self.current_ctx)
+
+        # ---------- pre-flight ---------------------------------------------
+        text = text.replace("*", "")
         converted = Utils.convert_numbers_to_words(text)
-        sentence_endings = re.compile(r'[.?!]+')
+        sentence_endings = re.compile(r"[.?!]+")
         in_think = False
-        tts_buffer = ""
-        tokens = ""
 
-        if self.config_manager.config["stream"]:
-            for chunk, done in self.chat_completion_stream(converted):
-                tokens += chunk
-                with display_state.lock:
-                    display_state.current_tokens = tokens
+        # watchdog (reuse if already exists)
+        if not hasattr(self, "watchdog"):
+            self.watchdog = WatchdogManager(
+                quality_model=self.config_manager.config["secondary_model"],
+                halluc_model=self.config_manager.config["secondary_model"],
+                quality_threshold=0.8,
+                halluc_threshold=0.5,
+                max_retries=0,          # we do the retries
+            )
+        wd = self.watchdog
 
-                data = chunk
-                idx = 0
-                while idx < len(data):
-                    if not in_think:
-                        start = data.find("<think>", idx)
-                        if start == -1:
-                            tts_buffer += data[idx:]
-                            break
-                        else:
-                            tts_buffer += data[idx:start]
-                            idx = start + len("<think>")
-                            in_think = True
+        # rotation data
+        apology_variants = [
+            "Sorry, that drifted—let me tighten things up and retry.",
+            "Hmm, still not crisp.  Adjusting my approach…",
+            "Let me rethink and take another shot.",
+            "One more try with a fresh strategy.",
+        ]
+
+        # escalating tactics table
+        tactics = [
+            # (use_stream, use_secondary, history_window, extra_temp, halluc_delta)
+            (True,  False, None, 0.0, 0.0),   # 1
+            (True,  False, None, 0.2, 0.1),   # 2
+            (True,  True,  None, 0.3, 0.2),   # 3
+            (True,  True,   25,  0.4, 0.3),   # 4
+            (True,  True,   10,  0.5, 0.4),   # 5
+            (False, True,   10,  0.5, 0.5),   # 6
+            (True,  True,    5,  0.6, 0.5),   # 7
+        ]
+
+        attempt = 0
+        while True:  # never stop trying
+            attempt += 1
+            strat = tactics[(attempt - 1) % len(tactics)]
+            use_stream, use_secondary, hist_win, temp_bump, hallu_delta = strat
+
+            # 1) apply strategy-specific knobs
+            self._temp_bump = temp_bump
+            wd.halluc_threshold = min(1.0, wd.halluc_threshold + hallu_delta)
+
+            if use_secondary:
+                # temporarily swap primary/secondary models in config for this try
+                orig_primary = self.config_manager.config["primary_model"]
+                self.config_manager.config["primary_model"] = self.config_manager.config["secondary_model"]
+            else:
+                orig_primary = None  # marker for no swap
+
+            # ensure stream flag matches tactic
+            self.config_manager.config["stream"] = use_stream
+
+            log_message(
+                f"[Retry #{attempt}] "
+                f"{'stream' if use_stream else 'non-stream'}, "
+                f"model={'secondary' if use_secondary else 'primary'}, "
+                f"hist={hist_win or 'full'}, "
+                f"Δtemp={temp_bump:.2f}, "
+                f"halluc_thr={wd.halluc_threshold:.2f}",
+                "INFO",
+            )
+
+            try:
+                with _temporary_history(hist_win):
+                    if use_stream:
+                        # ------- streaming branch -----------------------------------
+                        tokens = ""
+                        tts_buffer = ""
+                        self.stop_flag = False
+                        monitored = _build_stream()
+
+                        for chunk, done in monitored:
+                            tokens += chunk
+                            with display_state.lock:
+                                display_state.current_tokens = tokens
+
+                            # remove <think> tags from spoken text
+                            data = chunk
+                            idx = 0
+                            while idx < len(data):
+                                if not in_think:
+                                    start = data.find("<think>", idx)
+                                    if start == -1:
+                                        tts_buffer += data[idx:]
+                                        break
+                                    tts_buffer += data[idx:start]
+                                    idx = start + len("<think>")
+                                    in_think = True
+                                else:
+                                    end = data.find("</think>", idx)
+                                    if end == -1:
+                                        break
+                                    idx = end + len("</think>")
+                                    in_think = False
+
+                            # flush complete sentences to TTS
+                            while True:
+                                m = sentence_endings.search(tts_buffer)
+                                if not m:
+                                    break
+                                end_i = m.end()
+                                sentence = tts_buffer[:end_i].strip()
+                                tts_buffer = tts_buffer[end_i:].lstrip()
+                                cleaned = re.sub(r"[*_`]", "", clean_text(sentence))
+                                if cleaned and not skip_tts:
+                                    self.tts_manager.enqueue(cleaned)
+                                    log_message(f"TTS enqueued: {cleaned}", "DEBUG")
+
+                            if done:
+                                # SUCCESS
+                                return tokens
                     else:
-                        end = data.find("</think>", idx)
-                        if end == -1:
-                            break
-                        else:
-                            idx = end + len("</think>")
-                            in_think = False
+                        # ------- non-stream branch ----------------------------------
+                        res = self.chat_completion_nonstream(converted)
+                        with display_state.lock:
+                            display_state.current_tokens = res
+                        return res
 
-                # extract full sentences from tts_buffer
-                while True:
-                    m = sentence_endings.search(tts_buffer)
-                    if not m:
-                        break
-                    end = m.end()
-                    sentence = tts_buffer[:end].strip()
-                    tts_buffer = tts_buffer[end:].lstrip()
-                    # Clean up the sentence for TTS
-                    clean = clean_text(sentence)
-                    # Remove special characters before TTS (asterisks, backticks, underscores)
-                    clean = re.sub(r'[*_`]', '', clean)
-                    if clean and not skip_tts:
-                        self.tts_manager.enqueue(clean)
-                        log_message(f"TTS enqueued: {clean}", "DEBUG")
+            except StopStreamException:
+                # Watchdog aborted → escalate
+                pass
+            except Exception as e:
+                # transport or model error → log & escalate
+                log_message(f"[Retry #{attempt}] Transport/model error: {e}", "ERROR")
 
-                if done:
-                    break
+            # -------- failure handling ----------------------------------------
+            apology = apology_variants[(attempt - 1) % len(apology_variants)]
+            if not skip_tts:
+                self.tts_manager.enqueue(apology)
+            log_message(f"Retry #{attempt} failed → apologising: {apology}", "WARNING")
 
-            return tokens
-        else:
-            res = self.chat_completion_nonstream(converted)
-            with display_state.lock:
-                display_state.current_tokens = res
-            return res
+            # restore swapped model, if any, before next loop
+            if orig_primary is not None:
+                self.config_manager.config["primary_model"] = orig_primary
+
+            # small sleep prevents hammering the local LLM server if it's crashing
+            time.sleep(0.5)
 
 
     def inference_thread(self, user_message, result_holder, skip_tts):
-        result_holder.append(self.process_text(user_message, skip_tts))
+        try:
+            # process_text now handles its own retries and won’t raise on streaming errors
+            result = self.process_text(user_message, skip_tts)
+        except Exception as e:
+            # last-ditch catch – log and return fallback
+            log_message(f"inference_thread: fatal error: {e}", "ERROR")
+            result = "Sorry, something went seriously wrong. Let me try again."
+        result_holder.append(result)
 
     def run_inference(self, prompt, skip_tts=False):
         log_message("run_inference: Starting...", "DEBUG")
@@ -4195,6 +4537,32 @@ class ChatManager:
                     log_message(f"[execute_tasks] subtask failed: {e}", "ERROR")
 
         return None
+    
+    def _stage_define_criteria(self, ctx, planning_summary: str) -> list[str]:
+        """
+        Ask the model to translate the planning summary into a set of
+        concrete, measurable success criteria.
+        Returns a JSON array of criterion strings.
+        """
+        import json
+        prompt = (
+            "You are a Criteria Agent.  Based on this one-sentence plan:\n\n"
+            f"    {planning_summary}\n\n"
+            "Output a JSON list of 3–5 clear, discrete, measurable criteria "
+            "that will tell us when the task is complete.  No extra text."
+        )
+        resp = chat(
+            model=self.config_manager.config["secondary_model"],
+            messages=[{"role":"system","content":prompt}],
+            stream=False
+        )["message"]["content"].strip()
+        try:
+            criteria = json.loads(resp)
+        except:
+            criteria = []
+        ctx.ctx_txt += f"\n[Defined Criteria]: {criteria}"
+        ctx.stage_outputs["define_criteria"] = criteria
+        return criteria
 
 
     # -------------------------------------------------------------------
@@ -4262,9 +4630,10 @@ class ChatManager:
         """
         Entry-point for a new user request.  
         Handles context-switching, per-context state, dynamic stage-list assembly,
-        pipeline execution, and final response delivery.
+        explicit data-flow between stages, and final response delivery.
         """
         import re
+        import inspect
 
         # 0) Context-switch detection: "/topic NAME" or "/ctx NAME"
         m = re.match(r"^/(topic|ctx)\s+(.+)$", user_message.strip(), re.IGNORECASE)
@@ -4273,73 +4642,120 @@ class ChatManager:
             self._activate_context(topic)
             return f"Switched to context '{topic}'."
 
-        # 1) Grab or create the current_ctx
+        # 1) Grab or create current context
         ctx = getattr(self, "current_ctx", None)
         if ctx is None:
             self._activate_context("global")
             ctx = self.current_ctx
 
-        # 1a) Rebind managers to this context
+        # 1a) Rebind managers
         self.history_manager   = ctx.history_manager
         self.tts_manager       = ctx.tts_manager
         Tools._history_manager = ctx.history_manager
 
-        # 2) Seed or reset per-turn fields
-        ctx.user_message    = user_message
-        ctx.sender_role     = sender_role
-        ctx.skip_tts        = skip_tts
-        ctx.ctx_txt         = ""
-        ctx.tool_summaries  = []
-        ctx.assembled       = ""
-        ctx.final_response  = None
+        # 2) Reset per-turn fields
+        ctx.user_message     = user_message
+        ctx.sender_role      = sender_role
+        ctx.skip_tts         = skip_tts
+        ctx.ctx_txt          = ""
+        ctx.tool_summaries   = []
+        ctx.assembled        = ""
+        ctx.final_response   = None
         ctx.stage_counts.clear()
+        ctx.stage_outputs    = {}   # ◀ new: will hold each stage’s output
 
-        # 2a) Record the user’s message (no immediate TTS echo)
+        # 2a) Record user message (no TTS echo)
         ctx.history_manager.add_entry(sender_role, user_message)
 
-        # 3) Telemetry: start a new run
+        # 3) Telemetry
         run_id = self.observer.start_run(user_message)
         self.current_run_id = run_id
         ctx.run_id          = run_id
 
-        # 4) Load the base agent-stack stages and drop any old record stage
+        # 4) Build & prune base stage list
         stack  = Tools.load_agent_stack()
         stages = list(stack.get("stages", []))
         if "record_user_message" in stages:
             stages.remove("record_user_message")
 
-        # 4.5) Dynamic stage assembly based on the user's message
+        # 4.5) Dynamic stage assembly
         stages = self._assemble_stage_list(user_message, stages)
 
-        # 5) Ensure all core stages are present in proper order
+        # 5) Ensure core stages in order
         def _ensure(name: str, after: str | None):
             if name not in stages and after and after in stages:
                 stages.insert(stages.index(after) + 1, name)
 
-        _ensure("context_analysis",     stages[0] if stages else None)
-        _ensure("workspace_setup",      "context_analysis")
-        _ensure("file_management",      "workspace_setup")
-        _ensure("file_validation",      "file_management")
-        _ensure("html_filtering",       "file_management")
-        _ensure("chunk_and_summarize",  "html_filtering")
-        _ensure("intent_clarification", "context_analysis")
+        _ensure("context_analysis",             stages[0] if stages else None)
+        _ensure("workspace_setup",              "context_analysis")
+        _ensure("file_management",              "workspace_setup")
+        _ensure("file_validation",              "file_management")
+        _ensure("html_filtering",               "file_management")
+        _ensure("chunk_and_summarize",          "html_filtering")
+        _ensure("intent_clarification",         "context_analysis")
         _ensure("external_knowledge_retrieval", "intent_clarification")
-        _ensure("memory_summarization", "external_knowledge_retrieval")
-        _ensure("planning_summary",     "memory_summarization")
-        _ensure("tool_chaining",        "planning_summary")
-        _ensure("assemble_prompt",      "tool_chaining")
-        _ensure("final_inference",      "assemble_prompt")
-        _ensure("chain_of_thought",     "final_inference")
-        _ensure("notification_audit",   "chain_of_thought")
-        _ensure("flow_health_check",    "notification_audit")
+        _ensure("memory_summarization",         "external_knowledge_retrieval")
+        _ensure("planning_summary",             "memory_summarization")
 
-        # 6) Optionally insert adversarial_loop right after final_inference
+        # CRITERIA → PLAN → EXECUTE → VERIFY
+        _ensure("define_criteria",              "planning_summary")
+        _ensure("task_decomposition",           "define_criteria")
+        _ensure("plan_validation",              "task_decomposition")
+        _ensure("execute_actions",              "plan_validation")
+        _ensure("verify_results",               "execute_actions")
+
+        # GLOBAL TASK LIST
+        _ensure("task_management",              "verify_results")
+        _ensure("subtask_management",           "task_management")
+        _ensure("execute_tasks",                "subtask_management")
+
+        # back to reply
+        _ensure("tool_chaining",                "execute_tasks")
+        _ensure("assemble_prompt",              "tool_chaining")
+        _ensure("final_inference",              "assemble_prompt")
+        _ensure("chain_of_thought",             "final_inference")
+        _ensure("notification_audit",           "chain_of_thought")
+        _ensure("flow_health_check",            "notification_audit")
+
+
+        # 6) Insert adversarial_loop after final_inference if missing
         if "final_inference" in stages and "adversarial_loop" not in stages:
             idx = stages.index("final_inference") + 1
             stages.insert(idx, "adversarial_loop")
 
-        # 7) Execute the pipeline
+        # 7) Define explicit one-up dependency map
+        deps = {
+            "context_analysis":             None,
+            "intent_clarification":         "context_analysis",
+            "workspace_setup":              None,
+            "file_management":              "workspace_setup",
+            "file_validation":              "file_management",
+            "html_filtering":               "file_management",
+            "chunk_and_summarize":          "html_filtering",
+            "external_knowledge_retrieval": "intent_clarification",
+            "memory_summarization":         "external_knowledge_retrieval",
+            "planning_summary":             "memory_summarization",
+            "define_criteria":              "planning_summary",
+            "task_decomposition":           "define_criteria",
+            "plan_validation":              "task_decomposition",
+            "execute_actions":              "plan_validation",
+            "verify_results":               "execute_actions",
+            "task_management":              "verify_results",
+            "subtask_management":           "task_management",
+            "execute_tasks":                "subtask_management",
+            "tool_chaining":                "execute_tasks",
+            "assemble_prompt":              "tool_chaining",
+            "final_inference":              "assemble_prompt",
+            "adversarial_loop":             "final_inference",
+            "chain_of_thought":             "final_inference",
+            "notification_audit":           "chain_of_thought",
+            "flow_health_check":            "notification_audit",
+        }
+
+
+
         log_message(f"[Context={ctx.name}] Pipeline stages: {stages}", "INFO")
+
         for stage in stages:
             # runaway guard
             cnt = ctx.stage_counts.get(stage, 0) + 1
@@ -4349,37 +4765,51 @@ class ChatManager:
                 continue
 
             handler = getattr(self, f"_stage_{stage}", None)
-            if not handler:
+            if handler is None:
                 continue
 
             self.observer.log_stage_start(run_id, stage)
+
+            # fetch the single dependency’s output (if any)
+            dep = deps.get(stage)
+            prev_output = ctx.stage_outputs.get(dep) if dep else None
+
             try:
-                result = handler(ctx)
+                sig = inspect.signature(handler)
+                # bound method: parameters are (ctx, prev_output) for new-style handlers
+                if len(sig.parameters) == 2:
+                    result = handler(ctx, prev_output)
+                else:
+                    result = handler(ctx)
             except Exception as e:
                 self.observer.log_error(run_id, stage, e)
                 log_message(f"[{ctx.name}] Stage '{stage}' failed: {e}", "ERROR")
-                # retry final_inference once with bumped temp
+                # retry logic for final_inference
                 if stage == "final_inference" and getattr(self, "_temp_bump", 0.0) == 0.0:
                     log_message("Retrying final_inference with bumped temp", "INFO")
                     self._temp_bump = 0.2
                     try:
-                        result = handler(ctx)
+                        result = handler(ctx, prev_output) if len(sig.parameters)==2 else handler(ctx)
                     except Exception:
-                        pass
+                        result = ""
                     finally:
                         self._temp_bump = 0.0
             else:
                 self.observer.log_stage_end(run_id, stage)
 
-            # fast-paths
-            if stage == "summary_request" and isinstance(result, str):
+            # record non-empty string outputs
+            if isinstance(result, str) and result:
+                ctx.stage_outputs[stage] = result
+
+            # early exit for summary_request
+            if stage == "summary_request" and isinstance(result, str) and result:
                 return result
-            if stage == "timeframe_history_query" and isinstance(result, str):
+            if stage == "timeframe_history_query" and isinstance(result, str) and result:
                 ctx.ctx_txt += "\n[History lookup]:\n" + result
                 continue
-            # allow adversarial_loop to run after final_inference
+            # adversarial_loop runs even after final_inference
 
-        # 8) Persist workspace memory & complete the run
+        # 8) Wrap up
         self._save_workspace_memory(ctx.workspace_memory)
         self.observer.complete_run(run_id)
 
@@ -4474,41 +4904,49 @@ class ChatManager:
         return None
 
     # ------------------------------
-    # Stage 3: context_analysis
+    # Stage: context_analysis
     # ------------------------------
-    def _stage_context_analysis(self, ctx: Context):
-        buf = []
+    def _stage_context_analysis(self, ctx: Context, prev_output: str | None) -> str:
+        """
+        Perform a focused context analysis of the user’s latest message.
+        Returns the analysis text.
+        """
+        buf: list[str] = []
+        # stream in the context‐analysis tokens
         for tok, done in self._stream_context(ctx.user_message):
             buf.append(tok)
             if done:
                 break
-        ca = "".join(buf)
+        ca = "".join(buf).strip()
         log_message(f"Context analysis: {ca!r}", "DEBUG")
-        ctx.ctx_txt += ca
-        return None
+
+        # record it for both human‐readability and downstream stages
+        ctx.ctx_txt += ca + "\n"
+        return ca
 
 
     # ------------------------------
-    # Stage 4: intent_clarification
+    # Stage: intent_clarification
     # ------------------------------
-    def _stage_intent_clarification(self, ctx):
+    def _stage_intent_clarification(self, ctx: Context, context_analysis: str) -> str:
         """
-        If the user’s request is ambiguous, ask ONE simple question to disambiguate.
-        BUT—before speaking to the user—first attempt to resolve that question
-        internally via your secondary_model.  Only if that “self-clarification”
-        comes back empty or unhelpful do you ask the user.
+        If the user’s request is ambiguous, first try to resolve it internally.
+        Only if that fails do we ask the user.
+        Returns:
+          - ""              if no clarification is needed or we auto‐resolved
+          - the clarification question to speak if we must ask the user
         """
-        # 1) Ask Clarifier whether we need more info
-        clar = self._clarify_intent(ctx.user_message)
+        # 1) Do we even need to clarify?
+        clar = self._clarify_intent(context_analysis)
         if not clar:
-            return None
+            return ""
 
-        # 2) Try to auto-answer that clarification internally
+        # 2) Try to self‐answer
         auto_sys = (
             "You are the AUTOCLARIFIER AGENT.  "
-            "Use the existing conversation history to answer the question below.  "
-            "If you can answer it, respond with the answer.  "
-            "If it cannot be answered from context, respond with UNANSWERABLE."
+            "Answer the question below using only the existing conversation history.  "
+            "If you can answer it, respond with that answer.  "
+            "Otherwise respond with UNANSWERABLE."
         )
         auto_resp = chat(
             model=self.config_manager.config["secondary_model"],
@@ -4519,22 +4957,21 @@ class ChatManager:
             stream=False
         )["message"]["content"].strip()
 
-        # 3) Record what happened
-        ctx.ctx_txt += f"\n[Self-clarification attempt] Q: {clar!r} → A: {auto_resp!r}"
+        # 3) Log what happened
+        ctx.ctx_txt += f"[Self-clarification] Q={clar!r} → A={auto_resp!r}\n"
 
-        # 4) If we got a real answer, stitch it back into the user_message so downstream stages see it
+        # 4) If we succeeded, inject the resolution into the user_message
         if auto_resp and auto_resp.upper() != "UNANSWERABLE":
-            # inject the resolved detail
             ctx.user_message = f"{ctx.user_message} {auto_resp}"
-            return None  # skip asking the user
+            return ""
 
-        # 5) Otherwise, genuinely ask the user
-        #    (fallback because we truly couldn't resolve it ourselves)
+        # 5) Otherwise we really need to ask the user
         self.history_manager.add_entry("assistant", clar)
         if not ctx.skip_tts:
             self.tts_manager.enqueue(clar)
-        # we return None so pipeline just continues; user will reply with the needed detail
-        return None
+
+        return clar
+
 
     # ------------------------------
     # Stage 5: external_knowledge_retrieval
