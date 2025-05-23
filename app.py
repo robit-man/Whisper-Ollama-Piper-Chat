@@ -364,9 +364,28 @@ audio_queue = queue.Queue()
 current_tts_process = None
 tts_lock = threading.Lock()
 log_message("Global settings and queues initialized.", "DEBUG")
+# at the top of your module, after you load `config`:
+TTS_DEBUG = config.get("tts_debug", False)
+
+def _tts_log(msg: str, level: str = "DEBUG"):
+    """
+    Internal helper: only emit DEBUG logs if TTS_DEBUG is True.
+    INFO/ERROR always go through.
+    """
+    if level.upper() == "DEBUG" and not TTS_DEBUG:
+        return
+    log_message(msg, level)
+
+# At top of your module, after loading `config`:
+TTS_DEBUG = config.get("tts_debug", False)
+
+def _tts_debug(msg: str, category: str = "DEBUG"):
+    """Only log if TTS_DEBUG is True."""
+    if TTS_DEBUG:
+        log_message(msg, category)
 
 def flush_current_tts():
-    log_message("Flushing current TTS queue and processes...", "DEBUG")
+    _tts_debug("Flushing current TTS queue and processes...")
     with tts_lock:
         while not tts_queue.empty():
             try:
@@ -379,68 +398,69 @@ def flush_current_tts():
             pproc, aproc = current_tts_process
             try:
                 pproc.kill()
-                log_message("Killed current Piper process.", "DEBUG")
+                _tts_debug("Killed current Piper process.")
             except Exception as e:
                 log_message(f"Error killing Piper process: {e}", "ERROR")
             try:
                 aproc.kill()
-                log_message("Killed current aplay process.", "DEBUG")
+                _tts_debug("Killed current aplay process.")
             except Exception as e:
                 log_message(f"Error killing aplay process: {e}", "ERROR")
             current_tts_process = None
 
-# ----- TTS Processing -----
-def process_tts_request(text):
-    volume = config.get("tts_volume", 0.2)  # <-- new volume config
-
+def process_tts_request(text: str):
+    volume    = config.get("tts_volume", 0.2)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    piper_exe = os.path.join(script_dir, "piper", "piper")
-    onnx_json = os.path.join(script_dir, config["onnx_json"])
+    piper_exe  = os.path.join(script_dir, "piper", "piper")
+    onnx_json  = os.path.join(script_dir, config["onnx_json"])
     onnx_model = os.path.join(script_dir, config["onnx_model"])
 
     # Verify that necessary files exist
     for path, desc in [
-        (piper_exe, "Piper executable"),
-        (onnx_json, "ONNX JSON file"),
+        (piper_exe,  "Piper executable"),
+        (onnx_json,  "ONNX JSON file"),
         (onnx_model, "ONNX model file"),
     ]:
         if not os.path.isfile(path):
             log_message(f"Error: {desc} not found at {path}", "ERROR")
             return
 
-    payload = {"text": text, "config": onnx_json, "model": onnx_model}
+    payload     = {"text": text, "config": onnx_json, "model": onnx_model}
     payload_str = json.dumps(payload)
 
-    cmd_piper = [piper_exe, "-m", onnx_model, "--debug", "--json-input", "--output_raw"]
+    # Build Piper command; include --debug only if TTS_DEBUG
+    cmd_piper = [piper_exe, "-m", onnx_model, "--json-input", "--output_raw"]
+    if TTS_DEBUG:
+        cmd_piper.insert(3, "--debug")
+
     cmd_aplay = ["aplay", "--buffer-size=777", "-r", "22050", "-f", "S16_LE"]
 
     log_message(f"[TTS] Synthesizing: '{text}'", "INFO")
-
     try:
         with tts_lock:
+            stderr_dest = subprocess.PIPE if TTS_DEBUG else subprocess.DEVNULL
             proc = subprocess.Popen(
                 cmd_piper,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                stderr=stderr_dest
             )
-            # Intercept Piper stdout to adjust volume before sending to aplay
             proc_aplay = subprocess.Popen(cmd_aplay, stdin=subprocess.PIPE)
             global current_tts_process
             current_tts_process = (proc, proc_aplay)
-            log_message("TTS processes started.", "DEBUG")
+            _tts_debug("TTS processes started.")
 
-        # Send TTS request to Piper
+        # send payload
         proc.stdin.write(payload_str.encode("utf-8"))
         proc.stdin.close()
 
-        # Function to adjust volume on raw 16-bit PCM data
-        def adjust_volume(data, vol):
-            samples = np.frombuffer(data, dtype=np.int16)
-            samples = (samples.astype(np.float32) * vol).clip(-32768, 32767).astype(np.int16)
-            return samples.tobytes()
+        def adjust_volume(data: bytes, vol: float) -> bytes:
+            samples   = np.frombuffer(data, dtype=np.int16)
+            adjusted  = samples.astype(np.float32) * vol
+            clipped   = np.clip(adjusted, -32768, 32767)
+            return clipped.astype(np.int16).tobytes()
 
-        # Read Piper's output, adjust volume, and send it to aplay
+        # stream audio through aplay
         chunk_size = 4096
         while True:
             chunk = proc.stdout.read(chunk_size)
@@ -457,12 +477,16 @@ def process_tts_request(text):
         with tts_lock:
             current_tts_process = None
 
-        stderr_output = proc.stderr.read().decode("utf-8")
-        if stderr_output:
-            log_message("[Piper STDERR]: " + stderr_output, "ERROR")
+        # only read & log Piper’s stderr if debugging
+        if TTS_DEBUG:
+            stderr_output = proc.stderr.read().decode("utf-8", errors="ignore").strip()
+            if stderr_output:
+                log_message("[Piper STDERR]: " + stderr_output, "ERROR")
 
     except Exception as e:
         log_message("Error during TTS processing: " + str(e), "ERROR")
+
+
 
 def tts_worker(q):
     log_message("TTS worker thread started.", "DEBUG")
@@ -684,7 +708,7 @@ def clean_text(text):
 def consensus_whisper_transcribe_helper(audio_array, language="en", rms_threshold=0.01, consensus_threshold=0.8):
     rms = np.sqrt(np.mean(np.square(audio_array)))
     if rms < rms_threshold:
-        log_message("Audio RMS too low (RMS: {:.5f}). Skipping transcription.".format(rms), "WARNING")
+        #log_message("Audio RMS too low (RMS: {:.5f}). Skipping transcription.".format(rms), "WARNING")
         return ""
     
     transcription_base = ""
@@ -3216,28 +3240,27 @@ class ChatManager:
 
         yield "", True
 
-    def _stage_task_decomposition(self, ctx):
-        """
-        Break the user’s request into an ordered *list of tool-call strings*.
-        Extra fences / prose from the LLM are stripped automatically.
-        On failure, ctx.plan = [] and an explanatory note is appended.
-        """
+    # ─── Replacement ───
+    def _stage_task_decomposition(self, ctx) -> list[str]:
         import json, ast, re
 
-        prompt = (
-            "You are a Task-Decomposer.\n\n"
-            f'User request: "{ctx.user_message}"\n\n'
-            "Return **exactly** one line: valid JSON array (no markdown, no explanation), "
-            "where each element is a complete tool-call string, e.g.:\n"
-            '[  "create_file(\\"foo.py\\", \\"print(\'hi\')\\")",  '
-            '"run_script(\\"foo.py\\")" ]'
-        )
+        # 1) collect real tool names
+        tool_names = [
+            attr for attr in dir(Tools)
+            if not attr.startswith("_") and callable(getattr(Tools, attr))
+        ]
 
-        # build a minimal payload so we can set a low temperature
+        prompt = (
+            "You are a Task-Decomposer. Available tools:\n    "
+            + ", ".join(tool_names) + "\n\n"
+            f'User request: "{ctx.user_message}"\n\n'
+            "Return exactly one line: valid JSON array (no markdown, no explanation), "
+            "where each element is a complete tool-call string from that list."
+        )
         payload = {
-            "model":       self.config_manager.config["secondary_model"],
-            "messages":    [{"role": "system", "content": prompt}],
-            "stream":      False
+            "model":    self.config_manager.config["secondary_model"],
+            "messages": [{"role": "system", "content": prompt}],
+            "stream":   False
         }
         raw = chat(**payload)["message"]["content"].strip()
         log_message(f"[Task-Decomposer raw] {raw!r}", "DEBUG")
@@ -3272,20 +3295,34 @@ class ChatManager:
                 else:
                     error_msg = f"parse failure ({e_json!s}; {e_py!s})"
 
-        # validate each element
+        # validate each element syntax
         valid = [c for c in plan if re.match(r'^[A-Za-z_]\w*\s*\(.*\)$', str(c).strip())]
         if len(valid) != len(plan):
             error_msg = "some elements did not look like tool calls"
             plan = valid
 
-        # persist
-        ctx.plan = plan
+        # 2) filter out any calls not in real tools
+        filtered = []
+        dropped = []
+        for call_str in plan:
+            fn = call_str.split("(")[0]
+            if fn in tool_names:
+                filtered.append(call_str)
+            else:
+                dropped.append(call_str)
+        if dropped:
+            log_message(f"Dropped unknown tool calls: {dropped}", "WARNING")
+        plan = filtered
+
         if plan:
             ctx.ctx_txt += f"\n[Task-Decomposition] {plan}"
             log_message(f"Task plan accepted: {plan}", "INFO")
+            return plan
         else:
-            ctx.ctx_txt += "\n[Task-Decomposition FAILED] " + error_msg
-            log_message(f"Task decomposition failed → {error_msg}", "ERROR")
+            msg = error_msg or "no valid tool calls"
+            ctx.ctx_txt += f"\n[Task-Decomposition FAILED] {msg}"
+            log_message(f"Task decomposition failed → {msg}", "ERROR")
+            return []
 
 
 
@@ -3309,10 +3346,13 @@ class ChatManager:
             model=self.config_manager.config["secondary_model"],
             messages=[
                 {"role": "system", "content": prompt},
-                {"role": "user",   "content": "Review the plan above."}
+                {"role": "user",   "content": 
+                    f"Please compare the plan above against the original request: \"{ctx.user_message}\" and suggest revisions if needed."
+                }
             ],
             stream=False
         )["message"]["content"].strip()
+
 
         # strip any ```json``` fences or backticks
         resp_clean = re.sub(r'```(?:json)?\s*|\s*```', '', resp, flags=re.DOTALL).strip()
@@ -3969,8 +4009,7 @@ class ChatManager:
             if self.history_manager.history:
                 last = next((m["content"] for m in reversed(self.history_manager.history)
                              if m["role"]=="user"), "")
-                _ = Utils.embed_text(last)
-                mem = ""
+                mem = Utils.embed_text(last)
             else:
                 mem = ""
             mem_msg = {"role":"system",
@@ -4468,6 +4507,7 @@ class ChatManager:
         mini-stage’s performance, and adjust prompts if needed.
         """
         from concurrent.futures import ThreadPoolExecutor
+        import inspect, time
 
         tasks = ctx.get("global_tasks", [])
         if not tasks:
@@ -4507,7 +4547,12 @@ class ChatManager:
                 start = time.time()
                 success = True
                 try:
-                    handler(subctx)
+                    # call handler with or without prev_output arg
+                    sig = inspect.signature(handler)
+                    if len(sig.parameters) == 2:
+                        handler(subctx, None)
+                    else:
+                        handler(subctx)
                 except Exception:
                     success = False
                     # still record failure timing, then re-raise to abort this subtask
@@ -4516,8 +4561,9 @@ class ChatManager:
                     duration = time.time() - start
                     # record and maybe adjust prompt
                     self.prompt_evaluator.record(stage, duration, success)
-                    new_sys = self.prompt_evaluator.adjust(stage,
-                                                        self.config_manager.config["system"])
+                    new_sys = self.prompt_evaluator.adjust(
+                        stage, self.config_manager.config["system"]
+                    )
                     if new_sys:
                         self.config_manager.config["system"] = new_sys
 
@@ -4527,9 +4573,8 @@ class ChatManager:
             task["done"] = True
 
         # run all tasks in parallel
-        with ThreadPoolExecutor(max_workers= min(4, len(tasks))) as ex:
+        with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as ex:
             futures = [ex.submit(_run_one, t) for t in tasks if not t.get("done")]
-            # optionally handle exceptions here:
             for f in futures:
                 try:
                     f.result()
@@ -4906,7 +4951,7 @@ class ChatManager:
     # ------------------------------
     # Stage: context_analysis
     # ------------------------------
-    def _stage_context_analysis(self, ctx: Context, prev_output: str | None) -> str:
+    def _stage_context_analysis(self, ctx: Context, prev_output: str | None = None) -> str:
         """
         Perform a focused context analysis of the user’s latest message.
         Returns the analysis text.
@@ -4923,6 +4968,7 @@ class ChatManager:
         # record it for both human‐readability and downstream stages
         ctx.ctx_txt += ca + "\n"
         return ca
+
 
 
     # ------------------------------
@@ -4976,50 +5022,33 @@ class ChatManager:
     # ------------------------------
     # Stage 5: external_knowledge_retrieval
     # ------------------------------
-    def _stage_external_knowledge_retrieval(self, ctx):
-        facts = self._fetch_external_knowledge(ctx["user_message"])
+    def _stage_external_knowledge_retrieval(self, ctx) -> str:
+        facts = self._fetch_external_knowledge(ctx.user_message)
         if facts:
-            ctx["ctx_txt"] += "\n" + facts
-        return None
+            ctx.ctx_txt += "\n" + facts
+            return facts
+        return ""
+
 
     # ------------------------------
     # Stage 6: memory_summarization
     # ------------------------------
-    def _stage_memory_summarization(self, ctx: Context):
-        """
-        Every N turns compress full history to a short summary stored in memory.
-        """
-        # only run every 10th turn
-        if len(ctx.history_manager.history) % 10 != 0:
-            return None
-
-        full = "\n".join(m["content"] for m in ctx.history_manager.history)
-        try:
-            resp = chat(
-                model=self.config_manager.config["secondary_model"],
-                messages=[
-                    {"role": "system", "content":
-                        "You are a Memory Agent—summarize this conversation in one paragraph."
-                    },
-                    {"role": "user", "content": full}
-                ],
-                stream=False
-            )
-            summary = resp["message"]["content"].strip()
-            log_message("Memory summary: " + summary, "INFO")
+    def _stage_memory_summarization(self, ctx: Context) -> str:
+        summary = self._memory_summarize()
+        if summary:
             ctx.ctx_txt += "\nMemory summary:\n" + summary
             return summary
-        except Exception as e:
-            log_message(f"Memory summarization failed: {e}", "ERROR")
-            return None
+        return ""
+
 
 
     # ------------------------------
     # Stage 7: planning_summary
     # ------------------------------
-    def _stage_planning_summary(self, ctx):
+    def _stage_planning_summary(self, ctx) -> str:
+        import re
         peek = []
-        for tok, done in self._stream_tool(ctx["user_message"]):
+        for tok, done in self._stream_tool(ctx.user_message):
             peek.append(tok)
             if done:
                 break
@@ -5033,15 +5062,17 @@ class ChatManager:
                     {"role":"system",
                      "content":"You are a Planning Agent. Describe in one casual sentence what tool call you will make next."},
                     {"role":"user", "content":
-                        f"The user said: “{ctx['user_message']}”. I will now run `{call}`."}
+                        f"The user said: “{ctx.user_message}”. I will now run `{call}`."}
                 ],
                 stream=False
             )["message"]["content"].strip()
             log_message(f"Planning summary: {plan}", "INFO")
-            if not ctx["skip_tts"] and plan:
+            if not ctx.skip_tts and plan:
                 self.tts_manager.enqueue(plan)
-            ctx["ctx_txt"] += f"\n[Planning summary]: {plan}"
-        return None
+            ctx.ctx_txt += f"\n[Planning summary]: {plan}"
+            return plan
+        return ""
+
 
     # ------------------------------
     # Stage 8: tool_chaining
@@ -5216,25 +5247,28 @@ class ChatManager:
     # Stage 11: chain_of_thought
     # ------------------------------
     def _stage_chain_of_thought(self, ctx):
+        external_facts   = ctx.stage_outputs.get("external_knowledge_retrieval", "")
+        memory_summary   = ctx.stage_outputs.get("memory_summarization", "")
+        planning_summary = ctx.stage_outputs.get("planning_summary", "")
         cot = self._chain_of_thought(
-            user_message=ctx["user_message"],
-            context_analysis=ctx["ctx_txt"],
-            external_facts="",      # already baked in ctx_txt
-            memory_summary="",
-            planning_summary="",
-            tool_summaries=ctx["tool_summaries"],
-            final_response=ctx["final_response"]
+            user_message=ctx.user_message,
+            context_analysis=ctx.ctx_txt,
+            external_facts=external_facts,
+            memory_summary=memory_summary,
+            planning_summary=planning_summary,
+            tool_summaries=ctx.tool_summaries,
+            final_response=ctx.final_response
         )
-        # append to disk
         try:
             path = os.path.join(session_folder, "thoughts.json")
             bag  = json.load(open(path)) if os.path.exists(path) else []
             bag.append({"timestamp": datetime.now().isoformat(), "chain_of_thought": cot})
-            with open(path,"w") as f:
+            with open(path, "w") as f:
                 json.dump(bag, f, indent=2)
         except:
             pass
         return None
+
 
     # ------------------------------
     # Stage 12: notification_audit
@@ -5259,7 +5293,7 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
         # 1) Capture until silence
         chunk = audio_queue.get(); audio_queue.task_done()
         buffer = [chunk]; silence_start = None
-        log_message("Recording audio until silence detected...", "DEBUG")
+        #log_message("Recording audio until silence detected...", "DEBUG")
         while True:
             chunk = audio_queue.get(); audio_queue.task_done()
             buffer.append(chunk)
@@ -5272,7 +5306,7 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
                 elif time.time() - silence_start >= silence_duration:
                     break
 
-        log_message(f"Silence for {silence_duration}s; processing audio...", "INFO")
+        #log_message(f"Silence for {silence_duration}s; processing audio...", "INFO")
         audio_array = np.concatenate(buffer, axis=0).flatten().astype(np.float32)
 
         # 2) Optional enhancement
@@ -5282,7 +5316,7 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
             log_message("Audio enhancement complete.", "SUCCESS")
 
         # 3) Transcribe via consensus helper
-        log_message("Transcribing via consensus helper...", "PROCESS")
+        #log_message("Transcribing via consensus helper...", "PROCESS")
         transcription = consensus_whisper_transcribe_helper(
             audio_array,
             language="en",
@@ -5290,7 +5324,7 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
             consensus_threshold=config.get("consensus_threshold", 0.8)
         )
         if not transcription or not validate_transcription(transcription):
-            log_message("Invalid transcription; skipping.", "WARNING")
+            #log_message("Invalid transcription; skipping.", "WARNING")
             continue
 
         labeled = f"{transcription}"
