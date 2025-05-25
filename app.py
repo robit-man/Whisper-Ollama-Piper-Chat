@@ -18,8 +18,8 @@ This script now integrates:
     whose output is then passed to the primary model.
 """
 
-import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib, random, copy, statistics
-from datetime import datetime
+import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib, random, copy, statistics, ast
+from datetime import datetime, timezone
 
 # Define ANSI terminal colors for verbose logging
 COLOR_RESET = "\033[0m"
@@ -172,7 +172,9 @@ if not os.path.exists(SETUP_MARKER):
         "opencv-python",             # For image processing
         "mss",             # For screen capture
         "selenium",
-        "webdriver-manager"
+        "webdriver-manager",
+        "flask_cors",
+        "flask",            # For web server
     ])
     with open(SETUP_MARKER, "w") as f:
         f.write("Setup complete")
@@ -258,8 +260,10 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import whisper
+
 from ollama import chat, embed
 from dotenv import load_dotenv
+from ollama._types import ResponseError
 
 # ── Selenium stack
 from selenium import webdriver
@@ -301,8 +305,12 @@ import mss
 
 load_dotenv()
 brave_api_key = os.environ.get("BRAVE_API_KEY")
-print("brave key loaded from .env: " + brave_api_key)
+if brave_api_key:
+    print(f"brave key loaded from .env: {brave_api_key}")
+else:
+    log_message("BRAVE_API_KEY not set; falling back to DuckDuckGo search", "WARNING")
 log_message("Environment variables loaded using dotenv", "INFO")
+
 
 # ----- Load Whisper Models -----
 log_message("Loading Whisper models...", "PROCESS")
@@ -352,6 +360,15 @@ except Exception as e:
 log_message("Loading denoiser model (DNS64)...", "PROCESS")
 denoiser_model = pretrained.dns64()   # Loads a pretrained DNS64 model from denoiser
 log_message("Denoiser model loaded.", "SUCCESS")
+
+
+# ─── OBSERVABILITY & FLASK IMPORTS ─────────────────────────────────────
+import threading, time, json
+from datetime import datetime
+
+from flask import Flask, Response, render_template_string, request, jsonify
+from flask_cors import CORS
+from werkzeug.serving import make_server
 
 # ----- Global Settings and Queues -----
 
@@ -1189,7 +1206,116 @@ class Tools:
         path = os.path.join(WORKSPACE_DIR, "tasks.json")
         tasks = json.loads(open(path).read()) if os.path.exists(path) else []
         return json.dumps(tasks)
-# ───────── REPLACE TOOLS SECTION ─────────
+    
+    # ── Tools.run_python_snippet  (drop-in) ──────────────────────────────
+    @staticmethod
+    def run_python_snippet(
+        code: str,
+        *,
+        stdin: str = "",
+        timeout: int = 10,
+        dedent: bool = True,
+    ) -> dict:
+        """
+        Execute an arbitrary Python snippet in a fresh subprocess.
+
+        Parameters
+        ----------
+        code : str
+            The snippet to run.  It may already be wrapped in
+            ```python …```   or   ```py …``` fences – these are stripped
+            automatically so callers don’t have to worry.
+        stdin : str
+            Text piped to the child process’ STDIN.
+        timeout : int
+            Hard wall-clock limit (seconds).
+        dedent : bool
+            If True, run `textwrap.dedent()` on the snippet after stripping
+            fences – makes copy-pasted indented code work.
+
+        Returns
+        -------
+        dict
+            {
+            "stdout":      <captured STDOUT str>,
+            "stderr":      <captured STDERR str>,
+            "returncode":  <int>,
+            }
+            On failure an ``"error"`` key is present instead.
+        """
+        import re, subprocess, sys, tempfile, textwrap, os
+
+        # 1) unwrap optional back-tick fences -----------------------------------
+        fence_rx = re.compile(
+            r"```(?:python|py)?\s*([\s\S]*?)\s*```",
+            re.IGNORECASE,
+        )
+        m = fence_rx.search(code)
+        if m:
+            code = m.group(1)
+
+        if dedent:
+            code = textwrap.dedent(code)
+
+        # 2) write to a temporary .py file --------------------------------------
+        with tempfile.NamedTemporaryFile("w+", suffix=".py", delete=False) as tmp:
+            tmp.write(code)
+            tmp_path = tmp.name
+
+        # 3) run it in a clean subprocess ---------------------------------------
+        try:
+            proc = subprocess.run(
+                [sys.executable, tmp_path],
+                input=stdin,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+            return {
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "returncode": proc.returncode,
+            }
+
+        except subprocess.TimeoutExpired:
+            return {"error": f"Timed-out after {timeout}s"}
+
+        except Exception as e:                       # any other unexpected error
+            return {"error": str(e)}
+
+        finally:                                     # always clean up the temp file
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+    @staticmethod
+    def run_tool_once(tool_call:str) -> dict:
+        """
+        Convenience: parse `tool_call` (e.g. "hello('world')")
+        → execute the referenced *tool function* in-process
+        → return { "output":…, "exception": str|None }.
+        Useful for micro-benchmarks when launching a subprocess is overkill.
+        """
+        import ast, inspect, traceback
+        m = ast.parse(tool_call.strip(), mode="eval")
+        if not isinstance(m.body, ast.Call):
+            return {"exception": "Not a function call"}
+        name = m.body.func.id
+        fn   = getattr(Tools, name, None)
+        if not callable(fn):
+            return {"exception": f"Unknown tool {name}"}
+        # rebuild positional / kw from the AST
+        args   = [ast.literal_eval(ast.get_source_segment(tool_call,a)) for a in m.body.args]
+        kwargs = {kw.arg: ast.literal_eval(ast.get_source_segment(tool_call,kw.value))
+                  for kw in m.body.keywords}
+        try:
+            out = fn(*args, **kwargs)
+            return {"output": out, "exception": None}
+        except Exception as e:
+            return {"output": None, "exception": traceback.format_exc(limit=2)}
+
 
     @staticmethod
     def run_script(
@@ -1289,28 +1415,295 @@ class Tools:
         del Tools._process_registry[pid]
         return {"exit_code": rc}
 
+    @staticmethod
+    def explore_tools(action: str = "list", tool: str | None = None) -> str:
+        """
+        Tiny dispatcher so agents can:
+            • explore_tools("list")          –> same as list_tools(detail=True)
+            • explore_tools("source","foo")  –> same as get_tool_source("foo")
+        """
+        if action == "list":
+            return Tools.list_tools(detail=True)
+        if action == "source" and tool:
+            return Tools.get_tool_source(tool)
+        return "Usage: explore_tools('list')  or  explore_tools('source','tool_name')"
+
+
+    # ───────────────────────────  SELF-IMPROVEMENT HELPERS  ───────────────────────────
+    @staticmethod
+    def list_tools(detail: bool = False) -> str:
+        """
+        Return JSON metadata for every callable tool currently on Tools.
+
+        detail=False → ["name", ...]  
+        detail=True  → [{"name","signature","doc"}, ...]
+        """
+        import inspect, json, textwrap
+
+        tools: list = []
+        for name, fn in inspect.getmembers(Tools, predicate=callable):
+            if name.startswith("_"):
+                continue
+            if detail:
+                sig = str(inspect.signature(fn))
+                doc = textwrap.shorten(inspect.getdoc(fn) or "", width=140)
+                tools.append({"name": name, "signature": sig, "doc": doc})
+            else:
+                tools.append(name)
+        return json.dumps(tools, indent=2)
 
     @staticmethod
-    def load_external_tools():
+    def get_tool_source(tool_name: str) -> str:
         """
-        Dynamically load .py in external_tools/ as @staticmethods on Tools,
-        then refresh agent_stack.json.
+        Return the *source code* for `tool_name`, or an error string.
         """
-        import os, sys, inspect, importlib.machinery, importlib.util
+        import inspect
 
-        external_dir = os.path.join(os.path.dirname(__file__), "external_tools")
-        os.makedirs(external_dir, exist_ok=True)
+        fn = getattr(Tools, tool_name, None)
+        if not fn or not callable(fn):
+            return f"Error: tool '{tool_name}' not found."
+        try:
+            return inspect.getsource(fn)
+        except Exception as e:                     # pragma: no-cover
+            return f"Error retrieving source: {e}"
 
-        for fname in os.listdir(external_dir):
-            if not fname.endswith(".py") or fname.startswith("_"):
+    @staticmethod
+    def create_tool(
+        tool_name: str,
+        code: str | None = None,
+        *,
+        description: str | None = None,           # ← tolerated, but ignored
+        tool_call: str | None = None,             # ← dito (compat shim)
+        overwrite: bool = False,
+        auto_reload: bool = True,
+    ) -> str:
+        """
+        Persist a new *external tool* and optionally hot-reload it.
+
+        Parameters
+        ----------
+        tool_name    name of the Python file **and** the function inside it
+        code         full `def tool_name(...):` **OR** None when you just want
+                     to reserve the name (rare – normally provide real code)
+        description  ignored → kept for backward compatibility with agents
+        tool_call    ignored → ditto
+        overwrite    allow clobbering an existing file
+        auto_reload  immediately import the new module and attach the function
+        """
+        import os, re, textwrap
+
+        ext_dir = os.path.join(os.path.dirname(__file__), "external_tools")
+        os.makedirs(ext_dir, exist_ok=True)
+        file_path = os.path.join(ext_dir, f"{tool_name}.py")
+
+        # ── guard rails ────────────────────────────────────────────────────
+        if os.path.exists(file_path) and not overwrite:
+            return f"Error: {file_path} already exists (use overwrite=True)."
+
+        if code is None:
+            return ("Error: `code` is required.  Pass the full function body "
+                    "as a string under the `code=` parameter.")
+
+        if not re.match(rf"^\s*def\s+{re.escape(tool_name)}\s*\(", code):
+            return (f"Error: `code` must start with `def {tool_name}(` so that "
+                    "the module exposes exactly one top-level function.")
+
+        # ── write the module ───────────────────────────────────────────────
+        try:
+            with open(file_path, "w", encoding="utf-8") as fh:
+                header = textwrap.dedent(f'''\
+                    """
+                    Auto-generated external tool  –  {tool_name}
+                    Created via Tools.create_tool()
+                    {('Description: ' + description) if description else ''}
+                    """
+                    ''')
+                fh.write(header.rstrip() + "\n\n" + code.strip() + "\n")
+        except Exception as e:
+            return f"Error writing file: {e}"
+
+        log_message(f"Created external tool {tool_name} at {file_path}", "SUCCESS")
+
+        if auto_reload:
+            Tools.reload_external_tools()
+
+        return f"Tool '{tool_name}' created ✔"
+
+    @staticmethod
+    def list_external_tools() -> list[str]:
+        """
+        List *.py files currently present in *external_tools/*.
+        """
+        import os
+        ext_dir = os.path.join(os.path.dirname(__file__), "external_tools")
+        if not os.path.isdir(ext_dir):
+            return []
+        return sorted(f for f in os.listdir(ext_dir) if f.endswith(".py"))
+
+    @staticmethod
+    def remove_external_tool(tool_name: str) -> str:
+        """
+        Delete *external_tools/<tool_name>.py* and detach it from Tools.
+        """
+        import os, sys, importlib
+
+        ext_dir = os.path.join(os.path.dirname(__file__), "external_tools")
+        path = os.path.join(ext_dir, f"{tool_name}.py")
+
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                # also nuke any stale .pyc
+                pyc = path + "c"
+                if os.path.isfile(pyc):
+                    os.remove(pyc)
+            if hasattr(Tools, tool_name):
+                delattr(Tools, tool_name)
+            sys.modules.pop(f"external_tools.{tool_name}", None)
+            log_message(f"External tool {tool_name} removed.", "INFO")
+            return f"Tool '{tool_name}' removed."
+        except Exception as e:                     # pragma: no-cover
+            return f"Error removing tool: {e}"
+
+    @staticmethod
+    def reload_external_tools() -> str:
+        """
+        Detach any previously-loaded external tools, purge their modules, then
+        re-import everything found in *external_tools/*.
+        """
+        import sys, inspect
+
+        # 1️⃣  Detach current externals from Tools
+        for name, fn in list(inspect.getmembers(Tools, predicate=callable)):
+            if getattr(fn, "__module__", "").startswith("external_tools."):
+                delattr(Tools, name)
+
+        # 2️⃣  Purge from sys.modules so the next import is fresh
+        for mod in list(sys.modules):
+            if mod.startswith("external_tools."):
+                sys.modules.pop(mod, None)
+
+        # 3️⃣  Re-import
+        Tools.load_external_tools()
+        return "External tools reloaded."
+
+    @staticmethod
+    def test_tool(tool_name: str, test_cases: list[dict]) -> dict:
+        """
+        Quick-and-dirty unit-test harness.
+
+        Each *test_case* dict may contain:  
+          • args   : list – positional args  
+          • kwargs : dict – keyword args  
+          • expect : any  – expected value (optional)  
+          • compare: "eq" | "contains" | "custom" (default "eq")  
+          • custom : a **lambda** as string, evaluated only when compare="custom"
+        """
+        import traceback
+
+        fn = getattr(Tools, tool_name, None)
+        if not fn or not callable(fn):
+            return {"error": f"Tool '{tool_name}' not found."}
+
+        passed = failed = 0
+        results = []
+
+        for idx, case in enumerate(test_cases, 1):
+            args   = case.get("args", []) or []
+            kwargs = case.get("kwargs", {}) or {}
+            expect = case.get("expect")
+            mode   = case.get("compare", "eq")
+            try:
+                out = fn(*args, **kwargs)
+
+                if mode == "eq":
+                    ok = (out == expect)
+                elif mode == "contains":
+                    ok = str(expect) in str(out)
+                elif mode == "custom":
+                    ok = bool(eval(case.get("custom", "lambda *_: False"))(out))
+                else:
+                    ok = False
+
+                passed += ok
+                failed += (not ok)
+                results.append({"case": idx, "passed": ok, "output": out})
+            except Exception as e:
+                failed += 1
+                results.append({
+                    "case": idx,
+                    "passed": False,
+                    "error": f"{e}",
+                    "trace": traceback.format_exc(limit=2),
+                })
+
+        return {"tool": tool_name, "passed": passed, "failed": failed, "results": results}
+
+    @staticmethod
+    def evaluate_tool(
+        tool_name: str,
+        metric_code: str,
+        sample_inputs: list[dict],
+    ) -> dict:
+        """
+        Evaluate a tool with an arbitrary metric.
+
+        • *metric_code* must be a **single-line λ**:  
+          `lambda output, **inputs: <float between 0-1>` (higher = better).
+
+        • *sample_inputs*  → list of **kwargs** dicts supplied to the tool.
+
+        Returns {"scores": [...], "mean_score": <float>, "details": [...]}
+        """
+        import statistics, traceback
+
+        fn = getattr(Tools, tool_name, None)
+        if not fn or not callable(fn):
+            return {"error": f"Tool '{tool_name}' not found."}
+
+        try:
+            scorer = eval(metric_code)
+            assert callable(scorer)          # noqa: S101
+        except Exception as e:
+            return {"error": f"Invalid metric_code: {e}"}
+
+        scores, details = [], []
+        for inp in sample_inputs:
+            try:
+                out = fn(**inp)
+                score = float(scorer(out, **inp))
+            except Exception as e:
+                score = 0.0
+                details.append({"input": inp, "error": str(e),
+                                "trace": traceback.format_exc(limit=1)})
+            scores.append(score)
+
+        mean = statistics.mean(scores) if scores else 0.0
+        return {"scores": scores, "mean_score": mean, "details": details}
+
+    # ───────────────────────────  EXTERNAL-TOOL LOADER  ───────────────────────────
+    @staticmethod
+    def load_external_tools() -> None:
+        """
+        Import every *.py* file in *external_tools/* and attach its **public**
+        callables as @staticmethods on Tools.
+        """
+        import os, inspect, importlib.machinery, importlib.util
+
+        ext_dir = os.path.join(os.path.dirname(__file__), "external_tools")
+        os.makedirs(ext_dir, exist_ok=True)
+
+        for fname in os.listdir(ext_dir):
+            if fname.startswith("_") or not fname.endswith(".py"):
                 continue
 
             mod_name = f"external_tools.{fname[:-3]}"
-            path = os.path.join(external_dir, fname)
+            path     = os.path.join(ext_dir, fname)
+
             loader = importlib.machinery.SourceFileLoader(mod_name, path)
             spec   = importlib.util.spec_from_loader(mod_name, loader)
             module = importlib.util.module_from_spec(spec)
-            loader.exec_module(module)
+            loader.exec_module(module)               # actual import
 
             for name, fn in inspect.getmembers(module, inspect.isfunction):
                 if name.startswith("_") or hasattr(Tools, name):
@@ -1318,7 +1711,9 @@ class Tools:
                 setattr(Tools, name, staticmethod(fn))
                 log_message(f"Loaded external tool: {name}()", "INFO")
 
+        # keep the public manifest in sync for other agents
         Tools.discover_agent_stack()
+
 
 
     @staticmethod
@@ -1567,6 +1962,7 @@ class Tools:
             "external_knowledge_retrieval",
             "memory_summarization",
             "planning_summary",
+            "tool_self_improvement", 
             "tool_chaining",
             "assemble_prompt",
             "final_inference",
@@ -1584,22 +1980,55 @@ class Tools:
         with open(stack_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
         return f"agent_stack.json created with {len(tools)} tools & {len(agents)} agents."
-
     @staticmethod
     def load_agent_stack() -> dict:
         """
-        Loads agent_stack.json, or auto-discovers if missing.
+        Return the contents of *agent_stack.json*.
+
+        • If the file is missing or unreadable ⇒ call
+          `Tools.discover_agent_stack()` to (re)create it, then reload.
+        • If the JSON loads but is missing any of the canonical
+          top-level keys (“tools”, “agents”, “stages”) ⇒ we *merge-patch*
+          those keys from a fresh discovery result.
         """
+        import os, json, copy
+
         module_path = os.path.dirname(os.path.abspath(__file__))
         stack_path  = os.path.join(module_path, "agent_stack.json")
-        if not os.path.isfile(stack_path):
-            Tools.discover_agent_stack()
-        try:
+
+        # helper: (re)generate the stack file on disk
+        def _regen() -> dict:
+            Tools.discover_agent_stack()          # writes the file
             with open(stack_path, "r", encoding="utf-8") as f:
                 return json.load(f)
+
+        # 1️⃣  Ensure the file exists – otherwise create from scratch
+        if not os.path.isfile(stack_path):
+            return _regen()
+
+        # 2️⃣  Try to load it; regenerate on corruption
+        try:
+            with open(stack_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
         except Exception:
-            # fallback to regeneration
-            return {"tools": [], "agents": [], "stages": []}
+            return _regen()
+
+        # 3️⃣  Patch any missing keys without nuking user additions
+        required_keys = {"tools", "agents", "stages"}
+        if not required_keys.issubset(data.keys()):
+            fresh = _regen()
+            merged = copy.deepcopy(fresh)          # start with complete set
+            merged.update(data)                    # user keys / overrides win
+            # ensure required keys exist after merge
+            for k in required_keys:
+                merged.setdefault(k, fresh[k])
+            # write the patched file back
+            with open(stack_path, "w", encoding="utf-8") as f:
+                json.dump(merged, f, indent=2)
+            return merged
+
+        return data
+
 
     @staticmethod
     def update_agent_stack(changes: dict, justification: str | None = None) -> str:
@@ -2874,6 +3303,90 @@ class Observer:
         )
         return fails / len(last)
 
+
+class ObservabilityManager:
+    """
+    Wraps Observer to emit every event as JSON over SSE,
+    proxies other calls, and adds per-token streaming.
+    """
+    def __init__(self, real_observer):
+        self.real = real_observer
+        self._subscribers = []
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+    def subscribe(self, fn):
+        self._subscribers.append(fn)
+
+    def _emit(self, event: dict):
+        payload = json.dumps(event)
+        for fn in list(self._subscribers):
+            try:
+                fn(payload)
+            except:
+                self._subscribers.remove(fn)
+
+    # Run lifecycle
+    def start_run(self, user_msg):
+        rid = self.real.start_run(user_msg)
+        self._emit({
+            "runId": rid, "type":"run_start", "user_msg":user_msg,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+        return rid
+
+    def log_stage_start(self, runId, stage):
+        self.real.log_stage_start(runId, stage)
+        self._emit({
+            "runId": runId, "type":"stage_start", "stage":stage,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
+    def log_stage_token(self, runId, stage, token):
+        # new: per‐token streaming
+        self._emit({
+            "runId": runId, "type":"stage_stream",
+            "stage":stage, "token": token,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
+    def log_stage_end(self, runId, stage):
+        self.real.log_stage_end(runId, stage)
+        self._emit({
+            "runId": runId, "type":"stage_end", "stage":stage,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
+    def log_error(self, runId, stage, err):
+        self.real.log_error(runId, stage, err)
+        self._emit({
+            "runId": runId, "type":"stage_error", "stage":stage,
+            "error": str(err),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
+    def complete_run(self, runId):
+        self.real.complete_run(runId)
+        self._emit({
+            "runId": runId, "type":"run_end",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
+    # Tool hooks
+    def log_tool_start(self, runId, tool):
+        self._emit({
+            "runId": runId, "type":"tool_start", "tool":tool,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
+    def log_tool_end(self, runId, tool, output):
+        self._emit({
+            "runId": runId, "type":"tool_end", "tool":tool,
+            "output": output,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
 # -------------------------------------------------------------------
 # Expose two module-level variables for LLM introspection
 # -------------------------------------------------------------------
@@ -2919,6 +3432,12 @@ class Context:
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
 
+@dataclass
+class RunContext:
+    run_id:      str
+    user_msg:    str
+    context_text: str = ""
+    tool_choice: str = ""
 
 
 class ChatManager:
@@ -2942,7 +3461,11 @@ class ChatManager:
         self.mode_manager     = mode_manager
 
         # Observability & learning
-        self.observer         = Observer()
+        # self.observer         = Observer()
+        # wrap real Observer in SSE‐enabled Observable
+        real_obs = Observer()
+        self.observer = ObservabilityManager(real_obs)
+
         self.rl_manager       = RLManager()
         self.prompt_evaluator = PromptEvaluator()
         self._temp_bump       = 0.0
@@ -2969,31 +3492,37 @@ class ChatManager:
 
 
     STAGES = [
-        ("context_analysis",             "_stage_context_analysis",          None),
-        ("intent_clarification",         "_stage_intent_clarification",      "context_analysis"),
-        ("external_knowledge_retrieval", "_stage_external_knowledge_retrieval","intent_clarification"),
-        ("planning_summary",             "_stage_planning_summary",          "external_knowledge_retrieval"),
+        # ── core understanding ───────────────────────────────────────────
+        ("context_analysis",             "_stage_context_analysis",             None),
+        ("intent_clarification",         "_stage_intent_clarification",         "context_analysis"),
+        ("external_knowledge_retrieval", "_stage_external_knowledge_retrieval", "intent_clarification"),
+        ("planning_summary",             "_stage_planning_summary",             "external_knowledge_retrieval"),
 
-        # Complex‐task fulfilment pipeline:
-        ("define_criteria",              "_stage_define_criteria",           "planning_summary"),
-        ("task_decomposition",           "_stage_task_decomposition",        "define_criteria"),
-        ("plan_validation",              "_stage_plan_validation",           "task_decomposition"),
-        ("execute_actions",              "_stage_execute_actions",           "plan_validation"),
-        ("verify_results",               "_stage_verify_results",            "execute_actions"),
+        # ── 🔧 autonomous tool editing  ──────────────────────────────────
+        # will run only when `planning_summary` sets ctx.needs_tool_work = True
+        ("tool_self_improvement",        "_stage_tool_self_improvement",        "planning_summary"),
 
-        # Global task–list management:
-        ("task_management",              "_stage_task_management",           "verify_results"),
-        ("subtask_management",           "_stage_subtask_management",        "task_management"),
-        ("execute_tasks",                "_stage_execute_tasks",             "subtask_management"),
+        # ── complex-task fulfilment ──────────────────────────────────────
+        ("define_criteria",              "_stage_define_criteria",              "tool_self_improvement"),
+        ("task_decomposition",           "_stage_task_decomposition",           "define_criteria"),
+        ("plan_validation",              "_stage_plan_validation",              "task_decomposition"),
+        ("execute_actions",              "_stage_execute_actions",              "plan_validation"),
+        ("verify_results",               "_stage_verify_results",               "execute_actions"),
 
-        # Back to normal reply pipeline:
-        ("tool_chaining",                "_stage_tool_chaining",             "execute_tasks"),
-        ("assemble_prompt",              "_stage_assemble_prompt",           "tool_chaining"),
-        ("final_inference",              "_stage_final_inference",           "assemble_prompt"),
-        ("adversarial_loop",             "_stage_adversarial_loop",          "final_inference"),
-        ("notification_audit",           "_stage_notification_audit",        "adversarial_loop"),
-        ("flow_health_check",            "_stage_flow_health_check",         "notification_audit"),
+        # ── task-list management ─────────────────────────────────────────
+        ("task_management",              "_stage_task_management",              "verify_results"),
+        ("subtask_management",           "_stage_subtask_management",           "task_management"),
+        ("execute_tasks",                "_stage_execute_tasks",                "subtask_management"),
+
+        # ── normal reply pipeline ────────────────────────────────────────
+        ("tool_chaining",                "_stage_tool_chaining",                "execute_tasks"),
+        ("assemble_prompt",              "_stage_assemble_prompt",              "tool_chaining"),
+        ("final_inference",              "_stage_final_inference",              "assemble_prompt"),
+        ("adversarial_loop",             "_stage_adversarial_loop",             "final_inference"),
+        ("notification_audit",           "_stage_notification_audit",           "adversarial_loop"),
+        ("flow_health_check",            "_stage_flow_health_check",            "notification_audit"),
     ]
+
 
 
     def _stage_flow_health_check(self, ctx):
@@ -3062,6 +3591,31 @@ class ChatManager:
 
         return None
 
+    def _inject_python_results(self, raw_text: str) -> str:
+        """
+        Scan *raw_text* for ```python ...``` blocks, execute them via
+        Tools.run_python_snippet, and append a fenced ```output``` block
+        with the captured result **immediately after each code block**.
+
+        The returned string is safe to pass to downstream stages/logs.
+        """
+        def _runner(match):
+            code_block = match.group(0)
+            code_only  = match.group(1)
+
+            res = Tools.run_python_snippet(code_only)
+            pretty = json.dumps(res, indent=2)
+
+            return (
+                f"{code_block}\n"
+                f"```output\n{pretty}\n```"
+            )
+
+        pattern = re.compile(
+            r"```(?:python|py)\s*([\s\S]*?)```",
+            re.IGNORECASE
+        )
+        return pattern.sub(_runner, raw_text)
 
     
     def _activate_context(self, name: str, history_mgr=None, tts_mgr=None):
@@ -3080,170 +3634,209 @@ class ChatManager:
         self.tts_manager     = self.current_ctx.tts_manager
         Tools._history_manager = self.current_ctx.history_manager
 
-
     def _stream_context(self, user_msg: str):
-        log_message("Phase 1: Starting context-analysis stream...", "INFO")
+        """
+        Phase 1 – context-analysis helper.
+        NOTE:  It receives **just the user message string** and
+        pulls the active run-id from self.current_run_id, so it
+        can be called safely from any stage.
+        """
+        run_id = self.current_run_id                     # <─ NEW
+        log_message("Phase 1: Starting context-analysis stream…", "INFO")
+        self.observer.log_stage_start(run_id, "context_analysis")
 
-        # 1) Build the system prompt
+        # 1) System prompt
         preamble = (
-            "You are the CONTEXT-ASSEMBLY AGENT. Your mission is to synthesize the user’s latest message, "
-            "conversation history, and the system’s tool capabilities to generate a focused analysis. "
-            "In your analysis, identify the user’s explicit objective, any implicit or underlying goals, "
-            "relevant tools or operations that may be needed, and surface any ambiguities. "
-            "Output ONLY a concise, structured summary: 1–2 sentences for straightforward queries or "
-            "3–4 sentences for more complex requests. Do NOT include examples, suggestions, or extraneous commentary."
+            "You are the CONTEXT-ASSEMBLY AGENT.  Synthesise the user’s "
+            "latest message, conversation history and tool capabilities "
+            "into a concise analysis (1–4 sentences)."
         )
 
-        # Gather tool signatures
+        # 2) tool signatures
+        import inspect, json
         func_sigs = []
-        for attr in dir(Tools):
-            if not attr.startswith("_") and callable(getattr(Tools, attr)):
+        for name in dir(Tools):
+            if name.startswith("_"):
+                continue
+            fn = getattr(Tools, name)
+            if callable(fn):
                 try:
-                    sig = inspect.signature(getattr(Tools, attr))
-                    func_sigs.append(f"  • {attr}{sig}")
-                except (ValueError, TypeError):
-                    func_sigs.append(f"  • {attr}(…)")
-        tools_block = "AVAILABLE TOOLS:\n" + "\n".join(func_sigs)
+                    func_sigs.append(f"  • {name}{inspect.signature(fn)}")
+                except (TypeError, ValueError):
+                    func_sigs.append(f"  • {name}(…)")
+        tools_block = "AVAILABLE_TOOLS:\n" + "\n".join(func_sigs)
 
-        # 2) Grab the last 5 exchanges
+        # 3) recent + similar history
         recent = "\n".join(
             f"{m['role'].upper()}: {m['content']}"
             for m in self.history_manager.history[-5:]
         )
-
-        # 3) Similarity search
         try:
             sim_json = Tools.get_chat_history(user_msg, 5)
-            sim_results = json.loads(sim_json).get("results", [])
-            similar = "\n".join(f"{e['role'].upper()}: {e['content']}" for e in sim_results)
-        except Exception as e:
-            log_message(f"Could not retrieve similar history: {e}", "WARNING")
-            similar = ""
+            sim = "\n".join(
+                f"{e['role'].upper()}: {e['content']}"
+                for e in json.loads(sim_json).get("results", [])
+            )
+        except Exception:
+            sim = ""
 
-        # 4) Assemble context
-        context_block = ""
-        if similar:
-            context_block += "SIMILAR PAST MESSAGES:\n" + similar + "\n\n"
+        ctx_block = ""
+        if sim:
+            ctx_block += f"SIMILAR PAST:\n{sim}\n\n"
         if recent:
-            context_block += "RECENT HISTORY:\n" + recent + "\n\n"
+            ctx_block += f"RECENT:\n{recent}\n\n"
 
-        # 5) Build payload
-        messages = [
-            {"role": "system", "content": "\n\n".join([preamble, tools_block, context_block])},
-            {"role": "user",   "content": user_msg}
-        ]
-        payload = self.build_payload(override_messages=messages, model_key="secondary_model")
+        payload = self.build_payload(
+            override_messages=[
+                {"role": "system", "content": "\n\n".join([preamble, tools_block, ctx_block])},
+                {"role": "user",   "content": user_msg}
+            ],
+            model_key="secondary_model"
+        )
 
-        # 6) Stream with lock, fallback on error
         print("⟳ Context: ", end="", flush=True)
         buf = ""
         with self.inference_lock:
             try:
-                for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
-                    if self.stop_flag:
-                        log_message("Phase 1 aborted by stop flag.", "WARNING")
-                        break
+                for part in chat(model=payload["model"],
+                                 messages=payload["messages"],
+                                 stream=True):
+                    self._tick_activity()
                     tok = part["message"]["content"]
                     buf += tok
+                    if run_id is not None:                 # <─ NEW
+                        self.observer.log_stage_token(run_id, "context_analysis", tok)
                     print(tok, end="", flush=True)
                     yield tok, False
             except Exception as e:
                 log_message(f"Context-analysis streaming failed: {e}", "ERROR")
-                # fallback
-                try:
-                    resp = chat(model=payload["model"], messages=payload["messages"], stream=False)
-                    content = resp.get("message", {}).get("content", "") or ""
-                    print(content, end="", flush=True)
-                    yield content, True
-                except Exception as e2:
-                    log_message(f"Context-analysis non-stream fallback failed: {e2}", "ERROR")
-                    yield "", True
+                yield "", True
                 return
 
-        # 7) Complete
         print()
-        log_message(f"Phase 1 complete: context analysis:\n{buf}", "INFO")
+        self.observer.log_stage_end(run_id, "context_analysis")
+        log_message("Phase 1 complete.", "INFO")
         yield "", True
 
-    def _stream_tool(self, user_msg: str):
-        log_message("Phase 2: Starting tool‐decision stream...", "INFO")
+    # ───────────────────────────────────────────────────────────────
+    #  Phase-2: _stream_tool  ― decide which helper to call
+    # ───────────────────────────────────────────────────────────────
+    def _stream_tool(self, ctx: "RunContext | str"):
+        """
+        Phase 2 – pick ONE helper (or NO_TOOL).
 
-        # Build list of tool signatures
-        tool_names = []
-        func_sigs = []
-        for attr in dir(Tools):
-            if not attr.startswith("_") and callable(getattr(Tools, attr)):
-                tool_names.append(attr)
+        • If the caller passes a RunContext we use it directly.
+        • If it passes a plain string we fabricate a shim object that has
+          .run_id, .user_message, .tool_choice so downstream code is happy.
+        """
+        import inspect, ast, re                               # NEW: explicit
+        # ─── 0) input normalisation ──────────────────────────────────────────
+        if isinstance(ctx, str):                              # NEW
+            class _Shim:
+                def __init__(self, rid, msg):
+                    self.run_id        = rid
+                    self.user_message  = msg                  # ← unified name
+                    self.tool_choice   = ""
+            ctx = _Shim(getattr(self, "current_run_id", None), ctx)
+
+        # guard for first-time RunContext instances ---------- NEW
+        if not hasattr(ctx, "tool_choice"):
+            ctx.tool_choice = ""
+
+        log_message("Phase 2: Starting tool-decision stream…", "INFO")
+        self.observer.log_stage_start(ctx.run_id, "tool_decision")
+
+        # ─── 1) enumerate available helpers ────────────────────────────────
+        tool_names, func_sigs = [], []
+        for name in dir(Tools):
+            if name.startswith("_"):
+                continue
+            fn = getattr(Tools, name)
+            if callable(fn):
+                tool_names.append(name)
                 try:
-                    sig = inspect.signature(getattr(Tools, attr))
-                    func_sigs.append(f"{attr}{sig}")
-                except (ValueError, TypeError):
-                    func_sigs.append(f"{attr}(…)")
-        tools_message = "AVAILABLE FUNCTIONS (name + signature only):\n" + "\n".join(func_sigs)
+                    func_sigs.append(f"{name}{inspect.signature(fn)}")
+                except (TypeError, ValueError):
+                    func_sigs.append(f"{name}(…)")
+        tools_msg = "AVAILABLE_FUNCTIONS:\n" + "\n".join(func_sigs)
 
-        # Instructions
         preamble = (
-            "You are a TOOL‐CALLING agent. Your ONLY job is to choose exactly one of the functions below—"
-            "no prose, no extra text. If you choose a function with text input, include the full query "
-            "as a double‐quoted string. Output exactly one of:\n"
-            "```tool_code\n<FunctionName>(\"arg1\", ...)\n```\n"
-            "or\n"
-            "```tool_code\nNO_TOOL\n```"
+            "You are a TOOL-CALLING agent.  Choose exactly one helper function.\n"
+            "If none are needed, output NO_TOOL.\n\n"
+            "Output ONE fenced block:\n"
+            "```tool_code\n<FunctionName>(…)\n```"
         )
-        final_instruction = "NOW: read the user message below and immediately output your SINGLE `tool_code` block."
+        final_inst = (
+            "NOW: read the user message below and immediately output your SINGLE "
+            "`tool_code` block."
+        )
 
-        messages = [
-            {"role": "system", "content": preamble},
-            {"role": "system", "content": tools_message},
-            {"role": "system", "content": final_instruction},
-            {"role": "user",   "content": user_msg}
-        ]
+        payload = self.build_payload(
+            override_messages=[
+                {"role": "system", "content": preamble},
+                {"role": "system", "content": tools_msg},
+                {"role": "system", "content": final_inst},
+                {"role": "user",   "content": ctx.user_message}
+            ],
+            model_key="secondary_model"
+        )
+        payload["temperature"] = self.config_manager.config.get(
+            "tool_temperature", payload["temperature"]
+        )
 
-        # Build payload
-        payload = self.build_payload(override_messages=messages, model_key="secondary_model")
-        payload["temperature"] = self.config_manager.config.get("tool_temperature", payload["temperature"])
-
-        # Stream with lock
+        # ─── 2) stream LLM output ───────────────────────────────────────────
         print("⟳ Tool: ", end="", flush=True)
         buf = ""
         with self.inference_lock:
             try:
-                for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
+                for part in chat(model=payload["model"],
+                                 messages=payload["messages"],
+                                 stream=True):
+                    self._tick_activity()                     # NEW
                     if self.stop_flag:
                         log_message("Phase 2 aborted by stop flag.", "WARNING")
                         break
                     tok = part["message"]["content"]
                     buf += tok
+                    ctx.tool_choice += tok
+                    self.observer.log_stage_token(
+                        ctx.run_id, "tool_decision", tok
+                    )
                     print(tok, end="", flush=True)
                     yield tok, False
             except Exception as e:
-                log_message(f"Tool‐decision streaming failed: {e}", "ERROR")
+                log_message(f"Tool-decision streaming failed: {e}", "ERROR")
 
-        # Log and extract
+        # ─── 3) finalise / parse the tool_code block ───────────────────────
         print()
-        log_message(f"Phase 2 complete: raw tool‐decision output:\n{buf}", "DEBUG")
-        import re, ast
-        pattern = (
-            r"(?:```tool_code\s*(.*?)\s*```)"   # fenced block
-            r"|^\s*([A-Za-z_]\w*\(.*?\))\s*$"   # bare call
+        log_message(f"Phase 2 complete: raw tool-decision output:\n{buf}", "DEBUG")
+
+        m = re.search(
+            r"(?:```tool_code\s*(.*?)\s*```)|^\s*([A-Za-z_]\w*\(.*?\))\s*$",
+            buf, re.DOTALL | re.MULTILINE
         )
-        m = re.search(pattern, buf, re.DOTALL | re.MULTILINE)
         code = (m.group(1) or m.group(2) or "").strip() if m else None
+
+        # strip stray inline type hints like “arg: int” ------------- NEW
+        if code:
+            code = re.sub(r'(\b[A-Za-z_]\w*)\s*:\s*[A-Za-z_]\w*', r'\1', code)
 
         if code and code.upper() != "NO_TOOL":
             try:
                 expr = ast.parse(code, mode="eval")
-                if not isinstance(expr, ast.Expression) or not isinstance(expr.body, ast.Call):
-                    raise ValueError("Not a single function call")
                 call = expr.body
-                if not isinstance(call.func, ast.Name) or call.func.id not in tool_names:
-                    raise ValueError(f"Unknown function '{getattr(call.func, 'id', None)}'")
+                # structural validation
+                if (not isinstance(expr, ast.Expression) or
+                    not isinstance(call, ast.Call) or
+                    not isinstance(call.func, ast.Name) or
+                    call.func.id not in tool_names):
+                    raise ValueError("Invalid helper name")
                 for arg in call.args:
                     if not isinstance(arg, ast.Constant):
-                        raise ValueError("All positional args must be literals")
+                        raise ValueError("Args must be literals")
                 for kw in call.keywords:
                     if not kw.arg or not isinstance(kw.value, ast.Constant):
-                        raise ValueError("All keyword args must be literal")
+                        raise ValueError("Kwargs must be literals")
                 log_message(f"Tool selected: {code}", "INFO")
             except Exception as e:
                 log_message(f"Invalid tool invocation `{code}`: {e}", "ERROR")
@@ -3252,162 +3845,268 @@ class ChatManager:
             log_message("No valid tool_code detected; treating as NO_TOOL.", "INFO")
             code = None
 
+        self.observer.log_stage_end(ctx.run_id, "tool_decision")
         yield "", True
 
-    # ─── Replacement ───
+
+    # ------------------------------------------------------------------
+    #  FIXED  _stage_task_decomposition
+    # ------------------------------------------------------------------
     def _stage_task_decomposition(self, ctx) -> list[str]:
-        import json, ast, re
+        """
+        Build a list of tool calls that will achieve the user request.
 
-        # 1) collect real tool names
+        – Accepts JSON / Python-literal / Markdown-fenced output from the LLM.  
+        – Silently strips *type hints* (`: int`, `: str = …`) and converts any
+          **bare tool names** into “no-arg” calls (`foo` → `foo()`).
+
+        Returns the cleaned list (possibly empty) and stores it on ctx.plan.
+        """
+        import json, ast, re, inspect
+
+        # ---------- 1.  Prompt the LLM ----------
         tool_names = [
-            attr for attr in dir(Tools)
-            if not attr.startswith("_") and callable(getattr(Tools, attr))
+            n for n, f in inspect.getmembers(Tools, callable)
+            if not n.startswith("_")
         ]
-
         prompt = (
-            "You are a Task-Decomposer. Available tools:\n    "
-            + ", ".join(tool_names) + "\n\n"
+            "You are a Task-Decomposer.\n"
+            f"Available tools: {', '.join(tool_names)}\n\n"
             f'User request: "{ctx.user_message}"\n\n'
-            "Return exactly one line: valid JSON array (no markdown, no explanation), "
-            "where each element is a complete tool-call string from that list."
-        )
-        payload = {
-            "model":    self.config_manager.config["secondary_model"],
-            "messages": [{"role": "system", "content": prompt}],
-            "stream":   False
-        }
-        raw = chat(**payload)["message"]["content"].strip()
-        log_message(f"[Task-Decomposer raw] {raw!r}", "DEBUG")
-
-        # strip fences & labels
-        cleaned = re.sub(r"```(?:json|tool_code)?", "", raw, flags=re.IGNORECASE).strip("` \n")
-        cleaned = re.sub(r"(?i)^(here is|the plan:?|output:)\s*", "", cleaned).strip()
-
-        plan: list[str] = []
-        error_msg = ""
-
-        # try strict JSON
-        try:
-            plan = json.loads(cleaned)
-            if not isinstance(plan, list):
-                raise ValueError("decoded but not a list")
-        except Exception as e_json:
-            # try Python literal
-            try:
-                plan = ast.literal_eval(cleaned)
-                if not isinstance(plan, list):
-                    raise ValueError("literal_eval not list")
-            except Exception as e_py:
-                # fallback: grab lines that look like calls
-                candidates = [
-                    ln.strip().rstrip(",")
-                    for ln in cleaned.splitlines()
-                    if re.match(r"^[A-Za-z_]\w*\s*\(", ln)
-                ]
-                if candidates:
-                    plan = candidates
-                else:
-                    error_msg = f"parse failure ({e_json!s}; {e_py!s})"
-
-        # validate each element syntax
-        valid = [c for c in plan if re.match(r'^[A-Za-z_]\w*\s*\(.*\)$', str(c).strip())]
-        if len(valid) != len(plan):
-            error_msg = "some elements did not look like tool calls"
-            plan = valid
-
-        # 2) filter out any calls not in real tools
-        filtered = []
-        dropped = []
-        for call_str in plan:
-            fn = call_str.split("(")[0]
-            if fn in tool_names:
-                filtered.append(call_str)
-            else:
-                dropped.append(call_str)
-        if dropped:
-            log_message(f"Dropped unknown tool calls: {dropped}", "WARNING")
-        plan = filtered
-
-        if plan:
-            ctx.ctx_txt += f"\n[Task-Decomposition] {plan}"
-            log_message(f"Task plan accepted: {plan}", "INFO")
-            return plan
-        else:
-            msg = error_msg or "no valid tool calls"
-            ctx.ctx_txt += f"\n[Task-Decomposition FAILED] {msg}"
-            log_message(f"Task decomposition failed → {msg}", "ERROR")
-            return []
-
-
-
-    def _stage_plan_validation(self, ctx):
-        """
-        Validate or refine the generated plan against the original request.
-        """
-        import json, re
-
-        plan = getattr(ctx, "plan", [])
-        prompt = (
-            "You are a Plan Validator.  The user asked:\n\n"
-            f"    \"{ctx.user_message}\"\n\n"
-            "The current plan (JSON list of tool calls) is:\n\n"
-            f"    {json.dumps(plan, indent=2)}\n\n"
-            "If this plan fully and correctly implements the request, reply with\n"
-            "    NO_CHANGES\n"
-            "Otherwise output a revised JSON array of tool-call strings."
+            "Return **only** a JSON array where each item is ONE call, e.g.:\n"
+            '  ["search_internet(\\"cats\\")", "summarize_search()", ...]'
         )
         resp = chat(
             model=self.config_manager.config["secondary_model"],
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user",   "content": 
-                    f"Please compare the plan above against the original request: \"{ctx.user_message}\" and suggest revisions if needed."
-                }
-            ],
+            messages=[{"role":"system","content":prompt}],
             stream=False
-        )["message"]["content"].strip()
+        )["message"]["content"]
 
+        # ---------- 2.  Unfence / detype ----------
+        raw = re.sub(r"```(?:json|tool_code)?", "", resp, flags=re.I).strip("` \n")
+        raw = re.sub(r"\s*#.*", "", raw)                # strip line comments
+        raw = re.sub(r":\s*\w+\s*(?==)", "", raw)       # strip “: int =”
+        raw = re.sub(r":\s*\w+\s*\)", ")", raw)         # strip “arg: int)”
 
-        # strip any ```json``` fences or backticks
-        resp_clean = re.sub(r'```(?:json)?\s*|\s*```', '', resp, flags=re.DOTALL).strip()
-
-        # no change requested?
-        if not resp_clean or resp_clean.upper() == "NO_CHANGES":
-            return None
-
-        # try to parse JSON
+        # ---------- 3.  Parse to list ----------
         try:
-            new_plan = json.loads(resp_clean)
-            if isinstance(new_plan, list):
-                setattr(ctx, "plan", new_plan)
-                ctx.ctx_txt += f"\n[Plan Validation] revised → {new_plan}"
-            else:
-                log_message(f"Plan validation ignored non-list output: {resp_clean!r}", "WARNING")
-        except json.JSONDecodeError as e:
-            log_message(f"Plan validation returned invalid JSON: {e}; output was: {resp_clean!r}", "WARNING")
-        return None
+            plan = json.loads(raw)
+        except Exception:
+            try:
+                plan = ast.literal_eval(raw)
+            except Exception:
+                plan = []
 
+        if not isinstance(plan, list):
+            plan = []
+
+        cleaned: list[str] = []
+        call_re = re.compile(r'^[A-Za-z_]\w*\s*\(')      # looks like foo(
+
+        for item in plan:
+            if not isinstance(item, str):
+                continue
+            item = item.strip().rstrip(",")
+            if not item:
+                continue
+
+            # add () if it’s a bare tool name
+            if item in tool_names:
+                item = f"{item}()"
+
+            # skip unknown tools
+            fn = item.split("(", 1)[0]
+            if fn not in tool_names:
+                continue
+
+            # reject obvious junk
+            if not call_re.match(item):
+                continue
+
+            cleaned.append(item)
+
+        if not cleaned:
+            ctx.ctx_txt += "\n[Task-Decomposition FAILED] no valid tool calls"
+            log_message("Task decomposition failed → no valid tool calls", "ERROR")
+            ctx.plan = []
+            return []
+
+        ctx.plan = cleaned
+        ctx.ctx_txt += f"\n[Task-Decomposition] {cleaned}"
+        log_message(f"Task plan accepted: {cleaned}", "INFO")
+        return cleaned
+
+
+
+    # ------------------------------
+    # Stage 9: plan_validation  (upgraded)
+    # ------------------------------
+    def _stage_plan_validation(self, ctx):
+        """
+        Validate -- and if needed *refine* -- ctx.plan (list[str] tool calls).
+
+        Adds / mutates context attributes:
+            ctx.plan_validated : bool
+            ctx.needs_tool_work : bool
+            ctx.validation_note : str
+        """
+        import json, re, ast, inspect, textwrap
+
+        plan: list[str] = getattr(ctx, "plan", [])
+        if not plan:
+            ctx.plan_validated = False
+            ctx.validation_note = "No plan generated."
+            log_message("[plan_validation] Empty plan – nothing to validate.", "WARNING")
+            return
+
+        # ── helper: single-call semantic guard via LLM ──────────────────────
+        def _llm_check(call: str) -> tuple[bool, str, str]:
+            """
+            Returns (ok:bool, reason:str, suggestion:str|NO_TOOL)
+            """
+            prompt = textwrap.dedent(f"""
+                USER REQUEST:
+                «{ctx.user_message}»
+
+                CANDIDATE CALL:
+                ```tool_code
+                {call}
+                ```
+
+                Reply in *one* line of valid JSON:
+                {{"valid": true|false, "reason": "...", "suggest": "<call>|NO_TOOL"}}
+            """)
+            raw = chat(
+                model=self.config_manager.config["secondary_model"],
+                messages=[{"role":"user","content":prompt}],
+                stream=False
+            )["message"]["content"].strip()
+            raw = re.sub(r"```(?:json)?|```", "", raw, flags=re.I).strip()
+            try:
+                out = json.loads(raw)
+                return bool(out.get("valid")), str(out.get("reason","")).strip(), str(out.get("suggest","NO_TOOL")).strip()
+            except Exception as e:
+                return False, f"Unparsable validator JSON: {e}", "NO_TOOL"
+
+        # ── pass 1 : syntax / availability check ────────────────────────────
+        valid_calls : list[str] = []
+        tool_names   = {n for n,_ in inspect.getmembers(Tools, inspect.isfunction)
+                        if not n.startswith("_")}
+
+        ctx.needs_tool_work = False
+        for call_raw in plan:
+            call = call_raw.strip()
+            # strip stray code fences if decomposer kept them
+            call = re.sub(r"^```tool_code\s*|\s*```$", "", call, flags=re.I).strip()
+
+            # quick syntax validation
+            parsed = Tools.parse_tool_call(call)
+            if not parsed:
+                log_message(f"[plan_validation] Dropped invalid syntax: {call_raw!r}", "ERROR")
+                continue
+
+            fn_name = parsed.split("(",1)[0].strip()
+            if fn_name not in tool_names:
+                ctx.needs_tool_work = True
+                log_message(f"[plan_validation] Missing helper {fn_name} – will trigger self-improvement.", "INFO")
+
+            valid_calls.append(parsed)
+
+        if not valid_calls:
+            ctx.plan_validated = False
+            ctx.validation_note = "All steps failed basic syntax."
+            return
+
+        # ── pass 2 : semantic approval per call ─────────────────────────────
+        final_plan : list[str] = []
+        for call in valid_calls:
+            ok, reason, sugg = _llm_check(call)
+            if ok:
+                final_plan.append(call)
+                log_message(f"[plan_validation] ✅ {call} – {reason}", "INFO")
+            else:
+                log_message(f"[plan_validation] ❌ {call} – {reason}", "WARNING")
+                if sugg and sugg.upper() != "NO_TOOL":
+                    # ensure suggestion has proper syntax before accepting
+                    if Tools.parse_tool_call(sugg):
+                        final_plan.append(sugg)
+                        log_message(f"[plan_validation]   ↳ replaced with {sugg}", "INFO")
+
+        # ── pass 3 : commit results to context ──────────────────────────────
+        if final_plan:
+            # only mark validated if every step survived the semantic guard
+            ctx.plan_validated  = (len(final_plan) == len(valid_calls))
+            ctx.plan            = final_plan
+            ctx.validation_note = (
+                "Plan approved." if ctx.plan_validated
+                else "Plan partially revised during validation."
+            )
+            ctx.ctx_txt += f"\n[Plan validation] {ctx.validation_note}"
+        else:
+            ctx.plan_validated  = False
+            ctx.validation_note = "All candidate steps were rejected."
+            ctx.plan            = []
+
+        # Optional: voice feedback
+        if not getattr(ctx, "skip_tts", False):
+            self.tts_manager.enqueue(ctx.validation_note)
 
     def _stage_execute_actions(self, ctx):
         """
-        Execute each tool call in ctx.plan in sequence, collecting outputs.
+        Run the validated plan, step-by-step.
+
+        NEW FEATURES
+        ────────────
+        1. **Guard-rail** – we refuse to execute unless a previous stage set
+        `ctx.plan_validated == True`.
+        2. **Idle heartbeat** – `self._tick_activity()` keeps the idle-monitor
+        timer from firing while long actions run.
+        3. **Rich logging** – success/failure for every call is logged +
+        appended to ctx.ctx_txt.
         """
+        import json, traceback
+
+        # ── 0) Safety check: plan must be validated ─────────────────────────
+        if not getattr(ctx, "plan_validated", False):
+            note = "Plan not validated – skipping execution stage."
+            log_message(f"[execute_actions] {note}", "WARNING")
+            ctx.ctx_txt += f"\n[Execute Actions] {note}"
+            setattr(ctx, "action_results", [])
+            return  # **early exit**
+
         plan = getattr(ctx, "plan", [])
+        if not plan:
+            ctx.ctx_txt += "\n[Execute Actions] No steps to run."
+            setattr(ctx, "action_results", [])
+            return
+
         results = []
         for call_str in plan:
+            self._tick_activity()           # keeps idle-monitor happy
+
             code = Tools.parse_tool_call(call_str)
             if not code:
-                results.append((call_str, "Error: could not parse call"))
+                msg = "Error: unparsable call"
+                log_message(f"[execute_actions] {call_str!r} → {msg}", "ERROR")
+                results.append((call_str, msg))
                 continue
+
             try:
                 out = self.run_tool(code)
+                log_message(f"[execute_actions] {code} → OK", "INFO")
             except Exception as e:
-                out = f"Error during execution: {e}"
+                out = f"Execution error: {e}"
+                log_message(
+                    f"[execute_actions] {code} → {e}\n{traceback.format_exc()}",
+                    "ERROR"
+                )
             results.append((code, out))
+
+        # ── 4) Persist & annotate context ───────────────────────────────────
         setattr(ctx, "action_results", results)
-        lines = "\n".join(f"{c} → {o}" for c,o in results)
-        ctx.ctx_txt += f"\n[Executed Actions]:\n{lines}"
-        return None
+
+        pretty = "\n".join(f"{c} → {o}" for c, o in results)
+        ctx.ctx_txt += f"\n[Executed Actions]\n{pretty}"
 
     def _stage_verify_results(self, ctx):
         """
@@ -3676,6 +4375,153 @@ class ChatManager:
         self.tts_manager.enqueue(out)
         return out
 
+    def _stage_tool_self_improvement(self, ctx):
+        """
+        Stage: tool_self_improvement
+        ────────────────────────────
+        Trigger – `planning` (or the user) sets **ctx.needs_tool_work = True**.
+        Goal     – Let the LLM iteratively CREATE / MODIFY / TEST tools until it
+                    declares “NO_TOOL”.
+
+        Loop outline (max `tool_iter_max`, default = 4):
+            1. Build a *local* conversation containing:
+                • A reminder of the task and current plan
+                • Any evaluation rubric the planner stored in
+                    ctx.tool_eval_plan  (dict)  – optional
+                • A concise history of previous iterations
+                • A cheatsheet of helper functions
+            2. Stream the secondary-model; expect ONE ```tool_code``` block.
+            3. Parse → execute immediately with  run_tool()  (same validator
+            you already use elsewhere).  Capture result / exception.
+            4. Append a compact   [tool_improvement]   entry to ctx.ctx_txt
+            (so downstream stages can see the evolution).
+            5. Feed the *result summary* back into the next iteration’s history.
+            6. Exit when   NO_TOOL   or when max iterations reached.
+        On exit:
+            • `Tools.load_external_tools()` to make new functions live.
+            • Observer hooks for start/end/tokens just like other stages.
+        """
+        import json, textwrap, traceback
+
+        # ── 0. quick exit ────────────────────────────────────────────────
+        if not getattr(ctx, "needs_tool_work", False):
+            return                                                        # skip stage
+
+        run_id = getattr(ctx, "run_id", None)
+        if run_id:
+            self.observer.log_stage_start(run_id, "tool_self_improvement")
+
+        # ─────────────────────────────────────────────────────────────────
+        max_iter = int(self.config_manager.config.get("tool_iter_max", 4))
+        history  = []             # [(call_str, truncated_result), …]
+
+        # helper: shorten any result so prompts stay small ↓↓↓
+        def _short(r, n=300):
+            s = str(r)
+            return (s[:n] + " …") if len(s) > n else s
+
+        for iteration in range(1, max_iter + 1):
+            self._tick_activity()                                         # idle-reset
+
+            # ── 1. Build conversation for secondary model ───────────────
+            cheat_sheet = textwrap.dedent("""
+                You are in TOOL-IMPROVEMENT mode.
+
+                ✔ Helper functions you may call *exactly one per message*
+                (wrap in a ```tool_code``` block):
+                    • create_tool(name:str, code:str, overwrite=True|False)
+                    • get_tool_source(name:str)
+                    • test_tool(name:str, cases:list[dict])
+                    • run_tool_once("foo(123)")
+                    • run_python_snippet(\"\"\"print('hi')\"\"\")
+                If you are satisfied and wish to leave this mode, output:
+
+                    ```tool_code
+                    NO_TOOL
+                    ```
+            """)
+
+            # –– contextual snapshot (task + evaluation plan) ––
+            task_snip = _short(ctx.user_msg if hasattr(ctx, "user_msg") else "")
+            plan_snip = _short(getattr(ctx, "plan_summary", ""))
+            eval_plan = _short(json.dumps(getattr(ctx, "tool_eval_plan", {}), indent=2))
+
+            hist_lines = [
+                f"{i}. {c}  →  {r}" for i, (c, r) in enumerate(history, 1)
+            ]
+            hist_txt = "\n".join(hist_lines) or "(first pass)"
+
+            system_prompt = (
+                cheat_sheet
+                + f"\nCURRENT TASK: {task_snip}"
+                + (f"\nCURRENT PLAN: {plan_snip}" if plan_snip else "")
+                + (f"\nEVALUATION RUBRIC:\n{eval_plan}" if eval_plan else "")
+                + f"\n\nEarlier iterations:\n{hist_txt}\n"
+                + "\nRespond with ONE tool_code block now."
+            )
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                # A minimal user kick – keeps roles consistent
+                {"role": "user",   "content": "Make your next improvement."}
+            ]
+
+            # ── 2. Stream the LLM response ───────────────────────────────
+            buf = ""
+            print(f"\n🛠  Tool-loop #{iteration}: ", end="", flush=True)
+            try:
+                for part in chat(
+                    model=self.config_manager.config["secondary_model"],
+                    messages=messages,
+                    stream=True
+                ):
+                    tok = part["message"]["content"]
+                    buf += tok
+                    # observer streaming trace
+                    if run_id:
+                        self.observer.log_stage_token(
+                            run_id, "tool_self_improvement", tok
+                        )
+                    print(tok, end="", flush=True)
+                    self._tick_activity()
+            except Exception as e_stream:
+                log_message(f"[tool_self_improvement] streaming error: {e_stream}", "ERROR")
+                break
+            print()
+
+            # ── 3. Parse the SINGLE tool_code block or inline call ───────
+            call_str = Tools.parse_tool_call(buf) or "NO_TOOL"
+            if call_str.upper() == "NO_TOOL":
+                log_message("[tool_self_improvement] LLM signalled finish.", "DEBUG")
+                break                                                    # exit cleanly
+
+            # ── 4. Execute helper immediately ────────────────────────────
+            try:
+                result = self.run_tool(call_str)
+            except Exception as e_exec:
+                result = f"Execution-error: {e_exec}\n{traceback.format_exc(limit=2)}"
+
+            # ⟹ record to ctx + history
+            ctx.ctx_txt += f"\n[tool_improvement] {call_str}  →  {_short(result,120)}"
+            history.append((call_str, _short(result)))
+
+            # terse console feedback
+            print(f"↪ {call_str}  →  {_short(result,160)}")
+
+            # ── 5. decide whether to continue (LLM may decide) ───────────
+            # (If the helper just ran tests and all passed, it will likely
+            #  output NO_TOOL next round.  We rely on the language model’s
+            #  judgement; max_iter is the hard stop.)
+
+        # ── 6. Finalise ──────────────────────────────────────────────────
+        try:
+            Tools.load_external_tools()          # pick up any new .py files
+        except Exception as e_reload:
+            log_message(f"[tool_self_improvement] reload failed: {e_reload}", "ERROR")
+
+        if run_id:
+            self.observer.log_stage_end(run_id, "tool_self_improvement")
+
 
     # NEW: External Knowledge Retrieval (RAG)
     # ----------------------------------------
@@ -3804,59 +4650,41 @@ class ChatManager:
             print(assembled[:500] + "…")
             input("Press Enter to continue automatically…")
         return True
-        
+    # ── Idle-handling helpers ─────────────────────────────────────────────
+    def _touch_activity(self):
+        """Mark ‘now’ as the last time *anything* happened."""
+        self.last_interaction = datetime.now()
+
+    def _tick_activity(self):                     # alias used in tight loops
+        self.last_interaction = datetime.now()   
+
     def _idle_monitor(self):
         """
-        Runs in the background. Every `self.idle_interval` seconds of silence,
-        builds a dynamic “idle prompt” from the last few actions/context and
-        triggers an internal new_request(...) to re-engage.
+        Fires only after <idle_interval> seconds of *real* silence.
+        Any token, tool call, or stage transition resets the timer via
+        self._touch_activity(), so the idle mull can never interrupt an
+        active run.
         """
-        from datetime import datetime
         import time
-
         while not self._idle_stop.is_set():
-            start_ts = time.time()
-            interval = self.idle_interval
-
-            # countdown loop (print every up to 10s)
-            while not self._idle_stop.is_set():
-                elapsed = time.time() - start_ts
-                remaining = interval - elapsed
-                if remaining <= 0:
-                    break
-                mins, secs = divmod(int(remaining), 60)
-                print(f"[Idle Monitor] Next idle check in {mins}m {secs}s…", flush=True)
-                time.sleep(min(remaining, 10))
-
-            if self._idle_stop.is_set():
-                break
-
+            time.sleep(1)                                     # light-weight poll
             idle_secs = (datetime.now() - self.last_interaction).total_seconds()
-            if idle_secs >= interval:
-                # idle triggered → build dynamic message from recent context
-                ctx = self.current_ctx
-                # take the last 200 chars of ctx_txt for brevity
-                recent = (ctx.ctx_txt or "").replace("\n", " ")
-                recent_snip = (recent[-200:] + "...") if len(recent) > 200 else recent
-                prompt = (
-                    f"I've been idle for {int(idle_secs)} seconds. "
-                    f"Recent context: {recent_snip} "
-                    "What would you like me to do next?"
-                )
-                log_message(f"No user input for {int(idle_secs)}s — auto-mulling over tasks", "INFO")
-                print(f"[Idle Monitor] Idle detected ({int(idle_secs)}s) — self-prompting", flush=True)
-                # fire off an internal, silent request using that dynamic prompt
-                self.new_request(
-                    prompt,
-                    sender_role="assistant",
-                    skip_tts=True
-                )
-            else:
-                # user returned before timeout
-                log_message("Idle monitor: activity detected—resetting countdown", "DEBUG")
-                print(f"[Idle Monitor] Activity detected ({int(idle_secs)}s idle) — countdown reset", flush=True)
-
-        log_message("Idle monitor thread exiting.", "DEBUG")
+            if idle_secs < self.idle_interval:
+                continue                                      # still “busy”
+            # ---- idle window reached ------------------------------------------------
+            ctx  = self.current_ctx
+            recent = (ctx.ctx_txt or "").replace("\n", " ")
+            snip   = (recent[-200:] + "...") if len(recent) > 200 else recent
+            prompt = (
+                f"I've been idle for {int(idle_secs)} seconds. "
+                f"Recent context: {snip} "
+                "What would you like me to work on next?"
+            )
+            log_message(f"[Idle Monitor] Triggered after {int(idle_secs)} s", "INFO")
+            # Reset BEFORE launching the mull so cascaded failures can't recurse
+            self._touch_activity()
+            # Internal, silent request (no TTS)
+            self.new_request(prompt, sender_role="assistant", skip_tts=True)
 
 
     def _start_idle_mull(self):
@@ -4054,7 +4882,6 @@ class ChatManager:
         Ensures the model sees a fresh user turn rather than two assistant turns in a row,
         and aborts if it detects runaway repetition.
         """
-        from collections import deque
 
         log_message("Primary-model stream starting...", "DEBUG")
 
@@ -4091,6 +4918,7 @@ class ChatManager:
                 return
 
             tok = part["message"]["content"]
+            self.observer.log_stage_token(self.current_ctx.run_id, "final_inference", tok)
             print(tok, end="", flush=True)
             yield tok, part.get("done", False)
 
@@ -4116,8 +4944,6 @@ class ChatManager:
         except Exception as e:
             log_message(f"Primary-model non-stream error: {e}", "ERROR")
             return ""
-        
-    from ollama._types import ResponseError
 
     def process_text(self, text, skip_tts: bool = False):
         """
@@ -4126,7 +4952,7 @@ class ChatManager:
         list of tactics (temperature bumps, model switch, history-window trim,
         non-stream fallback, etc.).  It NEVER gives up.
         """
-        import re
+
         from contextlib import contextmanager
 
         log_message("process_text: Starting...", "DEBUG")
@@ -4334,7 +5160,16 @@ class ChatManager:
         - Name nodes (treated as their .id)
         - automatic conversion of kwargs→args for positional-only tools
         """
-        import ast, re, inspect
+
+        # ── mark activity so idle-monitor won’t fire while we work ──────────
+        if hasattr(self, "_tick_activity"):
+            self._tick_activity()
+
+        # ── OBSERVABILITY: emit tool_start ─────────────────────────────────
+        rid       = getattr(self, "current_run_id", None)
+        tool_name = tool_code.split("(", 1)[0]
+        if rid is not None:
+            self.observer.log_tool_start(rid, tool_name)
 
         # Strip out any type annotations in keyword args (e.g. prompt: str="…" → prompt="…")
         tool_code = re.sub(
@@ -4345,7 +5180,9 @@ class ChatManager:
 
         log_message(f"run_tool: Executing {tool_code!r}", "DEBUG")
 
-        # 0) Quick split–based parser for simple, unquoted args
+        # ------------------------------------------------------------------
+        # 0) Quick split-based parser for simple, *unquoted* args
+        # ------------------------------------------------------------------
         m_quick = re.fullmatch(
             r'\s*([A-Za-z_]\w*)\s*\(\s*(.*?)\s*\)\s*',
             tool_code,
@@ -4355,46 +5192,51 @@ class ChatManager:
             func_name, body = m_quick.group(1), m_quick.group(2)
             func = getattr(Tools, func_name, None)
             if func and not re.search(r'["\']', body):
-                args = []
-                kwargs = {}
-                parts = re.split(r'\s*,\s*', body)
-                for part in parts:
+                args, kwargs = [], {}
+                for part in re.split(r'\s*,\s*', body):
                     part = part.strip()
                     if not part:
                         continue
                     if '=' in part:
                         k, v = part.split('=', 1)
-                        k = k.strip()
-                        v = v.strip()
-                        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                        k, v = k.strip(), v.strip()
+                        if v[:1] in "\"'" and v[-1:] in "\"'":
                             v = v[1:-1]
                         kwargs[k] = v
                     else:
                         v = part
-                        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                        if v[:1] in "\"'" and v[-1:] in "\"'":
                             v = v[1:-1]
                         args.append(v)
+
                 # default for get_chat_history()
                 if func_name == "get_chat_history" and not args and not kwargs:
                     args = [5]
+
                 log_message(f"run_tool: Parsed {func_name} with args={args} kwargs={kwargs}", "DEBUG")
                 try:
-                    # if this tool is positional‐only, move kwargs into args
                     sig = inspect.signature(func)
-                    param_names = [
-                        p.name for p in sig.parameters.values()
-                        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-                    ]
-                    if not args and kwargs and all(n in kwargs for n in param_names):
-                        args = [kwargs.pop(n) for n in param_names]
+                    pos_names = [p.name for p in sig.parameters.values()
+                                 if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+                    if not args and kwargs and all(n in kwargs for n in pos_names):
+                        args = [kwargs.pop(n) for n in pos_names]
                     result = func(*args, **kwargs)
-                    log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
-                    return str(result)
+                    output = str(result)
+                    log_message(f"run_tool: {func_name} returned {output!r}", "INFO")
                 except Exception as e:
+                    output = f"Error executing `{func_name}`: {e}"
                     log_message(f"run_tool error: {e}", "ERROR")
-                    return f"Error executing `{func_name}`: {e}"
 
+                if rid is not None:
+                    self.observer.log_tool_end(rid, tool_name, output)
+
+                if hasattr(self, "_tick_activity"):
+                    self._tick_activity()
+                return output
+
+        # ------------------------------------------------------------------
         # 1) Regex fallback for single unquoted arg: func(foo bar)
+        # ------------------------------------------------------------------
         m_simple = re.fullmatch(
             r'\s*([A-Za-z_]\w*)\(\s*([^)]+?)\s*\)\s*',
             tool_code,
@@ -4408,13 +5250,22 @@ class ChatManager:
                     log_message(f"run_tool: Fallback parse → {func_name}('{raw_arg}')", "DEBUG")
                     try:
                         result = func(raw_arg)
-                        log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
-                        return str(result)
+                        output = str(result)
+                        log_message(f"run_tool: {func_name} returned {output!r}", "INFO")
                     except Exception as e:
+                        output = f"Error executing `{func_name}`: {e}"
                         log_message(f"run_tool error: {e}", "ERROR")
-                        return f"Error executing `{func_name}`: {e}"
 
-        # 2) Full AST–based parsing for all other cases
+                    if rid is not None:
+                        self.observer.log_tool_end(rid, tool_name, output)
+
+                    if hasattr(self, "_tick_activity"):
+                        self._tick_activity()
+                    return output
+
+        # ------------------------------------------------------------------
+        # 2) Full AST-based parsing for everything else
+        # ------------------------------------------------------------------
         try:
             tree = ast.parse(tool_code.strip(), mode="eval")
             if not isinstance(tree, ast.Expression) or not isinstance(tree.body, ast.Call):
@@ -4437,11 +5288,8 @@ class ChatManager:
                 elif isinstance(arg, ast.Name):
                     args.append(arg.id)
                 else:
-                    seg = ast.get_source_segment(tool_code, arg)
-                    if seg is not None:
-                        args.append(seg.strip())
-                    else:
-                        raise ValueError(f"Unsupported arg type: {ast.dump(arg)}")
+                    seg = ast.get_source_segment(tool_code, arg) or ""
+                    args.append(seg.strip())
 
             # keyword args
             kwargs = {}
@@ -4454,11 +5302,8 @@ class ChatManager:
                 elif isinstance(v, ast.Name):
                     kwargs[kw.arg] = v.id
                 else:
-                    seg = ast.get_source_segment(tool_code, v)
-                    if seg is not None:
-                        kwargs[kw.arg] = seg.strip()
-                    else:
-                        raise ValueError(f"Unsupported kwarg type: {ast.dump(v)}")
+                    seg = ast.get_source_segment(tool_code, v) or ""
+                    kwargs[kw.arg] = seg.strip()
 
             # default for get_chat_history()
             if func_name == "get_chat_history" and not args and not kwargs:
@@ -4466,22 +5311,28 @@ class ChatManager:
 
             log_message(f"run_tool: Calling {func_name} with args={args} kwargs={kwargs}", "DEBUG")
 
-            # positional‐only adjustment
             sig = inspect.signature(func)
-            param_names = [
-                p.name for p in sig.parameters.values()
-                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-            ]
-            if not args and kwargs and all(n in kwargs for n in param_names):
-                args = [kwargs.pop(n) for n in param_names]
+            pos_names = [p.name for p in sig.parameters.values()
+                         if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+            if not args and kwargs and all(n in kwargs for n in pos_names):
+                args = [kwargs.pop(n) for n in pos_names]
 
             result = func(*args, **kwargs)
-            log_message(f"run_tool: {func_name} returned {result!r}", "INFO")
-            return str(result)
+            output = str(result)
+            log_message(f"run_tool: {func_name} returned {output!r}", "INFO")
 
         except Exception as e:
+            output = f"Error executing `{tool_code}`: {e}"
             log_message(f"run_tool error: {e}", "ERROR")
-            return f"Error executing `{tool_code}`: {e}"
+
+        # ── OBSERVABILITY: emit tool_end ───────────────────────────────────
+        if rid is not None:
+            self.observer.log_tool_end(rid, tool_name, output)
+
+        if hasattr(self, "_tick_activity"):
+            self._tick_activity()
+        return output
+
 
         
     def _stage_prompt_optimization(self, ctx):
@@ -4514,22 +5365,33 @@ class ChatManager:
             ctx["overridden_stages"]   = new_stages
             ctx["ctx_txt"] += "\n[RL exploration enabled]"
         return None
-
+    
     def _stage_execute_tasks(self, ctx):
         """
         Parallel‐execute each non-done task in its own thread, measure each 
         mini-stage’s performance, and adjust prompts if needed.
         """
-        from concurrent.futures import ThreadPoolExecutor
-        import inspect, time
+
+        # Helper to let handlers use ctx.attr and ctx["attr"]
+        class TaskSubctx:
+            def __init__(self, data):
+                self.__dict__.update(data)
+                self.stage_outputs = {}
+                self.stage_counts = {}
+            def __getitem__(self, key):
+                return getattr(self, key)
+            def __setitem__(self, key, value):
+                setattr(self, key, value)
+            def get(self, key, default=None):
+                return getattr(self, key, default)
 
         tasks = ctx.get("global_tasks", [])
         if not tasks:
             return None
 
         def _run_one(task):
-            # build an isolated subctx
-            subctx = {
+            # Build a plain dict of the subcontext’s initial state
+            base = {
                 "user_message":     f"Work on task: {task['text']}",
                 "sender_role":      ctx.get("sender_role", "user"),
                 "run_id":           ctx["run_id"],
@@ -4543,8 +5405,9 @@ class ChatManager:
                 "ALL_AGENTS":       ctx["ALL_AGENTS"],
                 "global_tasks":     ctx["global_tasks"],
             }
+            # Wrap it so handlers see attributes and dict‐style access
+            subctx = TaskSubctx(base)
 
-            # mini‐pipeline stages
             mini_stages = [
                 "context_analysis",
                 "planning_summary",
@@ -4561,7 +5424,7 @@ class ChatManager:
                 start = time.time()
                 success = True
                 try:
-                    # call handler with or without prev_output arg
+                    # Call with or without prev_output arg
                     sig = inspect.signature(handler)
                     if len(sig.parameters) == 2:
                         handler(subctx, None)
@@ -4569,11 +5432,10 @@ class ChatManager:
                         handler(subctx)
                 except Exception:
                     success = False
-                    # still record failure timing, then re-raise to abort this subtask
+                    # record timing, then re-raise to abort this subtask
                     raise
                 finally:
                     duration = time.time() - start
-                    # record and maybe adjust prompt
                     self.prompt_evaluator.record(stage, duration, success)
                     new_sys = self.prompt_evaluator.adjust(
                         stage, self.config_manager.config["system"]
@@ -4581,12 +5443,12 @@ class ChatManager:
                     if new_sys:
                         self.config_manager.config["system"] = new_sys
 
-            # on success, record the result
+            # On success (or after a failure), record and mark done
             result = subctx.get("final_response", "")
             ctx["ctx_txt"] += f"\n[Task {task.get('id')} done]: {result}"
             task["done"] = True
 
-        # run all tasks in parallel
+        # Run in parallel as before
         with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as ex:
             futures = [ex.submit(_run_one, t) for t in tasks if not t.get("done")]
             for f in futures:
@@ -4596,6 +5458,7 @@ class ChatManager:
                     log_message(f"[execute_tasks] subtask failed: {e}", "ERROR")
 
         return None
+
     
     def _stage_define_criteria(self, ctx, planning_summary: str) -> list[str]:
         """
@@ -4603,7 +5466,7 @@ class ChatManager:
         concrete, measurable success criteria.
         Returns a JSON array of criterion strings.
         """
-        import json
+        
         prompt = (
             "You are a Criteria Agent.  Based on this one-sentence plan:\n\n"
             f"    {planning_summary}\n\n"
@@ -4660,7 +5523,6 @@ class ChatManager:
         - If they mention tasks or subtasks, include task stages.
         - If they reference files, include file management/validation early.
         """
-        import re
 
         stages = base_stages.copy()
 
@@ -4691,8 +5553,6 @@ class ChatManager:
         Handles context-switching, per-context state, dynamic stage-list assembly,
         explicit data-flow between stages, and final response delivery.
         """
-        import re
-        import inspect
 
         # 0) Context-switch detection: "/topic NAME" or "/ctx NAME"
         m = re.match(r"^/(topic|ctx)\s+(.+)$", user_message.strip(), re.IGNORECASE)
@@ -4849,6 +5709,16 @@ class ChatManager:
                     self._temp_bump = 0.2
                     try:
                         result = handler(ctx, prev_output) if len(sig.parameters)==2 else handler(ctx)
+
+                        # If the stage gave back text, run the “code-fence executor”
+                        if isinstance(result, str) and result:
+                            result = self._inject_python_results(result)
+
+
+                        # record non-empty string outputs
+                        if isinstance(result, str) and result:
+                            ctx.stage_outputs[stage] = result
+
                     except Exception:
                         result = ""
                     finally:
@@ -4877,7 +5747,6 @@ class ChatManager:
 
 
     def _stage_summary_request(self, ctx: Context):
-        import re, json
 
         # use the Context field, not dict access
         msg = ctx.user_message.lower()
@@ -4970,9 +5839,8 @@ class ChatManager:
         Perform a focused context analysis of the user’s latest message.
         Returns the analysis text.
         """
-        buf: list[str] = []
-        # stream in the context‐analysis tokens
-        for tok, done in self._stream_context(ctx.user_message):
+        buf = []
+        for tok, done in self._stream_context(ctx.user_message):   # ← unchanged call
             buf.append(tok)
             if done:
                 break
@@ -5055,37 +5923,89 @@ class ChatManager:
         return ""
 
 
-
     # ------------------------------
     # Stage 7: planning_summary
     # ------------------------------
     def _stage_planning_summary(self, ctx) -> str:
-        import re
-        peek = []
-        for tok, done in self._stream_tool(ctx.user_message):
+        """
+        • Streams the *tool-decision* output from `_stream_tool`.
+        • Extracts the first valid `tool_code` invocation and stores it on
+          the context as `ctx.next_tool_call`.
+        • Sets `ctx.needs_tool_work` ⇢ True if the function name is **not**
+          yet available on `Tools` (triggers the later self-improvement loop).
+        • Emits a one-sentence, user-friendly planning summary (and optional
+          TTS).
+        """
+        import re, inspect
+
+        # 1️⃣  Run the tool-decision stream and capture its raw output
+        peek: list[str] = []
+        for tok, done in self._stream_tool(ctx):
+            self._tick_activity()          # keep idle-monitor happy
             peek.append(tok)
             if done:
                 break
-        raw = re.sub(r"^```tool_code\s*|\s*```$", "", "".join(peek),
-                     flags=re.DOTALL).strip().strip("`")
-        call = Tools.parse_tool_call(raw)
+
+        raw_block = re.sub(
+            r"^```tool_code\s*|\s*```$",
+            "",
+            "".join(peek),
+            flags=re.DOTALL,
+        ).strip().strip("`")
+
+        call: str | None = Tools.parse_tool_call(raw_block)
+        ctx.next_tool_call = call                # make it available downstream
+
+        # 2️⃣  Decide whether the tool exists already
+        tool_names = [
+            name for name, fn in inspect.getmembers(Tools, inspect.isfunction)
+            if not name.startswith("_")
+        ]
         if call:
-            plan = chat(
+            fn_name = call.split("(", 1)[0].strip()
+            ctx.needs_tool_work = fn_name not in tool_names
+        else:
+            ctx.needs_tool_work = False
+
+        # 3️⃣  Produce a user-facing planning sentence
+        if call:
+            plan_msg = chat(
                 model=self.config_manager.config["secondary_model"],
                 messages=[
-                    {"role":"system",
-                     "content":"You are a Planning Agent. Describe in one casual sentence what tool call you will make next."},
-                    {"role":"user", "content":
-                        f"The user said: “{ctx.user_message}”. I will now run `{call}`."}
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a Planning Agent. "
+                            "Reply with ONE casual sentence that explains "
+                            "— at a very high level — what the upcoming tool "
+                            "call will do. No inner thoughts, no code fences."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"The user said: “{ctx.user_message}”. "
+                            f"We are about to run `{call}`."
+                        ),
+                    },
                 ],
-                stream=False
+                stream=False,
             )["message"]["content"].strip()
-            log_message(f"Planning summary: {plan}", "INFO")
-            if not ctx.skip_tts and plan:
-                self.tts_manager.enqueue(plan)
-            ctx.ctx_txt += f"\n[Planning summary]: {plan}"
-            return plan
+
+            log_message(f"Planning summary: {plan_msg}", "INFO")
+
+            if plan_msg and not getattr(ctx, "skip_tts", False):
+                self.tts_manager.enqueue(plan_msg)
+
+            ctx.ctx_txt += f"\n[Planning summary] {plan_msg}"
+            return plan_msg
+
+        # 4️⃣  Nothing was selected
+        ctx.ctx_txt += "\n[Planning summary] (no tool selected)"
+        log_message("Planning summary: no tool selected", "WARNING")
         return ""
+
+
 
 
     # ------------------------------
@@ -5096,7 +6016,7 @@ class ChatManager:
         1) Detect and run any “Next Action: Call `func()`” suggestion.
         2) Otherwise do the normal streaming tool-chaining.
         """
-        import re, json
+        
 
         run_id = ctx["run_id"]
 
@@ -5399,7 +6319,6 @@ def text_input_loop(chat_manager: ChatManager):
             session_log.flush()
         except Exception as e:
             log_message("Error in text input loop: " + str(e), "ERROR")
-
 # ----- Main Function -----
 def main():
     # file watcher to restart on code or config.json changes
@@ -5416,18 +6335,25 @@ def main():
                     m = os.path.getmtime(p)
                     if last_mtimes.get(p) != m:
                         log_message(f"File change detected for '{os.path.basename(p)}', restarting...", "INFO")
+                        # ── SHUT DOWN FLASK SERVER ───────────────────────────
+                        srv = globals().get("_flask_server")
+                        if srv:
+                            log_message("Shutting down existing Flask server...", "INFO")
+                            try:
+                                srv.shutdown()
+                            except Exception as e:
+                                log_message(f"Error shutting down Flask server: {e}", "WARNING")
+                        # ── RE-EXEC THE PROCESS ───────────────────────────────
                         os.execv(sys.executable, [sys.executable] + sys.argv)
                 except Exception:
                     continue
 
-    monitor_thread = threading.Thread(target=_monitor_files, daemon=True)
-    monitor_thread.start()
 
+    threading.Thread(target=_monitor_files, daemon=True).start()
     log_message("Main function starting.", "INFO")
 
     # Start the TTS worker thread
-    tts_thread = threading.Thread(target=tts_worker, args=(tts_queue,))
-    tts_thread.daemon = True
+    tts_thread = threading.Thread(target=tts_worker, args=(tts_queue,), daemon=True)
     tts_thread.start()
     log_message("Main: TTS worker thread launched.", "DEBUG")
 
@@ -5448,19 +6374,20 @@ def main():
         sys.exit(1)
 
     # Initialize managers
-    config_manager = ConfigManager(config)
+    config_manager  = ConfigManager(config)
     history_manager = HistoryManager()
-    tts_manager = TTSManager()
-    memory_manager = MemoryManager()
-    mode_manager = ModeManager()
+    tts_manager     = TTSManager()
+    memory_manager  = MemoryManager()
+    mode_manager    = ModeManager()
 
-    # Build ChatManager
+    # ─── Build ChatManager (make it global for SSE) ────────────────────
+    global chat_manager
     chat_manager = ChatManager(
         config_manager,
         history_manager,
         tts_manager,
-        tools_data=True,
-        format_schema=None,
+        tools_data=Tools.load_agent_stack().get("tools", []),
+        format_schema=Utils.load_format_schema(config.get("options", "")),
         memory_manager=memory_manager,
         mode_manager=mode_manager
     )
@@ -5468,18 +6395,18 @@ def main():
     # Launch voice loop (pass in playback primitives)
     voice_thread = threading.Thread(
         target=voice_to_llm_loop,
-        args=(chat_manager, playback_lock, output_stream)
+        args=(chat_manager, playback_lock, output_stream),
+        daemon=True
     )
-    voice_thread.daemon = True
     voice_thread.start()
     log_message("Main: Voice-to-LLM loop thread started.", "DEBUG")
 
-    # Launch text‑override loop
+    # Launch text-override loop
     text_thread = threading.Thread(
         target=text_input_loop,
-        args=(chat_manager,)
+        args=(chat_manager,),
+        daemon=True
     )
-    text_thread.daemon = True
     text_thread.start()
     log_message("Main: Text input override thread started.", "DEBUG")
 
@@ -5500,7 +6427,7 @@ def main():
     tts_queue.join()
     tts_thread.join()
     voice_thread.join()
-    # Note: text_thread may remain blocked on input(), so we don’t join it
+    # text_thread may remain blocked on input()
     session_log.close()
 
     # Save chat history
@@ -5513,5 +6440,317 @@ def main():
     print("Chat session saved in folder:", session_folder)
     print("System terminated.")
 
+
+# ─── START OBSERVABILITY DASHBOARD & SSE SERVER ───────────────────────
+
+app = Flask(__name__)
+CORS(app)
+
+# 1) SSE endpoint
+@app.route("/stream")
+def stream():
+    def event_stream():
+        q = []
+        cm = globals().get("chat_manager")
+        if cm:
+            cm.observer.subscribe(lambda data: q.append(data))
+        while True:
+            if q:
+                yield f"data: {q.pop(0)}\n\n"
+            else:
+                time.sleep(0.1)
+    return Response(event_stream(), mimetype="text/event-stream")
+
+# 2) Tweak endpoint (optional)
+@app.route("/api/tweak", methods=["POST"])
+def tweak():
+    p = request.json or {}
+    cm = globals().get("chat_manager")
+    if cm:
+        cm.observer._emit({
+            "runId":     p.get("runId"),
+            "type":      "tweak_applied",
+            "stage":     p.get("stage"),
+            "newData":   p.get("newData"),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+    return {"status": "ok"}
+
+# 3) In-browser dashboard
+INDEX_HTML = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Observable Agent Dashboard</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Doto:wght@100..900&family=Overpass+Mono:wght@300..700&display=swap');
+    :root {
+      --bg: #121212;
+      --fg: rgba(255,255,255,0.8);
+      --border: #333;
+      --panel-bg: rgba(255,255,255,0.05);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin:0; padding:0;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: 'Doto', sans-serif;
+    }
+    #grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      height: 100vh;
+    }
+    .col {
+      overflow-y: auto;
+      padding: 8px;
+      border-right: 1px solid var(--border);
+    }
+    .col:last-child { border-right: none; }
+    details {
+      background: var(--panel-bg);
+      margin: 6px 0;
+      padding: 6px;
+      border-radius: 4px;
+    }
+    summary {
+      cursor: pointer;
+      font-family: 'Overpass Mono', monospace;
+      font-weight: 500;
+      font-size: 0.95em;
+    }
+    .loading {
+      font-style: italic;
+      opacity: 0.6;
+    }
+    /* draggable registry items */
+    .registry .stage-item {
+      background: var(--panel-bg);
+      margin:4px 0;
+      padding:4px;
+      border:1px solid var(--border);
+      border-radius:4px;
+      cursor: grab;
+      user-select: none;
+    }
+    .registry .drag-over {
+      box-shadow: inset 0 0 8px gold;
+    }
+  </style>
+</head>
+<body>
+  <div id="grid">
+    <section id="col-stages" class="col"></section>
+    <section id="col-tools"  class="col"></section>
+    <section id="col-registry" class="col registry"></section>
+  </div>
+  <script>
+    // utility: hash a string to an HSL color
+    function colorFor(name) {
+      let hash=0; for(let c of name) hash=(hash<<5)-hash+c.charCodeAt(0)|0;
+      let h = ((hash%360)+360)%360;
+      return `hsl(${h}, 60%, 50%)`;
+    }
+
+    // 1) Registry: fetch & render stages as draggable list
+    const reg = document.getElementById("col-registry");
+    fetch("/api/stages")
+      .then(r=>r.json())
+      .then(({stages})=>{
+        stages.forEach((s,i)=>{
+          let d=document.createElement("div");
+          d.textContent=s;
+          d.id="reg-"+i;
+          d.draggable=true;
+          d.className="stage-item";
+          d.style.color=colorFor(s);
+          d.dataset.stage=s;
+          reg.appendChild(d);
+        });
+      });
+
+    // drag & drop handlers
+    let dragSrc=null;
+    reg.addEventListener("dragstart", e=>{
+      dragSrc=e.target;
+      e.dataTransfer.setData("text/plain","");
+      e.target.style.opacity=0.5;
+    });
+    reg.addEventListener("dragover", e=>{
+      e.preventDefault();
+      let over=e.target.closest(".stage-item");
+      reg.querySelectorAll(".stage-item").forEach(el=>el.classList.remove("drag-over"));
+      if(over) over.classList.add("drag-over");
+    });
+    reg.addEventListener("dragleave", e=>{
+      e.target.closest(".stage-item")?.classList.remove("drag-over");
+    });
+    reg.addEventListener("drop", e=>{
+      e.preventDefault();
+      let over=e.target.closest(".stage-item");
+      if(over && dragSrc && dragSrc!==over) {
+        reg.insertBefore(dragSrc, over.nextSibling);
+        updateOrder();
+      }
+      reg.querySelectorAll(".stage-item").forEach(el=>el.classList.remove("drag-over"));
+    });
+    reg.addEventListener("dragend", e=>{
+      e.target.style.opacity=1;
+    });
+    function updateOrder(){
+      let newStages = Array.from(reg.children).map(d=>d.dataset.stage);
+      fetch("/api/stages", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({stages:newStages})
+      });
+    }
+
+    // cache references
+    const colStages = document.getElementById("col-stages");
+    const colTools  = document.getElementById("col-tools");
+
+    // 2) SSE → handle events
+    const es = new EventSource("/stream");
+    es.onmessage = e=>{
+      let ev = JSON.parse(e.data);
+      handleEvent(ev);
+      // persist
+      let saved = JSON.parse(localStorage.getItem("obs_events")||"[]");
+      saved.push(e.data);
+      if(saved.length>500) saved.shift();
+      localStorage.setItem("obs_events", JSON.stringify(saved));
+    };
+    // replay on load
+    JSON.parse(localStorage.getItem("obs_events")||"[]")
+      .forEach(d=>handleEvent(JSON.parse(d)));
+
+    function handleEvent(e){
+      // STAGE START
+      if(e.type==="stage_start"){
+        let details = document.createElement("details");
+        details.id = `stage-${e.runId}-${e.stage}`;
+        details.style.borderLeft = `4px solid ${colorFor(e.stage)}`;
+        let sum = document.createElement("summary");
+        sum.textContent = `[${e.runId}] ▶ ${e.stage}`;
+        details.appendChild(sum);
+        let content = document.createElement("div");
+        content.className = "stage-content";
+        details.appendChild(content);
+        colStages.appendChild(details);
+        colStages.scrollTop = colStages.scrollHeight;
+      }
+      // STAGE STREAM (token)
+      if(e.type==="stage_stream"){
+        let container = document.querySelector(`#stage-${e.runId}-${e.stage} .stage-content`);
+        if(container){
+          let span = document.createElement("span");
+          span.textContent = e.token;
+          container.appendChild(span);
+          // ensure loading indicator
+          if(!container.querySelector(".loading")){
+            let load = document.createElement("div");
+            load.className = "loading";
+            load.textContent = "⏳";
+            container.appendChild(load);
+          }
+          container.parentElement.open = true;
+          container.scrollTop = container.scrollHeight;
+        }
+      }
+      // STAGE END
+      if(e.type==="stage_end"){
+        let details = document.getElementById(`stage-${e.runId}-${e.stage}`);
+        if(details){
+          details.querySelectorAll(".loading").forEach(n=>n.remove());
+          let done = document.createElement("div");
+          done.style.opacity = 0.6;
+          done.textContent = "✅ done";
+          details.querySelector(".stage-content").appendChild(done);
+        }
+      }
+      // TOOL events
+      if(e.type==="tool_start"||e.type==="tool_end"){
+        let div = document.createElement("div");
+        div.className="tool";
+        if(e.type==="tool_start"){
+          div.textContent = `[${e.runId}] 🔄 ${e.tool}`;
+        } else {
+          div.textContent = `[${e.runId}] ✅ ${e.tool} ⇒ ${e.output}`;
+        }
+        colTools.appendChild(div);
+        colTools.scrollTop = colTools.scrollHeight;
+      }
+    }
+  </script>
+</body>
+</html>"""
+
+# ─── DASHBOARD ENDPOINTS & FLASK LAUNCH ────────────────────────────────
+
+@app.route("/")
+def index():
+    tools = Tools.load_agent_stack().get("tools", [])
+    return render_template_string(INDEX_HTML, tools=tools)
+
+# GET current pipeline stages
+@app.route("/api/stages", methods=["GET"])
+def get_stages():
+    stages = Tools.load_agent_stack().get("stages", [])
+    return jsonify({"stages": stages})
+
+# POST a new ordering → update agent_stack.json
+@app.route("/api/stages", methods=["POST"])
+def update_stages():
+    data = request.get_json() or {}
+    new_stages = data.get("stages", [])
+    try:
+        Tools.update_agent_stack(
+            {"stages": new_stages},
+            justification=f"reordered via UI at {datetime.now(timezone.utc).isoformat()}"
+        )
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}, 500
+
+def _run_flask():
+    """
+    Launch Flask via a manually created server.  Mark its socket
+    O_CLOEXEC so it’s closed on execv, letting the next process
+    re-bind port 5000 cleanly.
+    """
+    host, port = "0.0.0.0", 5000
+
+    while True:
+        try:
+            from werkzeug.serving import make_server
+            server = make_server(host, port, app, threaded=True)
+
+            # ensure the listening socket is closed on exec:
+            server.socket.set_inheritable(False)
+
+            # save a reference so monitor can shut it down:
+            globals()["_flask_server"] = server
+
+            log_message(f"Flask SSE server listening on http://{host}:{port}", "INFO")
+            server.serve_forever()
+            break
+        except OSError as e:
+            if "Address already in use" in str(e):
+                log_message("Port 5000 still in use—retrying in 0.5s...", "WARNING")
+                time.sleep(0.5)
+                continue
+            else:
+                raise
+
+# Only start Flask once per process (even across execv reloads)
+if not globals().get("_flask_thread_started"):
+    globals()["_flask_thread_started"] = True
+    flask_thread = threading.Thread(target=_run_flask, daemon=True)
+    flask_thread.start()
+    print("🚀 Observable dashboard: http://localhost:5000")
+
 if __name__ == "__main__":
     main()
+
