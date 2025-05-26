@@ -3,25 +3,28 @@
 Voice-activated LLM Chat via Whisper & Piper TTS with Tool Calling, Config, and Session Logging,
 with added text input override.
 -----------------------------------------------------------------------------------------------
-This script now integrates:
-  - Real-time noise reduction via the denoiser (version 0.1.5) package.
-  - Loading of both Whisper base and medium models.
-  - A consensus transcription strategy: The base model transcribes the audio while the medium model validates it.
-    Both are run concurrently in separate threads; if their outputs agree (based on a similarity threshold),
-    the transcription is accepted; otherwise, it’s discarded.
-  - Chat history packaging into JSON with timestamps.
-  - Additional functionalities including EQ enhancement, debug audio playback, tool calling, etc.
-  - A new parallel text override mode: you can simply type your input and hit enter and it will be processed as if it were spoken.
-  - **New! Image inference support:** You can now pass images to the model (e.g. "./image.png").
-  - **New! Screen Capture Tool:** A tool call is available to capture the screen (using pyautogui) and save it as temp_screen.png.
-  - **New! Image Query Conversion:** An internal function converts the user query into a more relevant image-based query, 
-    whose output is then passed to the primary model.
+This script now integrates the following features:
+1. **Text Input Override**: Users can provide text input to override the audio transcription.
+2. **Configuration Management**: Loads settings from `config.json` for models, temperatures, and more.
+3. **Session Logging**: Creates a unique session folder for each chat, logging all interactions.
+4. **Dynamic TTS**: Uses Piper for text-to-speech synthesis, with optional audio enhancements.
+5. **Audio Capture**: Captures microphone input, applies noise reduction, and processes audio for transcription
+6. **Whisper Transcription**: Uses Whisper models for audio transcription, with consensus validation.
+7. **Tool Calling**: Supports tool calling with Ollama, including web search and file operations.
+8. **Web Scraping**: Uses BeautifulSoup for HTML parsing and data extraction.
+9. **Wi-Fi Control**: Scans and manages Wi-Fi networks using PyWiFi.
+10. **System Monitoring**: Monitors system resources using psutil.
+11. **Numerical Conversion**: Converts numbers to words using num2words.
+12. **Audio Enhancement**: Applies EQ, noise reduction, and dynamic range normalization to audio.
+13. **Screen Capture**: Captures screenshots using mss and OpenCV.
+-----------------------------------------------------------------------------------------------
 """
 
+# Ensure Python 3.8+ is used
 import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib, random, copy, statistics, ast
 from datetime import datetime, timezone
 
-# Define ANSI terminal colors for verbose logging
+# ----- COLOR CODES FOR LOGGING -----
 COLOR_RESET = "\033[0m"
 COLOR_INFO = "\033[94m"       # Blue for general info
 COLOR_SUCCESS = "\033[92m"    # Green for success messages
@@ -29,6 +32,7 @@ COLOR_WARNING = "\033[93m"    # Yellow for warnings
 COLOR_ERROR = "\033[91m"      # Red for error messages
 COLOR_DEBUG = "\033[95m"      # Magenta for debug messages
 COLOR_PROCESS = "\033[96m"    # Cyan for process steps
+
 
 def log_message(message, category="INFO"):
     if category.upper() == "INFO":
@@ -48,10 +52,11 @@ def log_message(message, category="INFO"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{color}[{timestamp}] {category.upper()}: {message}{COLOR_RESET}")
 
-# ----- VENV BOOTSTRAP CODE -----
+# This function checks if the script is running inside a virtual environment.
 def in_virtualenv():
     return sys.prefix != sys.base_prefix
 
+# This function creates a virtual environment named "whisper_env" in the current working directory
 def create_and_activate_venv():
     venv_dir = os.path.join(os.getcwd(), "whisper_env")
     if not os.path.isdir(venv_dir):
@@ -65,10 +70,11 @@ def create_and_activate_venv():
         subprocess.check_call([new_python] + sys.argv)
         sys.exit()
 
+# This block checks if the script is running inside a virtual environment.
 if not in_virtualenv():
     create_and_activate_venv()
 
-# ----- Automatic Piper and ONNX Files Setup -----
+# This function ensures the Piper executable and ONNX files are available.
 def setup_piper_and_onnx():
     """
     Ensure Piper executable and ONNX files are available.
@@ -150,7 +156,7 @@ def setup_piper_and_onnx():
 
 setup_piper_and_onnx()
 
-# ----- Automatic Dependency Installation -----
+# This block checks if the required dependencies are installed.
 SETUP_MARKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".setup_complete")
 if not os.path.exists(SETUP_MARKER):
     log_message("Installing required dependencies...", "PROCESS")
@@ -181,7 +187,7 @@ if not os.path.exists(SETUP_MARKER):
     log_message("Dependencies installed. Restarting script...", "SUCCESS")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-# ----- Configuration Loading -----
+# This function loads the configuration from config.json, creating it with default values if it doesn't exist.
 def load_config():
     """
     Load configuration from config.json (in the script directory). If not present, create it with default values.
@@ -228,7 +234,7 @@ def load_config():
 
 config = load_config()
 
-# ----- Chat Session Logging Setup -----
+# This function sets up a chat session by creating a unique session folder and log file.
 def setup_chat_session():
     """
     Create a session folder inside "chat_sessions", named by the current datetime.
@@ -248,7 +254,7 @@ def setup_chat_session():
 
 session_folder, session_log = setup_chat_session()
 
-# ----- Import Additional Packages (after venv initialization and dependency installation) -----
+# Here we import the necessary libraries for audio processing, web scraping, and other functionalities.
 from sounddevice import InputStream
 import sounddevice as sd                       # audio playback / capture
 
@@ -303,7 +309,16 @@ from PIL import ImageGrab
 import cv2
 import mss
 
+from dataclasses import dataclass, field
+from typing import Any, Optional
+from flask import Flask, Response, render_template_string, request, jsonify
+from flask_cors import CORS
+from werkzeug.serving import make_server
+
+
 load_dotenv()
+
+# Check if brave API key is set in the environment variables
 brave_api_key = os.environ.get("BRAVE_API_KEY")
 if brave_api_key:
     print(f"brave key loaded from .env: {brave_api_key}")
@@ -312,7 +327,6 @@ else:
 log_message("Environment variables loaded using dotenv", "INFO")
 
 
-# ----- Load Whisper Models -----
 log_message("Loading Whisper models...", "PROCESS")
 try:
     whisper_model_primary = whisper.load_model(config["whisper_model_primary"])
@@ -356,22 +370,13 @@ except Exception as e:
     log_message("Restarting script to recover...", "INFO")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-# ----- Load Denoiser Model -----
+
 log_message("Loading denoiser model (DNS64)...", "PROCESS")
 denoiser_model = pretrained.dns64()   # Loads a pretrained DNS64 model from denoiser
 log_message("Denoiser model loaded.", "SUCCESS")
 
 
-# ─── OBSERVABILITY & FLASK IMPORTS ─────────────────────────────────────
-import threading, time, json
-from datetime import datetime
-
-from flask import Flask, Response, render_template_string, request, jsonify
-from flask_cors import CORS
-from werkzeug.serving import make_server
-
-# ----- Global Settings and Queues -----
-
+# Here we set up the Flask app and CORS for cross-origin requests.
 WORKSPACE_DIR = os.path.join(os.path.dirname(__file__), "workspace")
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 SAMPLE_RATE = 16000
@@ -393,14 +398,15 @@ def _tts_log(msg: str, level: str = "DEBUG"):
         return
     log_message(msg, level)
 
-# At top of your module, after loading `config`:
 TTS_DEBUG = config.get("tts_debug", False)
 
+# This function logs debug messages only if TTS_DEBUG is enabled.
 def _tts_debug(msg: str, category: str = "DEBUG"):
     """Only log if TTS_DEBUG is True."""
     if TTS_DEBUG:
         log_message(msg, category)
 
+# This function flushes the current TTS queue and kills any running Piper processes.
 def flush_current_tts():
     _tts_debug("Flushing current TTS queue and processes...")
     with tts_lock:
@@ -425,6 +431,7 @@ def flush_current_tts():
                 log_message(f"Error killing aplay process: {e}", "ERROR")
             current_tts_process = None
 
+# This function processes a text-to-speech request using Piper.
 def process_tts_request(text: str):
     volume    = config.get("tts_volume", 0.2)
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -503,8 +510,7 @@ def process_tts_request(text: str):
     except Exception as e:
         log_message("Error during TTS processing: " + str(e), "ERROR")
 
-
-
+# This function starts the TTS worker thread that processes text-to-speech requests from the queue.
 def tts_worker(q):
     log_message("TTS worker thread started.", "DEBUG")
     while True:
@@ -516,32 +522,13 @@ def tts_worker(q):
         process_tts_request(text)
         q.task_done()
 
-def assemble_mixed_data(data):
-    """
-    Assembles a mixed set of variables, strings, and other data types into a single string.
-
-    Args:
-        data: An arbitrary collection (list, tuple, set, etc.) containing variables,
-              strings, and other data types.  The order of elements in the input
-              collection determines the order in the output string.
-
-    Returns:
-        A single string formed by converting each element in the input collection
-        to a string and concatenating them in the original order.
-    """
-
-    result = ""
-    for item in data:
-        result += str(item)  # Convert each item to a string and append
-
-    return result
-
-# ----- Microphone Audio Capture -----
+# This function is an audio callback that processes audio input from the microphone.
 def audio_callback(indata, frames, time_info, status):
     if status:
         log_message("Audio callback status: " + str(status), "WARNING")
     audio_queue.put(indata.copy())
 
+# This function starts the audio capture stream from the microphone.
 def start_audio_capture():
     log_message("Starting microphone capture...", "PROCESS")
     stream = InputStream(callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=BUFFER_SIZE)
@@ -549,6 +536,7 @@ def start_audio_capture():
     log_message("Microphone capture started.", "SUCCESS")
     return stream
 
+# This following function handles dynamic range normalization of audio input.
 def dynamic_range_normalize(
     audio: np.ndarray,
     sr: int,
@@ -595,6 +583,7 @@ def dynamic_range_normalize(
     out /= (norm + eps)
     return out[:len(audio)]
 
+# This function applies a series of audio enhancements including dynamic range normalization, noise reduction, pre-emphasis filtering, band-pass EQ, and dynamic range compression.
 def apply_eq_and_denoise(
     audio: np.ndarray,
     sample_rate: int,
@@ -696,6 +685,7 @@ def apply_eq_and_denoise(
     log_message("Enhancement: Audio enhancement complete.", "DEBUG")
     return compressed.astype(np.float32)
 
+# This function cleans up text by removing emojis, code-fence markers, asterisks, backticks, and underscores.
 def clean_text(text):
     # 1) Remove emojis
     emoji_pattern = re.compile(
@@ -720,8 +710,7 @@ def clean_text(text):
     # 4) Trim whitespace
     return text.strip()
 
-
-# ----- Consensus Transcription Helper -----
+# This function transcribes audio using two Whisper models and checks for consensus between their outputs.
 def consensus_whisper_transcribe_helper(audio_array, language="en", rms_threshold=0.01, consensus_threshold=0.8):
     rms = np.sqrt(np.mean(np.square(audio_array)))
     if rms < rms_threshold:
@@ -775,7 +764,7 @@ def consensus_whisper_transcribe_helper(audio_array, language="en", rms_threshol
         log_message("No consensus between base and medium models; ignoring transcription.", "WARNING")
         return ""
 
-# ----- Transcription Validation Helper -----
+# This function validates a transcription by checking if it contains at least one alphanumeric character and one non-whitespace token.
 def validate_transcription(text):
     """
     Accept any transcript that contains at least one letter or digit
@@ -795,13 +784,14 @@ def validate_transcription(text):
     log_message("Transcription validated successfully.", "SUCCESS")
     return True
 
-# ----- Manager & Helper Classes for Tool-Calling Chat System -----
+# This class manages the configuration settings for the application.
 class ConfigManager:
     def __init__(self, config):
         config["model"] = config["primary_model"]
         self.config = config
         log_message("ConfigManager initialized with config.", "DEBUG")
 
+# This class manages the chat history, allowing entries to be added with timestamps.
 class HistoryManager:
     def __init__(self):
         self.history = []
@@ -815,6 +805,7 @@ class HistoryManager:
         self.history.append(entry)
         log_message(f"History entry added for role '{role}'.", "INFO")
 
+# This class manages the text-to-speech (TTS) functionality, allowing text to be enqueued for processing.
 class TTSManager:
     def enqueue(self, text):
         log_message(f"Enqueuing text for TTS: {text}", "INFO")
@@ -826,6 +817,7 @@ class TTSManager:
         log_message("Starting TTS processes.", "PROCESS")
         pass
 
+# This following class manages storage and retrieval of messages in a memory manager, simulating a database or persistent storage.
 class MemoryManager:
     def store_message(self, conversation_id, role, message, embedding):
         log_message("Storing message in MemoryManager.", "DEBUG")
@@ -837,11 +829,13 @@ class MemoryManager:
         log_message("Retrieving latest summary from MemoryManager.", "DEBUG")
         return None
 
+# This Following class manages the conversation mode detection, which determines the type of conversation based on the history. It is vestigial in the current flow but can be extended for more complex mode detection.
 class ModeManager:
     def detect_mode(self, history):
         log_message("Detecting conversation mode.", "DEBUG")
         return "conversational"
 
+# This class manages the display state, including the current tokens, request, and tool calls.
 class DisplayState:
     def __init__(self):
         self.lock = threading.Lock()
@@ -852,7 +846,7 @@ class DisplayState:
         
 display_state = DisplayState()
 
-
+# Here in this class, we define various utility functions for text processing, embedding, and other operations. We also include methods for removing emojis, converting numbers to words, and calculating cosine similarity.
 class Utils:
     @staticmethod
     def remove_emojis(text):
@@ -1009,12 +1003,13 @@ class Utils:
         except Exception:
             pass
 
-
+# This class delivers various utility functions for managing tools, such as parsing tool calls, adding subtasks, and listing subtasks for use by an LLM instance or other components.
 class Tools:
     _driver = None          # always present, even before first browser launch
     _poll   = 0.05                     
     _short  = 3
     
+    # Here in this definition, we define a static method to parse tool calls from text. It works by extracting either a fenced code block, an inline backtick call, or a bare function call from the input text.
     @staticmethod
     def parse_tool_call(text: str) -> str | None:
         """
@@ -1085,6 +1080,7 @@ class Tools:
         log_message(f"Parsed tool call from text: {code!r}", "DEBUG")
         return code
     
+    # Here in this definition, we define a static method to add a subtask under an existing task. If the parent task does not exist or has an ID less than or equal to zero, the subtask will be created as a top-level task.
     @staticmethod
     def add_subtask(parent_id: int, text: str) -> dict:
         """
@@ -1136,7 +1132,7 @@ class Tools:
 
         return sub
 
-
+    # Here in this definition, we define a static method to list all subtasks for a given parent task ID. It returns a list of subtasks that have the specified parent ID. We also ensure that the tasks are loaded from a JSON file, and if the file does not exist, an empty list is returned.
     @staticmethod
     def list_subtasks(parent_id: int) -> list:
         """
@@ -1147,6 +1143,7 @@ class Tools:
         tasks = json.loads(open(path).read()) if os.path.exists(path) else []
         return [t for t in tasks if t.get("parent") == parent_id]
 
+    # Here in this definition, we define a static method to set the status of a task or subtask. It updates the status to 'pending', 'in_progress', or 'done' and saves the updated task list back to the JSON file.
     @staticmethod
     def set_task_status(task_id: int, status: str) -> dict:
         """
@@ -1169,7 +1166,7 @@ class Tools:
             json.dump(tasks, f, indent=2)
         return t
 
-    # internal helpers for persistence
+    # This following static method loads the tasks dictionary from a JSON file. If the file does not exist, it returns an empty dictionary.
     @staticmethod
     def _load_tasks_dict() -> dict:
         import json, os
@@ -1178,6 +1175,7 @@ class Tools:
             return json.load(open(path, "r"))
         return {}
 
+    # Here we save the tasks dictionary to a JSON file. This method is used to persist the tasks after they have been modified.
     @staticmethod
     def _save_tasks_dict(tasks: dict) -> None:
         import json, os
@@ -1185,9 +1183,31 @@ class Tools:
         with open(path, "w") as f:
             json.dump(tasks, f, indent=2)
 
-    
     _process_registry: dict[int, subprocess.Popen] = {}
     
+    # This is a special function that takes in arbitrary data types (variables, strings, etc.) and returns a single string.
+    @staticmethod
+    def assemble_mixed_data(data):
+        """
+        Assembles a mixed set of variables, strings, and other data types into a single string.
+
+        Args:
+            data: An arbitrary collection (list, tuple, set, etc.) containing variables,
+                strings, and other data types.  The order of elements in the input
+                collection determines the order in the output string.
+
+        Returns:
+            A single string formed by converting each element in the input collection
+            to a string and concatenating them in the original order.
+        """
+
+        result = ""
+        for item in data:
+            result += str(item)  # Convert each item to a string and append
+
+        return result
+
+    # In this method we define a static method to add a new task. It generates a new task ID, appends the task to the tasks list, and saves it to the JSON file. The method returns a confirmation message with the new task ID.
     @staticmethod
     def add_task(text: str) -> str:
         import json, os
@@ -1199,6 +1219,7 @@ class Tools:
             json.dump(tasks, f, indent=2)
         return f"Task {new_id} added."
 
+    # Here we update a task by its ID. It searches for the task in the tasks list, updates its text, and saves the updated list back to the JSON file. If the task is not found, it returns an error message.
     @staticmethod
     def update_task(task_id: int, text: str) -> str:
         import json, os
@@ -1214,6 +1235,7 @@ class Tools:
                 return f"Task {task_id} updated."
         return f"No task with id={task_id}."
 
+    # In this method we define a static method to remove a task by its ID. It filters out the task with the specified ID from the tasks list and saves the updated list back to the JSON file. If the task is not found, it returns an error message.
     @staticmethod
     def remove_task(task_id: int) -> str:
         import json, os
@@ -1228,6 +1250,7 @@ class Tools:
             json.dump(new, f, indent=2)
         return f"Task {task_id} removed."
 
+    # Here we can define a static method to list all tasks. It reads the tasks from the JSON file and returns them as a JSON string. If the file does not exist, it returns an empty list.
     @staticmethod
     def list_tasks() -> str:
         import json, os
@@ -1235,7 +1258,7 @@ class Tools:
         tasks = json.loads(open(path).read()) if os.path.exists(path) else []
         return json.dumps(tasks)
     
-    # ── Tools.run_python_snippet  (drop-in) ──────────────────────────────
+    # This static method runs an arbitrary Python code snippet in a fresh subprocess, capturing its output and return code. It handles timeouts and errors gracefully, returning a structured dictionary with the results.
     @staticmethod
     def run_python_snippet(
         code: str,
@@ -1317,7 +1340,7 @@ class Tools:
             except OSError:
                 pass
 
-
+    # This static method runs a tool function in-process, parsing the tool call from a string. It executes the function and returns its output or an exception message.
     @staticmethod
     def run_tool_once(tool_call:str) -> dict:
         """
@@ -1344,7 +1367,7 @@ class Tools:
         except Exception as e:
             return {"output": None, "exception": traceback.format_exc(limit=2)}
 
-
+    # This static method runs a Python script, either in a new terminal window or synchronously capturing its output. It returns a dictionary with the process ID or captured output.
     @staticmethod
     def run_script(
         script_path: str,
@@ -1407,7 +1430,7 @@ class Tools:
         except Exception as e:
             return {"error": str(e)}
 
-
+    # This static method stops a previously launched script by its process ID (PID). It attempts to terminate the process and waits for it to finish, removing it from the registry if successful.
     @staticmethod
     def stop_script(pid: int) -> dict:
         """
@@ -1425,7 +1448,7 @@ class Tools:
         except Exception as e:
             return {"error": str(e)}
 
-
+    # This static method checks the status of a managed script by its process ID (PID). It returns a dictionary indicating whether the script is running, has exited with a code, or if there was an error.
     @staticmethod
     def script_status(pid: int) -> dict:
         """
@@ -1443,6 +1466,7 @@ class Tools:
         del Tools._process_registry[pid]
         return {"exit_code": rc}
 
+    # This static method provides a simple dispatcher for exploring tools. It allows agents to list available tools or get the source code of a specific tool.
     @staticmethod
     def explore_tools(action: str = "list", tool: str | None = None) -> str:
         """
@@ -1456,8 +1480,7 @@ class Tools:
             return Tools.get_tool_source(tool)
         return "Usage: explore_tools('list')  or  explore_tools('source','tool_name')"
 
-
-    # ───────────────────────────  SELF-IMPROVEMENT HELPERS  ───────────────────────────
+    # This static method lists all callable tools currently available in the Tools class. It can return either a simple list of tool names or detailed metadata about each tool, depending on the `detail` parameter.
     @staticmethod
     def list_tools(detail: bool = False) -> str:
         """
@@ -1480,6 +1503,7 @@ class Tools:
                 tools.append(name)
         return json.dumps(tools, indent=2)
 
+    # This static method retrieves the source code of a specified tool function by its name. It uses the `inspect` module to get the source code and handles errors gracefully if the tool is not found or if there are issues retrieving the source.
     @staticmethod
     def get_tool_source(tool_name: str) -> str:
         """
@@ -1495,6 +1519,7 @@ class Tools:
         except Exception as e:                     # pragma: no-cover
             return f"Error retrieving source: {e}"
 
+    # This static method creates a new external tool by writing a Python function to a file in the `external_tools` directory. It handles overwriting existing files, auto-reloading the module, and provides error messages for common issues.
     @staticmethod
     def create_tool(
         tool_name: str,
@@ -1557,6 +1582,7 @@ class Tools:
 
         return f"Tool '{tool_name}' created ✔"
 
+    # This static method lists all external tools currently present in the `external_tools` directory. It returns a sorted list of filenames (without the `.py` extension) that are valid Python files.
     @staticmethod
     def list_external_tools() -> list[str]:
         """
@@ -1568,6 +1594,7 @@ class Tools:
             return []
         return sorted(f for f in os.listdir(ext_dir) if f.endswith(".py"))
 
+    # This static method removes an external tool by deleting its Python file and detaching it from the Tools class. It handles
     @staticmethod
     def remove_external_tool(tool_name: str) -> str:
         """
@@ -1593,6 +1620,7 @@ class Tools:
         except Exception as e:                     # pragma: no-cover
             return f"Error removing tool: {e}"
 
+    # This static method reloads all external tools by detaching any previously loaded tools, purging their modules from `sys.modules`, and then re-importing everything found in the `external_tools` directory. It returns a confirmation message.
     @staticmethod
     def reload_external_tools() -> str:
         """
@@ -1615,6 +1643,7 @@ class Tools:
         Tools.load_external_tools()
         return "External tools reloaded."
 
+    # This static method provides a quick-and-dirty unit-test harness for testing tools. It accepts a tool name and a list of test cases, executing each case and returning a summary of passed and failed tests.
     @staticmethod
     def test_tool(tool_name: str, test_cases: list[dict]) -> dict:
         """
@@ -1667,6 +1696,7 @@ class Tools:
 
         return {"tool": tool_name, "passed": passed, "failed": failed, "results": results}
 
+    # This static method evaluates a tool using an arbitrary metric defined as a single-line lambda function. It runs the tool with provided sample inputs and returns a dictionary with scores, mean score, and details of each run.
     @staticmethod
     def evaluate_tool(
         tool_name: str,
@@ -1709,7 +1739,7 @@ class Tools:
         mean = statistics.mean(scores) if scores else 0.0
         return {"scores": scores, "mean_score": mean, "details": details}
 
-    # ───────────────────────────  EXTERNAL-TOOL LOADER  ───────────────────────────
+    # This static method loads all external tools from the `external_tools` directory, importing each Python file and attaching its public functions as static methods on the Tools class. It also logs the loaded tools.
     @staticmethod
     def load_external_tools() -> None:
         """
@@ -1742,8 +1772,7 @@ class Tools:
         # keep the public manifest in sync for other agents
         Tools.discover_agent_stack()
 
-
-
+    # This static method creates, appends, or deletes files in the workspace directory. It provides methods to create a new file, append content to an existing file, delete a file, list workspace entries, find files matching a pattern, and read/write files.
     @staticmethod
     def create_file(filename: str, content: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
@@ -1759,7 +1788,7 @@ class Tools:
         except Exception as e:
             return f"Error creating file {path!r}: {e}"
 
-
+    # This static method appends content to an existing file or creates it if it does not exist. It ensures the directory structure is created and handles any exceptions that may occur during the file operation.
     @staticmethod
     def append_file(filename: str, content: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
@@ -1775,7 +1804,7 @@ class Tools:
         except Exception as e:
             return f"Error appending to file {path!r}: {e}"
 
-
+    # This static method deletes a specified file from the workspace directory. It handles exceptions for file not found and other errors, returning appropriate messages.
     @staticmethod
     def delete_file(filename: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
@@ -1791,7 +1820,7 @@ class Tools:
         except Exception as e:
             return f"Error deleting file {path!r}: {e}"
 
-
+    # This static method lists all entries (files and directories) under the specified base directory. It returns a JSON string of the entries or an error message if the operation fails.
     @staticmethod
     def list_workspace(base_dir: str = WORKSPACE_DIR) -> str:
         """
@@ -1804,7 +1833,7 @@ class Tools:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
-
+    # This static method finds files matching a specified pattern under the workspace directory. It recursively searches through subdirectories and returns a JSON string of matching files and their directories.
     @staticmethod
     def find_files(pattern: str, path: str = WORKSPACE_DIR) -> str:
         """
@@ -1818,7 +1847,7 @@ class Tools:
                     matches.append({"file": fname, "dir": root})
         return json.dumps(matches)
 
-
+    # This static method lists the contents of a directory, returning a JSON string of the entries. It handles exceptions and returns an error message if the operation fails.
     @staticmethod
     def list_dir(path: str = WORKSPACE_DIR) -> str:
         """
@@ -1830,11 +1859,13 @@ class Tools:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
+    # Here we define a static method that serves as an alias for `find_files`, allowing users to list files in the workspace directory using a specified pattern. It returns a list of matching files.
     @staticmethod
     def list_files(path: str = WORKSPACE_DIR, pattern: str = "*") -> list:
         """Alias for find_files(pattern, path)."""
         return Tools.find_files(pattern, path)
 
+    # This static method reads multiple files from a specified path and returns their contents as a dictionary. Each key in the dictionary is the filename, and the value is the content of that file.
     @staticmethod
     def read_files(path: str, *filenames: str) -> dict:
         """
@@ -1845,6 +1876,7 @@ class Tools:
             out[fn] = Tools.read_file(fn, path)
         return out
 
+    # We define a static method to read the contents of a single file. It constructs the full path, attempts to read the file, and returns its contents or an error message if reading fails.
     @staticmethod
     def read_file(filepath: str, base_dir: str | None = None) -> str:
         """
@@ -1858,7 +1890,7 @@ class Tools:
         except Exception as e:
             return f"Error reading {path!r}: {e}"
 
-
+    # This static method writes content to a specified file path, creating any necessary directories. It handles exceptions and returns a message indicating success or failure.
     @staticmethod
     def write_file(filepath: str, content: str, base_dir: str | None = None) -> str:
         """
@@ -1874,7 +1906,7 @@ class Tools:
         except Exception as e:
             return f"Error writing {path!r}: {e}"
 
-
+    # This static method renames a file from an old name to a new name under the specified base directory. It ensures that the paths are safe and handles exceptions, returning a message indicating success or failure.
     @staticmethod
     def rename_file(old: str, new: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
@@ -1894,7 +1926,7 @@ class Tools:
         except Exception as e:
             return f"Error renaming file: {e}"
 
-
+    # This static method copies a file from a source path to a destination path under the specified base directory. It ensures that the paths are safe, creates necessary directories, and handles exceptions, returning a message indicating success or failure.
     @staticmethod
     def copy_file(src: str, dst: str, base_dir: str = WORKSPACE_DIR) -> str:
         """
@@ -1914,7 +1946,7 @@ class Tools:
         except Exception as e:
             return f"Error copying file: {e}"
 
-
+    # This static method checks if a file exists under the specified base directory. It normalizes the path to prevent directory traversal attacks and returns a boolean indicating whether the file exists.
     @staticmethod
     def file_exists(filename: str, base_dir: str = WORKSPACE_DIR) -> bool:
         """
@@ -1926,7 +1958,7 @@ class Tools:
             return False
         return os.path.exists(os.path.join(base_dir, safe))
 
-
+    # This static method retrieves metadata for a specified file, including its size and last modified time. It normalizes the path to prevent directory traversal attacks and handles exceptions, returning a dictionary with the file's metadata or an error message.
     @staticmethod
     def file_info(filename: str, base_dir: str = WORKSPACE_DIR) -> dict:
         """
@@ -1943,7 +1975,7 @@ class Tools:
         except Exception as e:
             return {"error": str(e)}
 
-
+    # This static method returns the absolute path of the workspace directory, which is defined as a constant at the top of the module. It can be used to get the base directory for file operations.
     @staticmethod
     def get_workspace_dir() -> str:
         """
@@ -1951,7 +1983,7 @@ class Tools:
         """
         return WORKSPACE_DIR
 
-
+    # This static method returns the current working directory of the process. It uses the `os` module to get the current directory and returns it as a string.
     @staticmethod
     def get_cwd() -> str:
         """
@@ -1960,7 +1992,7 @@ class Tools:
         import os
         return os.getcwd()
 
-
+    # We define a static method to introspect the available tools and agents, writing the results to a JSON file named `agent_stack.json`. This method collects tool and agent names, default stages, and the last updated timestamp.
     @staticmethod
     def discover_agent_stack() -> str:
         """
@@ -2008,6 +2040,8 @@ class Tools:
         with open(stack_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
         return f"agent_stack.json created with {len(tools)} tools & {len(agents)} agents."
+    
+    # This static method loads the agent stack from the `agent_stack.json` file. It handles cases where the file is missing or corrupted, regenerating it if necessary, and ensures that all required keys are present in the JSON structure.
     @staticmethod
     def load_agent_stack() -> dict:
         """
@@ -2057,7 +2091,7 @@ class Tools:
 
         return data
 
-
+    # This static method updates the `agent_stack.json` file with user-specified changes. It merges the changes into the existing configuration, appends a change history entry if a justification is provided, and writes the updated configuration back to disk.
     @staticmethod
     def update_agent_stack(changes: dict, justification: str | None = None) -> str:
         """
@@ -2092,11 +2126,8 @@ class Tools:
             json.dump(config, f, indent=2)
 
         return "agent_stack.json updated."
-    
-    from selenium.common.exceptions import WebDriverException
-    from selenium.webdriver.chrome.service import Service
-    from selenium.webdriver.chrome.options import Options
 
+    # This static method attempts to find a working system-wide chromedriver executable. It checks common locations and verifies that the executable can run without errors, returning the path if successful or None if not found.
     @staticmethod
     def _find_system_chromedriver() -> str | None:
         """
@@ -2130,7 +2161,7 @@ class Tools:
                     continue
         return None
     
-    # ── internal helpers ──────────────────────────────────────────────
+    # This static method waits for the document to be fully loaded in a Selenium WebDriver instance. It blocks until the `document.readyState` is "complete", ensuring that the page is fully loaded before proceeding with further actions.
     @staticmethod
     def _wait_for_ready(drv, timeout=6):
         """Block until document.readyState == 'complete'."""
@@ -2138,6 +2169,7 @@ class Tools:
             lambda d: d.execute_script("return document.readyState") == "complete"
         )
 
+    # This static method waits for a specific element to be present and enabled in the DOM, given a list of CSS selectors. It returns the first matching WebElement or None if none are found within the specified timeout.
     @staticmethod
     def _first_present(drv, selectors: list[str], timeout=4):
         """
@@ -2153,6 +2185,7 @@ class Tools:
                 continue
         return None
 
+    # This static method defines a condition for WebDriverWait that checks if an element is both visible and enabled. It returns a callable that can be used with WebDriverWait to wait for the specified condition.
     @staticmethod
     def _visible_and_enabled(locator):
         """condition: element is displayed *and* not disabled."""
@@ -2164,7 +2197,7 @@ class Tools:
                 return False
         return _cond
 
-    # ── session bootstrap ────────────────────────────────────────────
+    # This static method opens a Chrome/Chromium browser using Selenium WebDriver. It tries multiple methods to find a suitable chromedriver, including Selenium-Manager, system-wide chromedriver, and webdriver-manager. It handles different CPU architectures and returns a message indicating success or failure.
     @staticmethod
     def open_browser(headless: bool = False, force_new: bool = False) -> str:
         """
@@ -2277,7 +2310,7 @@ class Tools:
                 "Install a matching chromedriver and set PATH or CHROME_BIN."
             ) from e_wdm
 
-
+    # This static method closes the currently open browser session, if any. It attempts to quit the WebDriver instance and handles exceptions gracefully, returning a message indicating whether the browser was closed or if there was no browser to close.
     @staticmethod
     def close_browser() -> str:
         if Tools._driver:
@@ -2290,7 +2323,7 @@ class Tools:
             return "Browser closed"
         return "No browser to close"
 
-    # ── low-level DOM helpers ────────────────────────────────────────
+    # This static method navigates the currently open browser to a specified URL. It checks if the browser is open, logs the navigation action, and returns a message indicating success or failure.
     @staticmethod
     def navigate(url: str) -> str:
         if not Tools._driver:
@@ -2299,6 +2332,7 @@ class Tools:
         Tools._driver.get(url)
         return f"Navigated to {url}"
 
+    # This static method clicks on a specified element in the currently open browser using a CSS selector. It waits for the element to be clickable, scrolls it into view, and logs the action. It returns a message indicating success or failure.
     @staticmethod
     def click(selector: str, timeout: int = 8) -> str:
         if not Tools._driver:
@@ -2317,6 +2351,7 @@ class Tools:
             log_message(f"[click] Error clicking {selector}: {e}", "ERROR")
             return f"Error clicking {selector}: {e}"
 
+    # This static method inputs text into a specified element in the currently open browser using a CSS selector. It waits for the element to be clickable, scrolls it into view, clears any existing text, and sends the specified text followed by a RETURN key. It logs the action and returns a message indicating success or failure.
     @staticmethod
     def input(selector: str, text: str, timeout: int = 8) -> str:
         if not Tools._driver:
@@ -2335,12 +2370,14 @@ class Tools:
             log_message(f"[input] Error typing into {selector}: {e}", "ERROR")
             return f"Error typing into {selector}: {e}"
 
+    # This static method retrieves the current HTML content of the page in the currently open browser. It checks if the browser is open, retrieves the page source, and returns it as a string. If the browser is not open, it returns an error message.
     @staticmethod
     def get_html() -> str:
         if not Tools._driver:
             return "Error: browser not open"
         return Tools._driver.page_source
 
+    # This static method takes a screenshot of the currently open browser and saves it to a specified filename. It checks if the browser is open, saves the screenshot, and returns the filename. If the browser is not open, it returns an error message.
     @staticmethod
     def screenshot(filename: str = "screenshot.png") -> str:
         if not Tools._driver:
@@ -2348,7 +2385,7 @@ class Tools:
         Tools._driver.save_screenshot(filename)
         return filename
 
-    # ───────────────────────────  DUCKDUCKGO SEARCH  ──────────────────────────
+    # This static method performs a quick DuckDuckGo search for a given topic. It opens the DuckDuckGo homepage, inputs the search query, waits for results, and optionally deep-scrapes the first few results in new tabs. It returns a list of dictionaries containing the title, URL, snippet, summary, and full page HTML content.
     @staticmethod
     def duckduckgo_search(        # ← new canonical name
         topic: str,
@@ -2512,15 +2549,10 @@ class Tools:
         log_message(f"[duckduckgo_search] Collected {len(results)} results.", "SUCCESS")
         return results
 
-
-    # ▸ optional backward-compat alias
+    # This method assigns the duckduckgo_search method to a variable for compatibility with existing code that expects this name.
     ddg_search = duckduckgo_search
 
-
-
-    # ────────────────────────────────────────────────────────────────
-    #  selenium_extract_summary  (robust version)
-    # ────────────────────────────────────────────────────────────────
+    # This static method extracts a summary from a webpage using two stages:
     @staticmethod
     def selenium_extract_summary(url: str, wait_sec: int = 8) -> str:
         """
@@ -2566,9 +2598,7 @@ class Tools:
         finally:
             Tools.close_browser()
 
-    # ────────────────────────────────────────────────────────────────
-    #  summarize_local_search  (minor tweak → deep_scrape flag)
-    # ────────────────────────────────────────────────────────────────
+    # This static method summarizes a local search by calling the ddg_search method to get the top_n results for a given topic. It formats the results into a bullet list with titles and summaries, returning the formatted string.
     @staticmethod
     def summarize_local_search(topic: str, top_n: int = 3, deep: bool = False) -> str:
         """
@@ -2586,7 +2616,10 @@ class Tools:
             for i, e in enumerate(entries, 1)
         )
 
-    
+    # This static method retrieves the chat history based on various input parameters. It can return messages from a specific timeframe, the last N messages, or messages relevant to a query. It merges on-disk session logs with in-memory history and returns the results in JSON format.
+    # The method handles different input formats and applies semantic similarity search if a query is provided.
+    # It also ensures that the results are formatted consistently and includes timestamps, roles, and content.
+    # The method is designed to be flexible and can handle various use cases for retrieving chat history.
     @staticmethod
     def get_chat_history(arg1=None, arg2=None) -> str:
         """
@@ -2744,6 +2777,7 @@ class Tools:
 
         return json.dumps({"results": out}, indent=2)
 
+    # This static method retrieves the current local time in a formatted string. It uses the datetime module to get the current time, formats it as "YYYY-MM-DD HH:MM:SS", and logs the action.
     @staticmethod
     def get_current_time():
         from datetime import datetime
@@ -2753,7 +2787,8 @@ class Tools:
         # Log the exact timestamp we’re returning
         log_message(f"Current time retrieved: {current_time}", "DEBUG")
         return current_time
-        
+    
+    # This static method captures the primary monitor's screen using mss, saves it with a timestamp, and returns a JSON string containing the file path and a prompt for the model to describe the screenshot.
     @staticmethod
     def capture_screen_and_annotate():
         """
@@ -2791,7 +2826,7 @@ class Tools:
             "prompt": f"Please describe what you see in the screenshot, considering this is a screenshot which is of the computer that you reside on, and activity on the screen may be critical to answering questions, be as verbose as possible and describe any text or images present at '{path}'."
         })
 
-
+    # This static method captures one frame from the default webcam using OpenCV, saves it with a timestamp, and returns a JSON string containing the file path and a prompt for the model to describe the image.
     @staticmethod
     def capture_webcam_and_annotate():
         """
@@ -2839,7 +2874,7 @@ class Tools:
             "prompt": f"Please describe what you see in the image in great detail, considering the context that this image is coming from a webcam attached to the computer you reside on at '{path}'."
         })
 
-
+    # This static method converts a user query into a more precise information query related to the content of an image. It uses a secondary agent tool to process the query and image context, returning the refined query.
     @staticmethod
     def convert_query_for_image(query, image_path):
         prompt = (f"Given the user query: '{query}', and the context of the image at '{image_path}', "
@@ -2849,6 +2884,7 @@ class Tools:
         log_message("Image query conversion response: " + response, "SUCCESS")
         return response
 
+    # This static method loads an image from a specified path, checking if the file exists. If the image is found, it returns the absolute path; otherwise, it logs an error and returns an error message.
     @staticmethod
     def load_image(image_path):
         full_path = os.path.abspath(image_path)
@@ -2858,7 +2894,8 @@ class Tools:
         else:
             log_message(f"Image file not found: {full_path}", "ERROR")
             return f"Error: Image file not found: {full_path}"
-        
+    
+    # This static method retrieves the battery voltage from a file named "voltage.txt" located in the user's home directory. It reads the voltage value, logs the action, and returns the voltage as a float. If an error occurs while reading the file, it logs the error and raises a RuntimeError.
     @staticmethod
     def get_battery_voltage():
         try:
@@ -2872,8 +2909,7 @@ class Tools:
             log_message("Error reading battery voltage: " + str(e), "ERROR")
             raise RuntimeError(f"Error reading battery voltage: {e}")
     
-
-    # ───────────────────────────  WEB SEARCH HELPERS  ─────────────────────────
+    # This static method searches the internet for a given topic using the Brave Search API if available, or falls back to DuckDuckGo search. It returns a JSON string containing the search engine used and the raw results.
     @staticmethod
     def search_internet(topic: str) -> str:
         """
@@ -2918,7 +2954,7 @@ class Tools:
             log_message(f"DuckDuckGo fallback failed: {e}", "ERROR")
             return json.dumps({"engine": "error", "data": str(e)})
 
-    # ───────────────────────────  SEARCH → SUMMARY  ───────────────────────────
+    # This static method summarizes a web search by calling the search_internet method to get the top_n results for a given topic. It scrapes each URL for content, asks a secondary agent tool for a summary, and returns a formatted bullet list of the results.
     @staticmethod
     def summarize_search(topic: str, top_n: int = 3) -> str:
         """
@@ -2970,7 +3006,7 @@ class Tools:
             return "No web results found."
         return "\n".join(summaries)
 
-
+    # This static method scrapes a webpage using BeautifulSoup and requests. It fetches the content of the URL, parses it with BeautifulSoup, and returns the prettified HTML. If an error occurs during scraping, it logs the error and returns an error message.
     @staticmethod
     def bs4_scrape(url):
         headers = {
@@ -2990,6 +3026,7 @@ class Tools:
             log_message("Error during scraping: " + str(e), "ERROR")
             return f"Error during scraping: {e}"
 
+    # This static method finds a file by name in a specified search path. It walks through the directory tree, checking each file against the given filename. If the file is found, it logs the success and returns the directory path; otherwise, it logs a warning and returns None.
     @staticmethod
     def find_file(filename, search_path="."):
         log_message(f"Searching for file: {filename} in path: {search_path}", "PROCESS")
@@ -3000,6 +3037,7 @@ class Tools:
         log_message("File not found.", "WARNING")
         return None
 
+    # This static method retrieves the current location based on the public IP address of the machine. It uses the ip-api.com service to get location data, logs the action, and returns the JSON response. If an error occurs during the request, it logs the error and returns an error message.
     @staticmethod
     def get_current_location():
         try:
@@ -3016,6 +3054,7 @@ class Tools:
             log_message("Error retrieving location: " + str(e), "ERROR")
             return {"error": str(e)}
 
+    # This static method retrieves the current system utilization metrics such as CPU usage, memory usage, and disk usage. It uses the psutil library to gather these metrics, logs the action, and returns a dictionary containing the utilization percentages.
     @staticmethod
     def get_system_utilization():
         utilization = {
@@ -3026,46 +3065,48 @@ class Tools:
         log_message("System utilization retrieved.", "DEBUG")
         return utilization
 
+    # This static method invokes the secondary LLM (for tool processing) with a user prompt and an optional temperature. It streams tokens to the console as they arrive and returns the full assistant message content as a string.
     @staticmethod
     def secondary_agent_tool(prompt: str, temperature: float = 0.7) -> str:
         """
         Invoke the secondary LLM (for tool processing) with a user prompt
-        and an optional temperature. Returns the assistant’s message content
-        as a plain string (or an error message on failure).
+        and an optional temperature. Streams tokens to console as they arrive,
+        and returns the full assistant message content as a string.
         """
         secondary_model = config.get("secondary_model")
         payload = {
             "model": secondary_model,
             "temperature": temperature,
             "messages": [{"role": "user", "content": prompt}],
-            "stream": False
+            "stream": True
         }
         try:
-            log_message(f"Calling secondary agent tool with prompt={prompt!r} temperature={temperature}", "PROCESS")
-            response = chat(
+            log_message(f"Calling secondary agent tool (streaming) with prompt={prompt!r} temperature={temperature}", "PROCESS")
+            content = ""
+            print("⟳ Secondary Agent Tool Stream:", end="", flush=True)
+            for part in chat(
                 model=secondary_model,
                 messages=payload["messages"],
-                stream=False
-            )
-            # Ollama’s chat(...) returns {"message": {"content": ...}}
-            content = response.get("message", {}).get("content")
-            if content is None:
-                log_message("Secondary agent tool returned no content field", "WARNING")
-                return ""
-            log_message("Secondary agent tool responded.", "SUCCESS")
+                stream=True
+            ):
+                tok = part["message"]["content"]
+                content += tok
+                print(tok, end="", flush=True)
+            print()  # newline after stream finishes
+            log_message("Secondary agent tool stream complete.", "SUCCESS")
             return content
         except Exception as e:
             log_message(f"Error in secondary agent tool: {e}", "ERROR")
             return f"Error in secondary agent: {e}"
 
-
+# This exception is raised to stop a stream when the Watchdog detects a runaway or hallucinating output.
 class StopStreamException(Exception):
     """Raised to abort a runaway or hallucinating stream."""
     pass
 
-
+# This class manages the Watchdog functionality, which monitors the quality of LLM runs and detects potential hallucinations in the output. It evaluates the overall run quality and monitors streaming outputs for hallucinations.
 class WatchdogManager:
-    # ─── Replacement ───
+    # This class monitors the quality of LLM runs and detects potential hallucinations in the output.
     def __init__(self, quality_model: str, halluc_model: str = None,
                  quality_threshold: float = 7.5, halluc_threshold: float = 0.5,
                  max_retries: int = 1):
@@ -3086,7 +3127,7 @@ class WatchdogManager:
         self.min_snippet_tokens     = 3    # ignore snippets shorter than this
         self.snippet_check_frequency = 2   # only check every Nth snippet
 
-
+    # This method evaluates the run quality after the full pipeline execution. It returns a tuple containing the score (0–10) and a list of suggestions for improvement.
     def evaluate_run(self, ctx) -> tuple[float, list[str]]:
         """
         After the full pipeline, returns (score, suggestions).
@@ -3117,7 +3158,7 @@ class WatchdogManager:
         except Exception:
             return 0.0, []
 
-    # ─── Replacement ───
+    # This method monitors a streaming output for potential hallucinations. It yields each chunk of the stream while checking every Nth snippet for hallucinations, based on the configured thresholds.
     def monitor_stream(self, stream_generator, ctx):
         executor       = ThreadPoolExecutor(max_workers=2)
         pending_checks = []
@@ -3162,8 +3203,8 @@ class WatchdogManager:
         finally:
             executor.shutdown(wait=False)
 
-
-    # ─── Replacement ───
+    # This method detects hallucinations in a given snippet using the configured hallucination model. It returns a score between 0 and 1, where higher scores indicate more likely hallucinations.
+    # It skips very short or trivial snippets entirely.
     def _detect_hallucination(self, snippet: str, ctx) -> float:
         """
         Returns a hallucination score 0–1 for this snippet, using self.halluc_model.
@@ -3196,7 +3237,7 @@ class WatchdogManager:
             # on parse failure, assume no hallucination
             return 0.0
 
-
+# This class tracks the performance of each stage in the pipeline, recording timing and success rates. It adjusts the system prompt for stages that consistently underperform, aiming to improve reliability.
 class PromptEvaluator:
     """
     Tracks per-stage timing & success, and adjusts the system prompt
@@ -3204,16 +3245,19 @@ class PromptEvaluator:
     """
     WINDOW = 10  # how many recent runs to consider
 
+    # Initializes the PromptEvaluator with a metrics dictionary that will hold stage performance data.
     def __init__(self):
         # stage → list of (duration, success)
         self.metrics = defaultdict(list)
 
+    # Records the duration and success status of a stage run. If the number of records exceeds the WINDOW, it removes the oldest record.
     def record(self, stage: str, duration: float, success: bool):
         m = self.metrics[stage]
         m.append((duration, success))
         if len(m) > self.WINDOW:
             m.pop(0)
 
+    # Checks if a stage should be adjusted based on its recent performance. If the failure rate exceeds 30% in the last WINDOW runs, it returns True; otherwise, it returns False.
     def should_adjust(self, stage: str) -> bool:
         # if more than 30% failures in WINDOW
         m = self.metrics.get(stage, [])
@@ -3222,6 +3266,7 @@ class PromptEvaluator:
         failures = sum(1 for d,s in m if not s)
         return (failures / len(m)) > 0.3
 
+    # Adjusts the system prompt for a stage if it should be adjusted. It appends a note to the current system prompt to improve reliability for that stage.
     def adjust(self, stage: str, current_system: str) -> str | None:
         """
         Returns a modified system prompt if needed, else None.
@@ -3233,6 +3278,7 @@ class PromptEvaluator:
         note = f"\n[Note] Improve reliability of '{stage}' stage by being more explicit."
         return current_system + note
     
+# This class manages a rolling history of prompts and their observed rewards, allowing for the suggestion of variations and selection of the best-performing prompts.
 class RLManager:
     """
     Keeps a rolling history of prompts/stage-lists and their
@@ -3241,16 +3287,17 @@ class RLManager:
     """
     WINDOW = 25        # how many recent runs to keep
 
+    # Initializes the RLManager with an empty history list that will store tuples of (prompt, stages, reward).
     def __init__(self):
         self.history = []   # list[(prompt,str), stages,list[str], reward,float]
 
-    # ——— called by ChatManager at end of each run ———
+    # This method records a new prompt, its stages, and the observed reward. If the history exceeds the WINDOW size, it removes the oldest record to maintain a rolling history.
     def record(self, prompt: str, stages: list[str], reward: float):
         self.history.append((prompt, stages, reward))
         if len(self.history) > self.WINDOW:
             self.history.pop(0)
 
-    # ——— produce a candidate (prompt, stages) tuple ———
+    # This method proposes a new prompt and stage list by mutating the base prompt and stages. It randomly shuffles instructions in the prompt and may drop, add, or swap stages in the stage list.
     def propose(self, base_prompt: str, base_stages: list[str]) -> tuple[str, list[str]]:
         # 1) mutate the prompt (simple example: shuffle two instructions)
         parts = base_prompt.split("\n")
@@ -3275,13 +3322,14 @@ class RLManager:
             stages[i], stages[j] = stages[j], stages[i]
         return new_prompt, stages
 
-    # ——— pick best prompt seen so far ———
+    # This method suggests a new prompt based on the best-performing prompt in the history. If no history exists, it returns the default prompt.
     def best_prompt(self, default: str) -> str:
         if not self.history:
             return default
         best = max(self.history, key=lambda rec: rec[2])
         return best[0]
 
+# This class provides a lightweight run-time telemetry system that tracks each pipeline run, every stage's status and timing, and exposes simple signals (e.g., recent failure rate) that the ChatManager can use to adjust its behavior.
 class Observer:
     """
     Lightweight run-time telemetry: tracks each pipeline run, every stage’s
@@ -3290,10 +3338,11 @@ class Observer:
     """
     _ids = count(1)
 
+    # Initializes the Observer with an empty runs dictionary that will hold run data indexed by run IDs.
     def __init__(self):
         self.runs: dict[int, dict] = {}
 
-    # ---------------- run lifecycle ----------------
+    # This method starts a new run, assigning it a unique run ID and storing the user message, start time, and initial status. It returns the run ID.
     def start_run(self, user_msg: str) -> int:
         run_id = next(self._ids)
         self.runs[run_id] = {
@@ -3304,22 +3353,26 @@ class Observer:
         }
         return run_id
 
+    # This method logs the start and end times of a stage, along with its status. It initializes the stage entry if it does not exist.
     def log_stage_start(self, run_id: int, stage: str):
         self.runs[run_id]["stages"][stage]["start"] = datetime.now()
 
+    # This method logs a token emitted during a stage, allowing for per-token streaming. It initializes the stage entry if it does not exist.
     def log_stage_end(self, run_id: int, stage: str):
         self.runs[run_id]["stages"][stage]["end"]   = datetime.now()
         self.runs[run_id]["stages"][stage]["status"] = "done"
 
+    # This method logs a token emitted during a stage, allowing for per-token streaming. It initializes the stage entry if it does not exist.
     def log_error(self, run_id: int, stage: str, err: Exception):
         self.runs[run_id]["stages"][stage]["error"]  = str(err)
         self.runs[run_id]["stages"][stage]["status"] = "error"
 
+    # This method logs a token emitted during a stage, allowing for per-token streaming. It initializes the stage entry if it does not exist.
     def complete_run(self, run_id: int):
         self.runs[run_id]["end"]   = datetime.now()
         self.runs[run_id]["status"] = "done"
 
-    # ---------------- signals ----------------
+    # Here is a method to retrieve the run data for a specific run ID. It returns the run details or None if the run ID does not exist.
     def recent_failure_ratio(self, n: int = 10) -> float:
         """Return fraction of the last *n* runs that had any stage error."""
         last = list(self.runs.values())[-n:]
@@ -3331,22 +3384,26 @@ class Observer:
         )
         return fails / len(last)
 
-
+# This class wraps the Observer to emit every event as JSON over Server-Sent Events (SSE), proxies other calls, and adds per-token streaming capabilities. It allows subscribers to receive real-time updates about the run lifecycle and tool usage.
 class ObservabilityManager:
     """
     Wraps Observer to emit every event as JSON over SSE,
     proxies other calls, and adds per-token streaming.
     """
+    # Initializes the ObservabilityManager with a real Observer instance and an empty list of subscribers.
     def __init__(self, real_observer):
         self.real = real_observer
         self._subscribers = []
 
+    # This method allows dynamic attribute access to the underlying Observer instance, enabling the ObservabilityManager to proxy calls to the real Observer.
     def __getattr__(self, name):
         return getattr(self.real, name)
 
+    # This method allows subscribers to register callback functions that will be called when an event is emitted. Subscribers can be any callable that accepts a single argument (the JSON payload).
     def subscribe(self, fn):
         self._subscribers.append(fn)
 
+    # This method emits an event to all registered subscribers by converting the event dictionary to a JSON string and calling each subscriber function with the payload. If a subscriber raises an exception, it is removed from the list of subscribers.
     def _emit(self, event: dict):
         payload = json.dumps(event)
         for fn in list(self._subscribers):
@@ -3355,7 +3412,7 @@ class ObservabilityManager:
             except:
                 self._subscribers.remove(fn)
 
-    # Run lifecycle
+    # This method starts a new run, emits a "run_start" event with the run ID and user message, and returns the run ID. It also records the start time of the run.
     def start_run(self, user_msg):
         rid = self.real.start_run(user_msg)
         self._emit({
@@ -3364,6 +3421,7 @@ class ObservabilityManager:
         })
         return rid
 
+    # This method logs the start of a stage, emits a "stage_start" event with the run ID and stage name, and records the start time of the stage.
     def log_stage_start(self, runId, stage):
         self.real.log_stage_start(runId, stage)
         self._emit({
@@ -3371,6 +3429,7 @@ class ObservabilityManager:
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
+    # This method logs a token emitted during a stage, emits a "stage_stream" event with the run ID, stage name, and token, and records the timestamp of the token emission.
     def log_stage_token(self, runId, stage, token):
         # new: per‐token streaming
         self._emit({
@@ -3379,6 +3438,7 @@ class ObservabilityManager:
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
+    # This method logs the end of a stage, emits a "stage_end" event with the run ID and stage name, and records the end time of the stage.
     def log_stage_end(self, runId, stage):
         self.real.log_stage_end(runId, stage)
         self._emit({
@@ -3386,6 +3446,7 @@ class ObservabilityManager:
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
+    # This method logs an error that occurred during a stage, emits a "stage_error" event with the run ID, stage name, and error message, and records the timestamp of the error.
     def log_error(self, runId, stage, err):
         self.real.log_error(runId, stage, err)
         self._emit({
@@ -3394,6 +3455,7 @@ class ObservabilityManager:
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
+    # This method completes a run, emits a "run_end" event with the run ID, and records the end time of the run.
     def complete_run(self, runId):
         self.real.complete_run(runId)
         self._emit({
@@ -3401,13 +3463,14 @@ class ObservabilityManager:
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
-    # Tool hooks
+    # This method logs the start of a tool, emits a "tool_start" event with the run ID and tool name, and records the timestamp of the tool start.
     def log_tool_start(self, runId, tool):
         self._emit({
             "runId": runId, "type":"tool_start", "tool":tool,
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
+    # This method logs the end of a tool, emits a "tool_end" event with the run ID, tool name, and output, and records the timestamp of the tool end.
     def log_tool_end(self, runId, tool, output):
         self._emit({
             "runId": runId, "type":"tool_end", "tool":tool,
@@ -3415,19 +3478,19 @@ class ObservabilityManager:
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
-# -------------------------------------------------------------------
-# Expose two module-level variables for LLM introspection
-# -------------------------------------------------------------------
+# These module level variables are initialized with the loaded tools and agents from the Tools class. They provide easy access to all available tools and agents in the chat manager.
 ALL_TOOLS  = Tools.load_agent_stack().get("tools", [])
 ALL_AGENTS = Tools.load_agent_stack().get("stages", [])
 
 Tools.load_external_tools()
 
-from dataclasses import dataclass, field
-from typing import Any, Optional
-
+# This class represents the context for a single chat session, including user messages, tool summaries, and various per-turn fields. It is used to manage the state of the conversation and the tools used during the session.
 @dataclass
 class Context:
+    # Below we define the Context class, which holds the state of a chat session.
+    # This class holds the context for a chat session, including user messages, tool summaries, and various per-turn fields.
+    # It is used to manage the state of a specific chat session within the ChatManager.
+    # It includes fields for the session name, history manager, TTS manager, and workspace memory.
     name: str
     history_manager: HistoryManager
     tts_manager: TTSManager
@@ -3443,6 +3506,7 @@ class Context:
     assembled: str = ""
     final_response: Optional[str] = None
 
+    # Stages and their outputs are tracked here
     stage_counts: dict[str,int] = field(default_factory=dict)
     stage_outputs: dict[str, Any] = field(default_factory=dict)
 
@@ -3452,15 +3516,19 @@ class Context:
     ALL_TOOLS: list[str]      = field(default_factory=list)
     ALL_AGENTS: list[str]     = field(default_factory=list)
 
+    # This method allows dynamic attribute access to the context, enabling the Context to behave like a dictionary.
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
 
+    # This method allows dynamic attribute setting, enabling the Context to behave like a dictionary. It sets the attribute with the given key to the specified value.
     def __setitem__(self, key: str, value: Any) -> None:
         setattr(self, key, value)
 
+    # This method retrieves the value of an attribute by its key, returning a default value if the attribute does not exist. It allows for safe access to context fields without raising an AttributeError.
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
 
+# This class represents the context for a single run, including the run ID, user message, and various context fields. It is used to manage the state of a specific run within the chat manager.
 @dataclass
 class RunContext:
     run_id:      str
@@ -3468,7 +3536,7 @@ class RunContext:
     context_text: str = ""
     tool_choice: str = ""
 
-
+# This class manages the chat session, including context management, pipeline stages, and observability. It initializes various managers and handles the lifecycle of a chat session, including idle monitoring and context activation.
 class ChatManager:
     # ---------------------------------------------------------------- #
     #                           INITIALISATION                         #
@@ -4031,8 +4099,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ctx.stage_outputs["execute_selected_tool"] = output
         ctx.next_tool_call = None
 
-
-
     def _stage_drive_generation(self, ctx: Context) -> str:
         """
         Propose your own high-level personality drives given the user’s goal.
@@ -4229,9 +4295,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         log_message("Phase 1 complete.", "INFO")
         yield "", True
 
-    # ───────────────────────────────────────────────────────────────
-    #  Phase-2: _stream_tool  ― decide which helper to call
-    # ───────────────────────────────────────────────────────────────
     def _stream_tool(self, ctx: "RunContext | str"):
         """
         Decide **one** helper function to invoke (or NO_TOOL) *and* make the
@@ -4255,7 +4318,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             AVAILABLE_FUNCTIONS catalogue into `ctx.stage_outputs` for later
             diagnostics.
         """
-        import inspect, ast, re, textwrap
 
         # ── 0) Normalize the incoming context object ──────────────────────
         if isinstance(ctx, str):
@@ -4268,14 +4330,10 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                     self.tool_summaries = []
                     self.ctx_txt        = ""
             ctx = _Shim(getattr(self, "current_run_id", None), ctx)
-        if not hasattr(ctx, "tool_choice"):
-            ctx.tool_choice = ""
-        if not hasattr(ctx, "stage_outputs"):
-            ctx.stage_outputs = {}
-        if not hasattr(ctx, "tool_summaries"):
-            ctx.tool_summaries = []
-        if not hasattr(ctx, "ctx_txt"):
-            ctx.ctx_txt = ""
+        if not hasattr(ctx, "tool_choice"):    ctx.tool_choice    = ""
+        if not hasattr(ctx, "stage_outputs"):  ctx.stage_outputs  = {}
+        if not hasattr(ctx, "tool_summaries"): ctx.tool_summaries = []
+        if not hasattr(ctx, "ctx_txt"):        ctx.ctx_txt        = ""
 
         # ── 1) Live-reload helper registry before catalogue generation ────
         try:
@@ -4289,8 +4347,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # ── 2) Build the AVAILABLE_FUNCTIONS catalogue once per turn ─────
         tool_names, func_sigs = [], []
         for name in dir(Tools):
-            if name.startswith("_"):
-                continue
+            if name.startswith("_"): continue
             fn = getattr(Tools, name)
             if callable(fn):
                 tool_names.append(name)
@@ -4301,8 +4358,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         tools_msg = "AVAILABLE_FUNCTIONS:\n" + "\n".join(func_sigs)
         ctx.stage_outputs["tool_catalogue"] = tools_msg        # diagnostic aid
 
-        # ── 3) Hand the model *enough* context so it can reason coherently –
-        #       but keep it under ~2K characters to avoid blowing the prompt.
+        # ── 3) Hand the model recent context & tool summaries ────────────
         ctx_snip  = (ctx.ctx_txt or "").strip()[-1200:]
         tool_snip = "\n".join(ctx.tool_summaries[-3:])[-600:]
 
@@ -4338,14 +4394,13 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             override_messages=override_msgs,
             model_key="secondary_model"
         )
-        # build_payload inserts many keys; keep only the ones Client.chat accepts
         clean_payload = {
             "model":    payload["model"],
             "messages": payload["messages"],
             "stream":   payload.get("stream", False)
         }
 
-        # ── 4) Stream the LLM response to the console & observer ──────────
+        # ── 4) Stream the LLM response to console & observer ─────────────
         print("⟳ Tool: ", end="", flush=True)
         buf = ""
         with self.inference_lock:
@@ -4379,15 +4434,29 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         if raw_code and raw_code.upper() != "NO_TOOL":
             try:
                 expr = ast.parse(raw_code, mode="eval")
-                call = expr.body
                 if (not isinstance(expr, ast.Expression)
-                    or not isinstance(call, ast.Call)
-                    or not isinstance(call.func, ast.Name)
+                    or not isinstance(expr.body, ast.Call)):
+                    raise ValueError("Not a single function call")
+                call = expr.body
+                if (not isinstance(call.func, ast.Name)
                     or call.func.id not in tool_names):
-                    raise ValueError("Invalid helper name")
-                for node in list(call.args) + [kw.value for kw in call.keywords]:
-                    if not isinstance(node, ast.Constant):
-                        raise ValueError("Arguments must be literals")
+                    raise ValueError(f"Invalid helper name '{getattr(call.func,'id',None)}'")
+
+                # ─── Updated literal validation ───────────────────────────
+                # allow any literal (strings, numbers, booleans, lists, dicts, tuples, etc.)
+                for arg_node in call.args:
+                    try:
+                        ast.literal_eval(arg_node)
+                    except Exception:
+                        raise ValueError("Positional argument must be a literal expression")
+                for kw in call.keywords:
+                    if not kw.arg:
+                        raise ValueError("Keyword arguments must have names")
+                    try:
+                        ast.literal_eval(kw.value)
+                    except Exception:
+                        raise ValueError("Keyword argument values must be literal expressions")
+
                 selected_call = raw_code
                 log_message(f"Tool selected: {selected_call}", "INFO")
             except Exception as e:
@@ -4395,25 +4464,21 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         else:
             log_message("No valid tool_code detected; treating as NO_TOOL.", "INFO")
 
-        # ── 6) Register the decision on the context so the scheduler can act ─
+        # ── 6) Register and expose source for diagnostics ───────────────
         ctx.next_tool_call = selected_call   # may be None
 
-        # ── NEW: expose full helper source for the next reasoning loop ──
         if selected_call:
             fn_name = selected_call.split("(", 1)[0]
             try:
                 src = Tools.get_tool_source(fn_name)
-                ctx.ctx_txt += (
-                    f"\n[TOOL SOURCE – {fn_name}]\n"
-                    f"```python\n{src}\n```"
-                )
-                # keep a copy in stage_outputs for diagnostics
+                ctx.ctx_txt += f"\n[TOOL SOURCE – {fn_name}]\n```python\n{src}\n```"
                 ctx.stage_outputs[f"tool_source_{fn_name}"] = src
             except Exception as e:
                 log_message(f"[stream_tool] unable to fetch source for {fn_name}: {e}", "WARNING")
 
         self.observer.log_stage_end(ctx.run_id, "tool_decision")
         yield "", True
+
 
 
     def _stage_task_decomposition(self, ctx) -> list[str]:
@@ -5348,34 +5413,62 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
 
     def _tick_activity(self):                     # alias used in tight loops
         self.last_interaction = datetime.now()   
-
+    # ─── Replace your existing _idle_monitor with this ───
     def _idle_monitor(self):
         """
-        Fires only after <idle_interval> seconds of *real* silence.
-        Any token, tool call, or stage transition resets the timer via
-        self._touch_activity(), so the idle mull can never interrupt an
-        active run.
+        Runs in the background. Every `self.idle_interval` seconds of silence,
+        fires a synthetic user request that kicks off the full ChatManager pipeline
+        (context-analysis through execute_tasks, etc.).
         """
+        from datetime import datetime
         import time
+
         while not self._idle_stop.is_set():
-            time.sleep(1)                                     # light-weight poll
+            start_ts = time.time()
+            interval = self.idle_interval
+
+            # wait until it's time (printing a countdown)
+            while not self._idle_stop.is_set():
+                elapsed = time.time() - start_ts
+                remaining = interval - elapsed
+                if remaining <= 0:
+                    break
+                mins, secs = divmod(int(remaining), 60)
+                print(f"[Idle Monitor] Next idle check in {mins}m {secs}s…", flush=True)
+                time.sleep(min(remaining, 10))
+
+            if self._idle_stop.is_set():
+                break
+
             idle_secs = (datetime.now() - self.last_interaction).total_seconds()
-            if idle_secs < self.idle_interval:
-                continue                                      # still “busy”
-            # ---- idle window reached ------------------------------------------------
-            ctx  = self.current_ctx
-            recent = (ctx.ctx_txt or "").replace("\n", " ")
-            snip   = (recent[-200:] + "...") if len(recent) > 200 else recent
-            prompt = (
-                f"I've been idle for {int(idle_secs)} seconds. "
-                f"Recent context: {snip} "
-                "What would you like me to work on next?"
-            )
-            log_message(f"[Idle Monitor] Triggered after {int(idle_secs)} s", "INFO")
-            # Reset BEFORE launching the mull so cascaded failures can't recurse
-            self._touch_activity()
-            # Internal, silent request (no TTS)
-            self.new_request(prompt, sender_role="assistant", skip_tts=True)
+            if idle_secs >= interval:
+                # Build a real “user” prompt from recent context
+                ctx = self.current_ctx
+                recent = (ctx.ctx_txt or "").replace("\n", " ")
+                snip   = recent[-200:] + "…" if len(recent) > 200 else recent
+                prompt = (
+                    f"I've been idle for {int(idle_secs)} seconds. "
+                    f"Recent context: {snip} "
+                    "What would you like me to do next?"
+                )
+
+                log_message(f"No user input for {int(idle_secs)}s — auto-triggering pipeline", "INFO")
+                print(f"[Idle Monitor] Idle detected ({int(idle_secs)}s) — invoking new_request", flush=True)
+
+                # *** DROP-IN FIX: send this as a USER message, not ASSISTANT ***
+                # so that the pipeline runs exactly as if the user spoke.
+                self.new_request(
+                    prompt,
+                    sender_role="user",
+                    skip_tts=True
+                )
+
+            else:
+                log_message("Idle monitor: activity detected—resetting countdown", "DEBUG")
+                print(f"[Idle Monitor] Activity detected ({int(idle_secs)}s idle) — countdown reset", flush=True)
+
+        log_message("Idle monitor thread exiting.", "DEBUG")
+
 
 
     def _start_idle_mull(self):
@@ -6592,13 +6685,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         _ = Utils.embed_text(um)
         return None
 
-    # ------------------------------------------------------------------
-    # Replace (again) the whole _stage_context_analysis implementation
-    # ------------------------------------------------------------------
+    # ─── Replacement ───
     def _stage_context_analysis(self, ctx: Context,
                                 prev_output: str | None = None) -> str:
         """
-        Strict 2-sentence meta-analysis of the user turn.
+        Strict 2-sentence meta-analysis of the user turn, with recent chat history.
         Never answers the question; if it tries, we retry once,
         then blank out to protect downstream stages.
         """
@@ -6609,7 +6700,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             if "http" in txt.lower():                   return True
             if re.search(r"\b°F\b|\b°C\b", txt):        return True
             if re.search(r"\bwind\b|\brain\b", txt):    return True
-            if re.search(r"\d{4}-\d{2}-\d{2}", txt):    return True
+            if re.search(r"\d{4}-\d{2}-\d{2}", txt):     return True
             return False
 
         SYS_PROMPT = textwrap.dedent("""
@@ -6628,28 +6719,35 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         """).strip()
 
         def _query_model(msgs):
-            """Utility that calls chat() with only the allowed keys."""
             return chat(
                 model=payload["model"],
                 messages=msgs,
                 stream=False
             )["message"]["content"].strip()
 
-        # ---------- build base payload (using your helper) ---------------
+        # ——— Gather last 5 turns for context ———
+        history = ctx.history_manager.history[-5:]
+        hist_msgs = [
+            {"role": m["role"], "content": m["content"]}
+            for m in history
+        ]
+
+        # ——— Build override messages with system, history, then new user_msg ———
+        override = [{"role": "system", "content": SYS_PROMPT}]
+        override += hist_msgs
+        override.append({"role": "user", "content": ctx.user_message})
+
+        # ——— Build payload ———
         payload = self.build_payload(
-            override_messages=[
-                {"role": "system", "content": SYS_PROMPT},
-                {"role": "user",   "content": ctx.user_message}
-            ],
+            override_messages=override,
             model_key="secondary_model"
         )
-        # We *do not* pass temperature / stream in; only model+messages
-        payload["stream"] = False    # deterministic single shot
+        payload["stream"] = False
 
-        # ---------- first attempt ----------------------------------------
+        # ——— First attempt ———
         raw = _query_model(payload["messages"])
 
-        # ---------- sanity check -----------------------------------------
+        # ——— Sanity check ———
         if _looks_like_answer(raw):
             log_message("[context_analysis] answer leak detected – retrying with harsher prompt", "WARNING")
 
@@ -6665,10 +6763,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 log_message("[context_analysis] second leak – blanking analysis", "ERROR")
                 raw = "NOTE: context analysis unavailable due to repeated policy violation."
 
-        # ---------- record & return --------------------------------------
+        # ——— Record & return ———
         ctx.ctx_txt += raw + "\n"
         log_message(f"Context analysis (clean): {raw!r}", "DEBUG")
         return raw
+
 
 
     # ------------------------------------------------------------------ #
@@ -6783,9 +6882,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         return ""
 
 
-    # ------------------------------------------------------------------ #
-    #  Stage : planning_summary  (re-worked bottom half)                 #
-    # ------------------------------------------------------------------ #
+    # ─── Replacement ───
     def _stage_planning_summary(self, ctx) -> str:
         """
         • Streams the tool-decision.
@@ -6798,16 +6895,25 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # 1) Stream the tool decision and collect only string tokens
         gathered = []
         for chunk, done in self._stream_tool(ctx):
+            # extract the raw token (may be str, dict, etc.)
             if isinstance(chunk, str):
                 token = chunk
             elif isinstance(chunk, dict):
-                token = chunk.get("message", {}).get("content", "") or chunk.get("content", "")
+                token = (
+                    chunk.get("message", {}).get("content", "")
+                    or chunk.get("content", "")
+                    or ""
+                )
             else:
-                token = str(chunk)
-            gathered.append(token)
+                token = chunk
+
+            # **Ensure it's always a str before appending**
+            token_str = str(token)
+            gathered.append(token_str)
             if done:
                 break
 
+        # 2) Join safely now that everything is a string
         raw = re.sub(
             r"^```tool_code\s*|\s*```$",
             "",
@@ -6817,7 +6923,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         call = Tools.parse_tool_call(raw)
         ctx.next_tool_call = call
 
-        # 2) Decide if the tool exists already
+        # 3) Decide if the tool exists already
         known_tools = {
             n for n, f in inspect.getmembers(Tools, inspect.isfunction)
             if not n.startswith("_")
@@ -6828,7 +6934,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         else:
             ctx.needs_tool_work = False
 
-        # 3) Friendly sentence for the user (optional)
+        # 4) Friendly sentence for the user (optional)
         plan_msg = ""
         if call:
             response = chat(
@@ -6858,7 +6964,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ctx.ctx_txt += f"\n[Planning summary] {plan_msg or '(no tool)'}"
         ctx.stage_outputs["planning_summary"] = plan_msg
 
-        # 4) Force next stages if they’re not already queued
+        # 5) Force next stages if they’re not already queued
         ctx._forced_next = [
             "define_criteria",
             "task_decomposition",
@@ -6866,6 +6972,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ]
 
         return plan_msg
+
 
 
 
@@ -7051,8 +7158,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
     # Stage: final_inference
     # ------------------------------
     def _stage_final_inference(self, ctx: Context):
-        import json
-        from datetime import datetime
+
 
         # 1) run the actual LLM call
         raw = self.run_inference(ctx.assembled, ctx.skip_tts)
@@ -7172,6 +7278,9 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # this is our final return value
         return ctx["final_response"]
 
+# This is the main loop for the voice-to-LLM processing.
+# It captures audio, processes it, and sends it to the LLM for a response.
+# It also handles text input override mode.
 def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
 
     log_message("Voice-to-LLM loop started. Waiting for speech...", "INFO")
@@ -7256,7 +7365,8 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
         # 8) No extra enqueue: new_request has already enqueued the final response
         log_message("Ready for next voice input...", "INFO")
 
-# ----- New: Text Input Override Loop -----
+# This is the main loop for text input override mode.
+# It allows users to type messages directly into the console,
 def text_input_loop(chat_manager: ChatManager):
     log_message("Text input override mode is active.", "INFO")
     print("\nText override mode is active. Type your message and press Enter to send it to the LLM.")
@@ -7276,7 +7386,9 @@ def text_input_loop(chat_manager: ChatManager):
             session_log.flush()
         except Exception as e:
             log_message("Error in text input loop: " + str(e), "ERROR")
-# ----- Main Function -----
+
+# This is the main entry point for the application.
+# It initializes the Flask app, starts the file watcher, and launches the main processing threads.
 def main():
     # file watcher to restart on code or config.json changes
     def _monitor_files(interval=1):
@@ -7397,13 +7509,10 @@ def main():
     print("Chat session saved in folder:", session_folder)
     print("System terminated.")
 
-
-# ─── START OBSERVABILITY DASHBOARD & SSE SERVER ───────────────────────
-
 app = Flask(__name__)
 CORS(app)
 
-# 1) SSE endpoint
+# Here we define the Flask routes for the web interface and SSE streaming.
 @app.route("/stream")
 def stream():
     def event_stream():
@@ -7418,7 +7527,7 @@ def stream():
                 time.sleep(0.1)
     return Response(event_stream(), mimetype="text/event-stream")
 
-# 2) Tweak endpoint (optional)
+# Additionally here we define the API endpoints for various actions.
 @app.route("/api/tweak", methods=["POST"])
 def tweak():
     p = request.json or {}
@@ -7433,232 +7542,414 @@ def tweak():
         })
     return {"status": "ok"}
 
-# 3) In-browser dashboard
-INDEX_HTML = """<!doctype html>
+# This is all of the HTML content for the web interface.
+INDEX_HTML = """
+<!-- Updated index.html with Highlight.js and revised rendering logic -->
+<!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
+  <meta charset="utf-8"/>
   <title>Observable Agent Dashboard</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Doto:wght@100..900&family=Overpass+Mono:wght@300..700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=WDXL+Lubrifont+TC&display=swap');
+
     :root {
       --bg: #99aabb;
-      --fg: rgba(255,255,255,0.8);
-      --border: #333;
+      --fg: #000a;
+      --border: #555;
+      --border-light: #5555;
       --panel-bg: rgba(255,255,255,0.05);
     }
     * { box-sizing: border-box; }
     body {
-      margin:0; padding:0;
+      margin: 0; padding: 0;
       background: var(--bg);
       color: var(--fg);
-      font-family: 'Doto', sans-serif;
+      font-family: "WDXL Lubrifont TC", sans-serif;
     }
+    details{
+
+    backdrop-filter: blur(10px);
+    border-right:1px solid var(--border-light)
+    border-tpop:1px solid var(--border-light)
+    border-bottom:1px solid var(--border-light)}
+    details:hover{
+        box-shadow: 0px 0px 2px 0px;
+        }
+    /* Header */
+    header {
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      height: 50px;
+      background: var(--panel-bg);
+      border-bottom: 1px solid var(--border);
+    }
+    code{
+    text-wrap: auto;
+    border-radius:1rem;
+    }
+    .header-left { display: flex; gap: 8px; }
+    .btn {
+      padding: 6px 12px;
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      cursor: pointer;
+      font: inherit;
+      color: inherit;
+    }
+    /* Modal */
+    .modal {
+      position: fixed; top: 0; left: 0;
+      width: 100%; height: 100%;
+      background: rgba(0,0,0,0.5);
+      z-index: 1;
+      display: flex; justify-content: center; align-items: center;
+    }
+    .modal.hidden { display: none; }
+    .modal-content {
+      background: #fff;
+      padding: 20px;
+      border-radius: 6px;
+      max-width: 90%;
+      max-height: 90%;
+      overflow: auto;
+      color: #000;
+    }
+    /* Grid */
     #grid {
       display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      height: 100vh;
+      grid-template-columns: 1fr 1fr 1fr 1fr;
+      height: calc(100vh - 50px);
+    }
+    .col::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    box-shadow: inset 0 0 0.5rem 2rem var(--bg);
+    pointer-events: none;
+    background-size: 2rem 2rem;
+    background-image: linear-gradient(to right, var(--border-light) 1px, transparent 1px), linear-gradient(to bottom, var(--border-light) 1px, transparent 1px);
+    opacity: 0.5;
+    z-index: -1;
+    clip-path: inset(0);
     }
     .col {
+    position: relative;
       overflow-y: auto;
       padding: 8px;
       scrollbar-width: none !important;
       border-right: 1px solid var(--border);
     }
     .col:last-child { border-right: none; }
+    /* Panels */
     details {
       background: var(--panel-bg);
       margin: 6px 0;
       padding: 6px;
       border-radius: 4px;
     }
+    pre code{
+    border:unset!important;
+    }
     summary {
       cursor: pointer;
-      font-family: 'Overpass Mono', monospace;
       font-weight: 500;
       font-size: 0.95em;
     }
-    .loading {
-      font-style: italic;
-      opacity: 0.6;
+    /* Tools & registry */
+    .tool {
+      box-sizing: border-box;
+      margin-bottom: 8px;
     }
-    /* draggable registry items */
     .registry .stage-item {
       background: var(--panel-bg);
-      margin:4px 0;
-      padding:4px;
-      border:1px solid var(--border);
-      border-radius:4px;
+      margin: 4px 0;
+      padding: 4px;
+      border: 1px dashed var(--border-light);
+      border-radius: 4px;
       cursor: grab;
       user-select: none;
+    backdrop-filter: blur(10px);
     }
     .registry .drag-over {
       box-shadow: inset 0 0 8px gold;
     }
   </style>
+
+  <!-- Highlight.js -->
+  <link rel="stylesheet" href="https://jmblog.github.io/color-themes-for-highlightjs/css/themes/tomorrow-night-blue.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/go.min.js"></script>
+  <script>hljs.highlightAll();</script>
 </head>
 <body>
-  <div id="grid">
-    <section id="col-stages" class="col"></section>
-    <section id="col-tools"  class="col"></section>
-    <section id="col-registry" class="col registry"></section>
+  <header>
+    <div class="header-left">
+      <button id="config-btn" class="btn">Config</button>
+      <button id="theme-btn" class="btn">Light/Dark</button>
+    </div>
+  </header>
+
+  <!-- Config Modal -->
+  <div id="config-modal" class="modal hidden">
+    <div class="modal-content">
+      <h2>Config</h2>
+      <textarea id="config-editor" style="width:100%; height:300px;"></textarea>
+      <div style="margin-top:12px; text-align:right;">
+        <button id="config-save" class="btn">Save</button>
+        <button id="config-close" class="btn">Close</button>
+      </div>
+    </div>
   </div>
+
+  <div id="grid">
+    <section id="col-stages"      class="col"></section>
+    <section id="col-tools-list"  class="col"></section>
+    <section id="col-tools"       class="col"></section>
+    <section id="col-registry"    class="col registry"></section>
+  </div>
+
   <script>
-    // utility: hash a string to an HSL color
+    // --- THEME TOGGLE ---
+    const root = document.documentElement;
+    const themeBtn = document.getElementById('theme-btn');
+    const vars = ['--bg','--fg','--border','--panel-bg'];
+    let original = {}, isDark = true;
+    vars.forEach(v => original[v] = getComputedStyle(root).getPropertyValue(v).trim());
+
+    function toggleTheme() {
+    if (isDark) {
+        // Dark mode: all backgrounds black, text & borders off-white
+        root.style.setProperty('--bg', '#000');
+        root.style.setProperty('--panel-bg', '#000');
+        root.style.setProperty('--fg', '#aaaaaaaa');
+        root.style.setProperty('--border', '#aaaaaaaa');
+    } else {
+        // Restore original light values
+        vars.forEach(v => {
+        root.style.setProperty(v, original[v]);
+        });
+    }
+    isDark = !isDark;
+    }
+    themeBtn.addEventListener('click', toggleTheme);
+
+    // --- CONFIG MODAL ---
+    const configBtn   = document.getElementById('config-btn');
+    const modal       = document.getElementById('config-modal');
+    const editor      = document.getElementById('config-editor');
+    const saveBtn     = document.getElementById('config-save');
+    const closeBtn    = document.getElementById('config-close');
+
+    configBtn.addEventListener('click', () => {
+      fetch('/config.json')
+        .then(r => r.text())
+        .then(txt => {
+          editor.value = txt;
+          modal.classList.remove('hidden');
+        });
+    });
+    closeBtn.addEventListener('click', () => modal.classList.add('hidden'));
+    saveBtn .addEventListener('click', () => {
+      try {
+        const data = JSON.parse(editor.value);
+        fetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data)
+        }).then(r => {
+          if (r.ok) modal.classList.add('hidden');
+          else alert('Save failed');
+        });
+      } catch {
+        alert('Invalid JSON');
+      }
+    });
+
+    // --- UTILITY: colorFor() ---
     function colorFor(name) {
-      let hash=0; for(let c of name) hash=(hash<<5)-hash+c.charCodeAt(0)|0;
-      let h = ((hash%360)+360)%360;
-      return `hsl(${h}, 60%, 50%)`;
+      let hash = 0;
+      for (let c of name) hash = (hash << 5) - hash + c.charCodeAt(0) | 0;
+      let h = ((hash % 360) + 360) % 360;
+      return `hsl(${h}, 20%, 20%)`;
     }
 
-    // 1) Registry: fetch & render stages as draggable list
-    const reg = document.getElementById("col-registry");
-    fetch("/api/stages")
+    // --- REGISTRY DRAG & DROP ---
+    const reg = document.getElementById('col-registry');
+    fetch('/api/stages')
       .then(r=>r.json())
       .then(({stages})=>{
         stages.forEach((s,i)=>{
-          let d=document.createElement("div");
-          d.textContent=s;
-          d.id="reg-"+i;
-          d.draggable=true;
-          d.className="stage-item";
-          d.style.color=colorFor(s);
-          d.dataset.stage=s;
+          let d = document.createElement('div');
+          d.textContent = s;
+          d.draggable   = true;
+          d.className   = 'stage-item';
+          d.style.color = colorFor(s);
+          d.dataset.stage = s;
           reg.appendChild(d);
         });
       });
 
-    // drag & drop handlers
-    let dragSrc=null;
-    reg.addEventListener("dragstart", e=>{
-      dragSrc=e.target;
-      e.dataTransfer.setData("text/plain","");
-      e.target.style.opacity=0.5;
+    let dragSrc = null;
+    reg.addEventListener('dragstart', e => {
+      dragSrc = e.target;
+      e.dataTransfer.setData('text/plain','');
+      e.target.style.opacity = 0.5;
     });
-    reg.addEventListener("dragover", e=>{
+    reg.addEventListener('dragover', e => {
       e.preventDefault();
-      let over=e.target.closest(".stage-item");
-      reg.querySelectorAll(".stage-item").forEach(el=>el.classList.remove("drag-over"));
-      if(over) over.classList.add("drag-over");
+      let over = e.target.closest('.stage-item');
+      reg.querySelectorAll('.stage-item').forEach(el=>el.classList.remove('drag-over'));
+      if (over) over.classList.add('drag-over');
     });
-    reg.addEventListener("dragleave", e=>{
-      e.target.closest(".stage-item")?.classList.remove("drag-over");
+    reg.addEventListener('dragleave', e => {
+      e.target.closest('.stage-item')?.classList.remove('drag-over');
     });
-    reg.addEventListener("drop", e=>{
+    reg.addEventListener('drop', e => {
       e.preventDefault();
-      let over=e.target.closest(".stage-item");
-      if(over && dragSrc && dragSrc!==over) {
+      let over = e.target.closest('.stage-item');
+      if (over && dragSrc && dragSrc!==over) {
         reg.insertBefore(dragSrc, over.nextSibling);
         updateOrder();
       }
-      reg.querySelectorAll(".stage-item").forEach(el=>el.classList.remove("drag-over"));
+      reg.querySelectorAll('.stage-item').forEach(el=>el.classList.remove('drag-over'));
     });
-    reg.addEventListener("dragend", e=>{
-      e.target.style.opacity=1;
-    });
-    function updateOrder(){
-      let newStages = Array.from(reg.children).map(d=>d.dataset.stage);
-      fetch("/api/stages", {
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({stages:newStages})
+    reg.addEventListener('dragend', e => e.target.style.opacity = 1);
+
+    function updateOrder() {
+      const newStages = Array.from(reg.children).map(d => d.dataset.stage);
+      fetch('/api/stages', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ stages: newStages })
       });
     }
 
-    // cache references
-    const colStages = document.getElementById("col-stages");
-    const colTools  = document.getElementById("col-tools");
-
-    // 2) SSE → handle events
-    const es = new EventSource("/stream");
-    es.onmessage = e=>{
-      let ev = JSON.parse(e.data);
+    // --- SSE & HIGHLIGHT.JS INTEGRATION ---
+    const colStages = document.getElementById('col-stages');
+    const colTools  = document.getElementById('col-tools');
+    const es = new EventSource('/stream');
+    es.onmessage = e => {
+      const ev = JSON.parse(e.data);
       handleEvent(ev);
-      // persist
-      let saved = JSON.parse(localStorage.getItem("obs_events")||"[]");
+      const saved = JSON.parse(localStorage.getItem('obs_events')||'[]');
       saved.push(e.data);
-      if(saved.length>500) saved.shift();
-      localStorage.setItem("obs_events", JSON.stringify(saved));
+      if (saved.length>500) saved.shift();
+      localStorage.setItem('obs_events', JSON.stringify(saved));
     };
-    // replay on load
-    JSON.parse(localStorage.getItem("obs_events")||"[]")
-      .forEach(d=>handleEvent(JSON.parse(d)));
+    JSON.parse(localStorage.getItem('obs_events')||'[]')
+      .forEach(d => handleEvent(JSON.parse(d)));
 
-    function handleEvent(e){
-      // STAGE START
-      if(e.type==="stage_start"){
-        let details = document.createElement("details");
-        details.id = `stage-${e.runId}-${e.stage}`;
-        details.style.borderLeft = `4px solid ${colorFor(e.stage)}`;
-        let sum = document.createElement("summary");
-        sum.textContent = `[${e.runId}] ▶ ${e.stage}`;
-        details.appendChild(sum);
-        let content = document.createElement("div");
-        content.className = "stage-content";
-        details.appendChild(content);
-        colStages.appendChild(details);
+    function handleEvent(e) {
+      // STAGE START → create a <pre><code class="language-markdown">…
+      if (e.type === 'stage_start') {
+        const d = document.createElement('details');
+        d.id = `stage-${e.runId}-${e.stage}`;
+        d.style.borderLeft = `4px solid ${colorFor(e.stage)}`;
+        const s = document.createElement('summary');
+        s.textContent = `[${e.runId}] ▶ ${e.stage}`;
+        d.appendChild(s);
+
+        const pre = document.createElement('pre');
+        const code = document.createElement('code');
+        code.className = 'language-markdown';
+        pre.appendChild(code);
+        d.appendChild(pre);
+
+        colStages.appendChild(d);
         colStages.scrollTop = colStages.scrollHeight;
+        hljs.highlightElement(code);
       }
-      // STAGE STREAM (token)
-      if(e.type==="stage_stream"){
-        let container = document.querySelector(`#stage-${e.runId}-${e.stage} .stage-content`);
-        if(container){
-          let span = document.createElement("span");
-          span.textContent = e.token;
-          container.appendChild(span);
-          // ensure loading indicator
-          if(!container.querySelector(".loading")){
-            let load = document.createElement("div");
-            load.className = "loading";
-            load.textContent = "⏳";
-            container.appendChild(load);
-          }
-          container.parentElement.open = true;
-          container.scrollTop = container.scrollHeight;
+
+      // STAGE STREAM → append tokens side-by-side in the same <code>
+      if (e.type === 'stage_stream') {
+        const code = document.querySelector(`#stage-${e.runId}-${e.stage} code`);
+        if (code) {
+          code.textContent += e.token;
+          hljs.highlightElement(code);
+          const details = code.closest('details');
+          if (details) details.open = true;
+          colStages.scrollTop = colStages.scrollHeight;
         }
       }
-      // STAGE END
-      if(e.type==="stage_end"){
-        let details = document.getElementById(`stage-${e.runId}-${e.stage}`);
-        if(details){
-          details.querySelectorAll(".loading").forEach(n=>n.remove());
-          let done = document.createElement("div");
+
+      // STAGE END → mark done
+      if (e.type === 'stage_end') {
+        const code = document.querySelector(`#stage-${e.runId}-${e.stage} code`);
+        if (code) {
+          const done = document.createElement('div');
           done.style.opacity = 0.6;
-          done.textContent = "✅ done";
-          details.querySelector(".stage-content").appendChild(done);
+          done.textContent = '✅ done';
+          code.closest('details').appendChild(done);
         }
       }
-      // TOOL events
-      if(e.type==="tool_start"||e.type==="tool_end"){
-        let div = document.createElement("div");
-        div.className="tool";
-        if(e.type==="tool_start"){
-          div.textContent = `[${e.runId}] 🔄 ${e.tool}`;
-        } else {
-          div.textContent = `[${e.runId}] ✅ ${e.tool} ⇒ ${e.output}`;
-        }
+
+      // TOOL EVENTS → wrap each call/output in python code block
+      if (e.type === 'tool_start' || e.type === 'tool_end') {
+        const div = document.createElement('div');
+        div.className = 'tool';
+
+        const pre = document.createElement('pre');
+        const codeEl = document.createElement('code');
+        codeEl.className = 'language-python';
+        const text = e.type === 'tool_start'
+          ? `[${e.runId}] 🔄 ${e.tool}`
+          : `[${e.runId}] ✅ ${e.tool} ⇒ ${e.output}`;
+        codeEl.textContent = text;
+        pre.appendChild(codeEl);
+        div.appendChild(pre);
+
         colTools.appendChild(div);
+        hljs.highlightElement(codeEl);
         colTools.scrollTop = colTools.scrollHeight;
       }
     }
+
+    // --- DYNAMIC TOOLS LIST with Highlight.js ---
+    const toolsList = document.getElementById('col-tools-list');
+    fetch('/agent_stack.json')
+      .then(r => r.json())
+      .then(({tools}) => {
+        tools.forEach(tool => {
+          const d = document.createElement('details');
+          const s = document.createElement('summary');
+          s.textContent = tool.name;
+          d.appendChild(s);
+
+          const pre = document.createElement('pre');
+          const code = document.createElement('code');
+          code.className = 'language-python';
+          code.textContent = tool.source;
+          pre.appendChild(code);
+          d.appendChild(pre);
+
+          toolsList.appendChild(d);
+          hljs.highlightElement(code);
+        });
+      });
   </script>
 </body>
-</html>"""
+</html>
+"""
 
-# ─── DASHBOARD ENDPOINTS & FLASK LAUNCH ────────────────────────────────
-
+# Here we define the Flask routes for the web interface and API endpoints.
 @app.route("/")
 def index():
     tools = Tools.load_agent_stack().get("tools", [])
     return render_template_string(INDEX_HTML, tools=tools)
 
-# GET current pipeline stages
+# Here we define the API endpoint to update the configuration.
 @app.route("/api/stages", methods=["GET"])
 def get_stages():
     stages = Tools.load_agent_stack().get("stages", [])
     return jsonify({"stages": stages})
 
-# POST a new ordering → update agent_stack.json
+# In the following route, we handle the update of stages via a POST request.
 @app.route("/api/stages", methods=["POST"])
 def update_stages():
     data = request.get_json() or {}
@@ -7672,6 +7963,7 @@ def update_stages():
     except Exception as e:
         return {"status": "error", "error": str(e)}, 500
 
+# Finally we launch the Flask server in a separate thread in order to serve the web interface and handle SSE streaming, and restart gracefully on code changes.
 def _run_flask():
     """
     Launch Flask via a manually created server.  Mark its socket
@@ -7702,13 +7994,14 @@ def _run_flask():
             else:
                 raise
 
-# Only start Flask once per process (even across execv reloads)
+# Here we check if the Flask thread has already been started.
 if not globals().get("_flask_thread_started"):
     globals()["_flask_thread_started"] = True
     flask_thread = threading.Thread(target=_run_flask, daemon=True)
     flask_thread.start()
     print("🚀 Observable dashboard: http://localhost:5000")
 
+# Last but not least, we define the main entry point for the application.
 if __name__ == "__main__":
     main()
 
