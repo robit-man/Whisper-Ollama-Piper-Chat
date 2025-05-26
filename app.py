@@ -2895,52 +2895,74 @@ class Tools:
             log_message(f"Image file not found: {full_path}", "ERROR")
             return f"Error: Image file not found: {full_path}"
     
-    # This static method retrieves the first wireless interface using the pywifi library. It checks for available interfaces and raises an error if none are found. This is a helper method used by other methods to ensure they operate on a valid wireless interface.
     @staticmethod
-    def _get_iface():
-        """Helper to get the first wireless interface."""
-        wifi = PyWiFi()
-        ifaces = wifi.interfaces()
-        if not ifaces:
-            raise RuntimeError("No wireless interface found")
-        return ifaces[0]
-
-    # This static method lists available Wi-Fi networks using the pywifi library. It scans for networks, waits for the scan to complete, and returns a list of dictionaries containing network details such as SSID, BSSID, signal strength, authentication algorithm, AKM types, and cipher type.
-    @staticmethod
-    def list_networks() -> List[dict[str, object]]:
+    def set_sudo_password() -> str:
         """
-        Scan for available Wi-Fi networks using pywifi.
+        Prompt for the sudo password and save it in a .env file as SUDO_PASS.
+        """
+        from getpass import getpass
+        import os
+
+        pwd = getpass("Enter your sudo password: ")
+        env_path = os.path.join(os.getcwd(), ".env")
+        # Remove any existing entry
+        lines = []
+        if os.path.isfile(env_path):
+            with open(env_path, "r") as f:
+                lines = [l for l in f.readlines() if not l.startswith("SUDO_PASS=")]
+        lines.append(f"SUDO_PASS={pwd}\n")
+        with open(env_path, "w") as f:
+            f.writelines(lines)
+        return "Sudo password saved to .env"
+
+    @staticmethod
+    def _get_sudo_pass() -> str | None:
+        """
+        Read the SUDO_PASS entry from .env in the current working directory.
+        """
+        import os
+        env_path = os.path.join(os.getcwd(), ".env")
+        if not os.path.isfile(env_path):
+            return None
+        with open(env_path, "r") as f:
+            for line in f:
+                if line.startswith("SUDO_PASS="):
+                    return line.split("=", 1)[1].strip()
+        return None
+
+    @staticmethod
+    def list_networks() -> list[dict[str, object]]:
+        """
+        List available Wi-Fi networks via sudo nmcli.
 
         Returns:
-            A list of dicts, each containing:
-            - 'ssid'  : network name (str)
-            - 'bssid' : MAC address of AP (str)
-            - 'signal': signal strength in dBm (int)
-            - 'auth'  : authentication algorithm (const.AUTH_ALG_*)
-            - 'akm'   : list of AKM types (const.AKM_TYPE_*)
-            - 'cipher': cipher type (const.CIPHER_TYPE_*)
+            A list of dicts with keys 'ssid', 'signal', 'security'.
         """
-        iface = _get_iface()
-        iface.scan()
-        time.sleep(2)  # allow scan to complete
-        results = iface.scan_results()
+        import subprocess
+        sudo_pass = Tools._get_sudo_pass()
+        cmd = ["sudo", "-S", "nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "device", "wifi", "list"]
+        proc = subprocess.run(
+            cmd,
+            input=(sudo_pass + "\n") if sudo_pass else None,
+            capture_output=True,
+            text=True
+        )
         nets = []
-        for net in results:
-            nets.append({
-                'ssid': net.ssid,
-                'bssid': net.bssid,
-                'signal': net.signal,
-                'auth': net.auth,
-                'akm': net.akm,
-                'cipher': net.cipher
-            })
+        for line in proc.stdout.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 3 and parts[0]:
+                ssid, sig, sec = parts[0], parts[1], parts[2]
+                try:
+                    signal = int(sig)
+                except ValueError:
+                    signal = 0
+                nets.append({"ssid": ssid, "signal": signal, "security": sec})
         return nets
 
-    # This static method connects to a Wi-Fi network by SSID and optional password. It uses the pywifi library to manage the connection, builds a profile for the network, and attempts to connect. It waits for a specified timeout period to confirm the connection status.
     @staticmethod
-    def connect_network(ssid: str, password: Optional[str] = None, timeout: int = 20) -> bool:
+    def connect_network(ssid: str, password: str | None = None, timeout: int = 20) -> bool:
         """
-        Connect to a Wi-Fi network by SSID.
+        Connect to a Wi-Fi network via sudo nmcli.
 
         Args:
             ssid:     The network SSID.
@@ -2948,88 +2970,77 @@ class Tools:
             timeout:  Seconds to wait for connection.
 
         Returns:
-            True if connected successfully, False on timeout or failure.
+            True if connected successfully, False otherwise.
         """
-        iface = _get_iface()
-        iface.disconnect()
-        time.sleep(1)
-
-        # Build profile
-        profile = Profile()
-        profile.ssid = ssid
-        profile.auth = const.AUTH_ALG_OPEN
+        import subprocess, time
+        sudo_pass = Tools._get_sudo_pass()
+        cmd = ["sudo", "-S", "nmcli", "device", "wifi", "connect", ssid]
         if password:
-            profile.akm.append(const.AKM_TYPE_WPA2PSK)
-            profile.cipher = const.CIPHER_TYPE_CCMP
-            profile.key = password
-        else:
-            profile.akm.append(const.AKM_TYPE_NONE)
+            cmd += ["password", password]
+        proc = subprocess.run(
+            cmd,
+            input=(sudo_pass + "\n") if sudo_pass else None,
+            capture_output=True,
+            text=True
+        )
+        if proc.returncode != 0:
+            return False
 
-        tmp_profile = iface.add_network_profile(profile)
-        iface.connect(tmp_profile)
-
+        # Wait until connected
         start = time.time()
         while time.time() - start < timeout:
-            if iface.status() == const.IFACE_CONNECTED:
-                return True
+            status = subprocess.run(
+                ["sudo", "-S", "nmcli", "-t", "-f", "DEVICE,STATE", "device"],
+                input=(sudo_pass + "\n") if sudo_pass else None,
+                capture_output=True,
+                text=True
+            )
+            for line in status.stdout.splitlines():
+                dev, state = line.split(":", 1)
+                if state == "connected":
+                    return True
             time.sleep(1)
         return False
 
-    # This static method checks Internet connectivity by pinging a specified host (default is Google's public DNS server). It runs the ping command and returns True if at least one ping succeeds, otherwise returns False.
     @staticmethod
-    def check_connectivity(host: str = '8.8.8.8', count: int = 1) -> bool:
+    def check_connectivity(host: str = "8.8.8.8", count: int = 1) -> bool:
         """
         Test Internet connectivity by pinging a host.
-
-        Args:
-            host:  IP or domain to ping (default: Google DNS).
-            count: Number of ICMP echo requests.
-
-        Returns:
-            True if at least one ping succeeds, False otherwise.
         """
+        import subprocess
         proc = subprocess.run(
-            ['ping', '-c', str(count), host],
+            ["ping", "-c", str(count), host],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
         return proc.returncode == 0
 
-    # This static method retrieves the signal strength of the current or specified Wi-Fi network. It uses the pywifi library to scan for networks and returns the signal strength in dBm. If the specified SSID is not found or not connected, it returns -1.
     @staticmethod
-    def get_signal_strength(ssid: Optional[str] = None) -> int:
+    def get_signal_strength(ssid: str | None = None) -> int:
         """
-        Get signal strength (dBm) of the current or specified SSID.
-
-        Args:
-            ssid: If provided, measure that network; otherwise detect current SSID
-                via nmcli first.
-
-        Returns:
-            Signal strength in dBm, or -1 if not found/connected.
+        Get the signal strength (%) of the specified or active SSID.
         """
+        import subprocess
         target = ssid
         if not target:
-            # Fallback to nmcli to find the active SSID
             try:
                 out = subprocess.check_output(
-                    ['nmcli', '-t', '-f', 'ACTIVE,SSID', 'device', 'wifi', 'list'],
+                    ["nmcli", "-t", "-f", "ACTIVE,SSID", "device", "wifi", "list"],
                     text=True
                 )
                 for line in out.splitlines():
-                    active, name = line.split(':', 1)
-                    if active == 'yes':
+                    active, name = line.split(":", 1)
+                    if active == "yes":
                         target = name
                         break
             except Exception:
                 return -1
-
         if not target:
             return -1
 
-        for net in list_networks():
-            if net['ssid'] == target:
-                return net['signal']
+        for net in Tools.list_networks():
+            if net["ssid"] == target:
+                return net["signal"]
         return -1
 
     # This static method retrieves the battery voltage from a file named "voltage.txt" located in the user's home directory. It reads the voltage value, logs the action, and returns the voltage as a float. If an error occurs while reading the file, it logs the error and raises a RuntimeError.
@@ -7640,6 +7651,41 @@ def main():
 app = Flask(__name__)
 CORS(app)
 
+
+@app.route("/api/message", methods=["POST"])
+def send_message():
+    p = request.get_json() or {}
+    user_text = p.get("text", "").strip()
+    if not user_text:
+        return {"status": "empty"}, 400
+
+    # Log and persist
+    log_message(f"Text override mode: Received text: {user_text}", "INFO")
+    session_log.write(json.dumps({
+        "role": "user",
+        "content": user_text,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }) + "\n")
+    session_log.flush()
+    flush_current_tts()
+
+    # Invoke the chat manager
+    cm = globals().get("chat_manager")
+    if not cm:
+        return {"status": "error", "error": "no chat manager"}, 500
+
+    response = cm.new_request(user_text)
+    log_message("Text override mode: LLM response received.", "INFO")
+    session_log.write(json.dumps({
+        "role": "assistant",
+        "content": response,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }) + "\n")
+    session_log.flush()
+
+    # Return immediately; SSE stream will carry any intermediate tokens
+    return {"status": "ok", "response": response}
+
 # Here we define the Flask routes for the web interface and SSE streaming.
 @app.route("/stream")
 def stream():
@@ -7783,6 +7829,10 @@ INDEX_HTML = """
     }
     pre code{
     border:unset!important;
+    scrollbar-width: none !important;
+    overflow: auto!important;
+    background:#2225!important;
+    font-weight:100!important;
     }
     summary {
       cursor: pointer;
@@ -7820,6 +7870,12 @@ INDEX_HTML = """
     <div class="header-left">
       <button id="config-btn" class="btn">Config</button>
       <button id="theme-btn" class="btn">Light/Dark</button>
+        <input
+      id="prompt-input"
+      type="text"
+      placeholder="Type a message..."
+      style="flex:1; padding:6px; font:inherit; color:inherit; background:var(--panel-bg); border:1px solid var(--border); border-radius:4px;"
+    />
     </div>
   </header>
 
@@ -8060,6 +8116,25 @@ INDEX_HTML = """
           hljs.highlightElement(code);
         });
       });
+
+
+    const promptInput = document.getElementById('prompt-input');
+    promptInput.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') {
+        const text = promptInput.value.trim();
+        if (!text) return;
+        promptInput.value = '';
+        try {
+        await fetch('/api/message', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text })
+        });
+        } catch (err) {
+        console.error('Failed to send message:', err);
+        }
+    }
+    });
   </script>
 </body>
 </html>
