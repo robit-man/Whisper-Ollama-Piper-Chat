@@ -291,7 +291,7 @@ import inspect
 
 # ── Wi-Fi control
 import pywifi
-from pywifi import const
+from pywifi import PyWiFi, const, Profile
 
 # ── System + numerics
 import psutil
@@ -310,7 +310,7 @@ import cv2
 import mss
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import List, Any, Optional
 from flask import Flask, Response, render_template_string, request, jsonify
 from flask_cors import CORS
 from werkzeug.serving import make_server
@@ -2895,6 +2895,143 @@ class Tools:
             log_message(f"Image file not found: {full_path}", "ERROR")
             return f"Error: Image file not found: {full_path}"
     
+    # This static method retrieves the first wireless interface using the pywifi library. It checks for available interfaces and raises an error if none are found. This is a helper method used by other methods to ensure they operate on a valid wireless interface.
+    @staticmethod
+    def _get_iface():
+        """Helper to get the first wireless interface."""
+        wifi = PyWiFi()
+        ifaces = wifi.interfaces()
+        if not ifaces:
+            raise RuntimeError("No wireless interface found")
+        return ifaces[0]
+
+    # This static method lists available Wi-Fi networks using the pywifi library. It scans for networks, waits for the scan to complete, and returns a list of dictionaries containing network details such as SSID, BSSID, signal strength, authentication algorithm, AKM types, and cipher type.
+    @staticmethod
+    def list_networks() -> List[dict[str, object]]:
+        """
+        Scan for available Wi-Fi networks using pywifi.
+
+        Returns:
+            A list of dicts, each containing:
+            - 'ssid'  : network name (str)
+            - 'bssid' : MAC address of AP (str)
+            - 'signal': signal strength in dBm (int)
+            - 'auth'  : authentication algorithm (const.AUTH_ALG_*)
+            - 'akm'   : list of AKM types (const.AKM_TYPE_*)
+            - 'cipher': cipher type (const.CIPHER_TYPE_*)
+        """
+        iface = _get_iface()
+        iface.scan()
+        time.sleep(2)  # allow scan to complete
+        results = iface.scan_results()
+        nets = []
+        for net in results:
+            nets.append({
+                'ssid': net.ssid,
+                'bssid': net.bssid,
+                'signal': net.signal,
+                'auth': net.auth,
+                'akm': net.akm,
+                'cipher': net.cipher
+            })
+        return nets
+
+    # This static method connects to a Wi-Fi network by SSID and optional password. It uses the pywifi library to manage the connection, builds a profile for the network, and attempts to connect. It waits for a specified timeout period to confirm the connection status.
+    @staticmethod
+    def connect_network(ssid: str, password: Optional[str] = None, timeout: int = 20) -> bool:
+        """
+        Connect to a Wi-Fi network by SSID.
+
+        Args:
+            ssid:     The network SSID.
+            password: WPA/WPA2 passphrase (None for open networks).
+            timeout:  Seconds to wait for connection.
+
+        Returns:
+            True if connected successfully, False on timeout or failure.
+        """
+        iface = _get_iface()
+        iface.disconnect()
+        time.sleep(1)
+
+        # Build profile
+        profile = Profile()
+        profile.ssid = ssid
+        profile.auth = const.AUTH_ALG_OPEN
+        if password:
+            profile.akm.append(const.AKM_TYPE_WPA2PSK)
+            profile.cipher = const.CIPHER_TYPE_CCMP
+            profile.key = password
+        else:
+            profile.akm.append(const.AKM_TYPE_NONE)
+
+        tmp_profile = iface.add_network_profile(profile)
+        iface.connect(tmp_profile)
+
+        start = time.time()
+        while time.time() - start < timeout:
+            if iface.status() == const.IFACE_CONNECTED:
+                return True
+            time.sleep(1)
+        return False
+
+    # This static method checks Internet connectivity by pinging a specified host (default is Google's public DNS server). It runs the ping command and returns True if at least one ping succeeds, otherwise returns False.
+    @staticmethod
+    def check_connectivity(host: str = '8.8.8.8', count: int = 1) -> bool:
+        """
+        Test Internet connectivity by pinging a host.
+
+        Args:
+            host:  IP or domain to ping (default: Google DNS).
+            count: Number of ICMP echo requests.
+
+        Returns:
+            True if at least one ping succeeds, False otherwise.
+        """
+        proc = subprocess.run(
+            ['ping', '-c', str(count), host],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        return proc.returncode == 0
+
+    # This static method retrieves the signal strength of the current or specified Wi-Fi network. It uses the pywifi library to scan for networks and returns the signal strength in dBm. If the specified SSID is not found or not connected, it returns -1.
+    @staticmethod
+    def get_signal_strength(ssid: Optional[str] = None) -> int:
+        """
+        Get signal strength (dBm) of the current or specified SSID.
+
+        Args:
+            ssid: If provided, measure that network; otherwise detect current SSID
+                via nmcli first.
+
+        Returns:
+            Signal strength in dBm, or -1 if not found/connected.
+        """
+        target = ssid
+        if not target:
+            # Fallback to nmcli to find the active SSID
+            try:
+                out = subprocess.check_output(
+                    ['nmcli', '-t', '-f', 'ACTIVE,SSID', 'device', 'wifi', 'list'],
+                    text=True
+                )
+                for line in out.splitlines():
+                    active, name = line.split(':', 1)
+                    if active == 'yes':
+                        target = name
+                        break
+            except Exception:
+                return -1
+
+        if not target:
+            return -1
+
+        for net in list_networks():
+            if net['ssid'] == target:
+                return net['signal']
+        return -1
+
     # This static method retrieves the battery voltage from a file named "voltage.txt" located in the user's home directory. It reads the voltage value, logs the action, and returns the voltage as a float. If an error occurs while reading the file, it logs the error and raises a RuntimeError.
     @staticmethod
     def get_battery_voltage():
@@ -6882,89 +7019,83 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         return ""
 
 
-    # ─── Replacement ───
     def _stage_planning_summary(self, ctx) -> str:
         """
         • Streams the tool-decision.
-        • Registers ctx.next_tool_call  **and**
-          forces the criteria → decomposition → validation branch to run
-          so that ctx.plan / ctx.plan_validated are always produced.
+        • Registers ctx.next_tool_call and forces the criteria → decomposition
+          → validation branch so ctx.plan is always set.
         """
         import re, inspect
 
-        # 1) Stream the tool decision and collect only string tokens
+        # 1) Stream the tool decision and collect tokens as STRINGS
         gathered = []
         for chunk, done in self._stream_tool(ctx):
-            # extract the raw token (may be str, dict, etc.)
+            # chunk might be str, dict, or something else
             if isinstance(chunk, str):
-                token = chunk
+                token_str = chunk
             elif isinstance(chunk, dict):
-                token = (
+                # extract whatever content fields you expect
+                token_str = (
                     chunk.get("message", {}).get("content", "")
                     or chunk.get("content", "")
                     or ""
                 )
             else:
-                token = chunk
+                # catch-all: convert to string
+                token_str = str(chunk)
 
-            # **Ensure it's always a str before appending**
-            token_str = str(token)
             gathered.append(token_str)
             if done:
                 break
 
-        # 2) Join safely now that everything is a string
+        # 2) Now safe to join
         raw = re.sub(
             r"^```tool_code\s*|\s*```$",
             "",
             "".join(gathered),
             flags=re.DOTALL
         ).strip().strip("`")
+
+        # 3) Parse & register
         call = Tools.parse_tool_call(raw)
         ctx.next_tool_call = call
 
-        # 3) Decide if the tool exists already
-        known_tools = {
+        # 4) Detect if this helper already exists
+        known = {
             n for n, f in inspect.getmembers(Tools, inspect.isfunction)
             if not n.startswith("_")
         }
-        if call and isinstance(call, str):
+        if isinstance(call, str):
             name = call.split("(", 1)[0]
-            ctx.needs_tool_work = name not in known_tools
+            ctx.needs_tool_work = (name not in known)
         else:
             ctx.needs_tool_work = False
 
-        # 4) Friendly sentence for the user (optional)
+        # 5) Generate a one-sentence “what I’m about to do” summary
         plan_msg = ""
         if call:
-            response = chat(
+            resp = chat(
                 model=self.config_manager.config["secondary_model"],
                 messages=[
                     {
                         "role": "system",
-                        "content": (
-                            "Speak one casual sentence explaining what the upcoming tool "
-                            "call will do."
-                        )
+                        "content": "Speak one casual sentence explaining what the upcoming tool call will do."
                     },
                     {
                         "role": "user",
-                        "content": (
-                            f"We are about to run {call} for the user request: "
-                            f"{ctx.user_message}"
-                        )
+                        "content": f"We are about to run {call} for the user request: {ctx.user_message}"
                     }
                 ],
                 stream=False
             )
-            plan_msg = response.get("message", {}).get("content", "").strip()
+            plan_msg = resp.get("message", {}).get("content", "").strip()
             if plan_msg and not ctx.skip_tts:
                 self.tts_manager.enqueue(plan_msg)
 
         ctx.ctx_txt += f"\n[Planning summary] {plan_msg or '(no tool)'}"
         ctx.stage_outputs["planning_summary"] = plan_msg
 
-        # 5) Force next stages if they’re not already queued
+        # 6) Force the next stages
         ctx._forced_next = [
             "define_criteria",
             "task_decomposition",
@@ -6972,9 +7103,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ]
 
         return plan_msg
-
-
-
 
     # ------------------------------
     # Stage 8: tool_chaining
