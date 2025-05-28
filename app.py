@@ -21,7 +21,7 @@ This script now integrates the following features:
 """
 
 # Ensure Python 3.8+ is used
-import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib, random, copy, statistics, ast
+import sys, os, subprocess, platform, re, json, time, threading, queue, datetime, inspect, difflib, random, copy, statistics, ast, shutil
 from datetime import datetime, timezone
 
 # ----- COLOR CODES FOR LOGGING -----
@@ -156,12 +156,26 @@ def setup_piper_and_onnx():
 
 setup_piper_and_onnx()
 
-# This block checks if the required dependencies are installed.
+
+# marker to skip setup on subsequent runs
 SETUP_MARKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".setup_complete")
+
 if not os.path.exists(SETUP_MARKER):
-    log_message("Installing required dependencies...", "PROCESS")
+    # 1) System-level dependencies
+    log_message("Installing system packages...", "PROCESS")
+    if sys.platform.startswith("linux") and shutil.which("apt-get"):
+        try:
+            subprocess.check_call(["sudo", "apt-get", "update"])
+            subprocess.check_call(["sudo", "apt-get", "install", "-y", "libsqlite3-dev"])
+        except subprocess.CalledProcessError as e:
+            log_message(f"Failed to install libsqlite3-dev: {e}", "ERROR")
+            sys.exit(1)
+
+    # 2) Python-level dependencies
+    log_message("Installing Python dependencies...", "PROCESS")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
-    subprocess.check_call([sys.executable, "-m", "pip", "install",
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install",
         "sounddevice", "numpy", "scipy",
         "openai-whisper",   # For Whisper transcription
         "ollama",           # For Ollama Python API
@@ -171,17 +185,22 @@ if not os.path.exists(SETUP_MARKER):
         "pywifi",           # For WiFi scanning
         "psutil",           # For system utilization
         "num2words",        # For converting numbers to words
-        "noisereduce",      # For noise cancellation (fallback, not used here)
-        "denoiser",         # For real-time speech enhancement via denoiser
+        "noisereduce",      # For noise cancellation (fallback)
+        "denoiser",         # For real-time speech enhancement
         "pyautogui",        # For screen capture
         "pillow",           # For image handling
-        "opencv-python",             # For image processing
-        "mss",             # For screen capture
-        "selenium",
-        "webdriver-manager",
-        "flask_cors",
+        "opencv-python",    # For image processing
+        "mss",              # For screen capture
+        "networkx",         # For knowledge graph operations
+        "pysqlite3",        # SQLite bindings (now that headers exist)
+        "pandas",           # For data manipulation
+        "selenium",         # For web scraping and automation
+        "webdriver-manager",# For managing web drivers
+        "flask_cors",       # For CORS support in Flask
         "flask",            # For web server
     ])
+
+    # 3) Stamp and restart
     with open(SETUP_MARKER, "w") as f:
         f.write("Setup complete")
     log_message("Dependencies installed. Restarting script...", "SUCCESS")
@@ -289,6 +308,11 @@ import html, textwrap                          # (html imported only once)
 import os, shutil, random, platform, json
 import inspect
 
+# ── Database / Knowledge Graph
+import sqlite3
+import networkx as nx
+import pandas as pd
+
 # ── Wi-Fi control
 import pywifi
 from pywifi import PyWiFi, const, Profile
@@ -310,7 +334,7 @@ import cv2
 import mss
 
 from dataclasses import dataclass, field
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Dict, Tuple
 from flask import Flask, Response, render_template_string, request, jsonify
 from flask_cors import CORS
 from werkzeug.serving import make_server
@@ -1009,24 +1033,23 @@ class Tools:
     _poll   = 0.05                     
     _short  = 3
     
-    # Here in this definition, we define a static method to parse tool calls from text. It works by extracting either a fenced code block, an inline backtick call, or a bare function call from the input text.
     @staticmethod
     def parse_tool_call(text: str) -> str | None:
         """
-        Extract either:
-          1) A fenced ```tool_code``` block
+        Extract a tool call from:
+          1) A fenced ```tool_code```, ```python``` or ```py``` block
           2) An inline-backtick call: `func(arg1, arg2)`
           3) A bare call on its own line: func(arg1, arg2)
 
-        Strips out Python‐style type annotations (e.g. filename: str="x")
-        so that `file_info(filename: str = "F.gig")` becomes
-        `file_info(filename="F.gig")`.
+        Strips out simple Python‐style type annotations (e.g. filename: str="x")
+        and normalizes key: value → key=value for basic literals.
+        Returns the raw "func(...)" string, or None if nothing valid is found.
         """
-        import re
+        import re, ast, logging
 
         t = text.strip()
 
-        # 0) Remove type annotations before the '='
+        # 1) Pre-clean: remove type annotations before '='
         #    e.g. 'filename: str = "F.gig"' → 'filename = "F.gig"'
         t = re.sub(
             r'([A-Za-z_]\w*)\s*:\s*[A-Za-z_]\w*(?=\s*=)',
@@ -1034,51 +1057,63 @@ class Tools:
             t
         )
 
-        # 1) Normalize key: value → key=value (for older-style “key: 'val'”)
+        # 2) Normalize simple key: value → key=value
         t = re.sub(
-            r'(\b[A-Za-z_]\w*\b)\s*:\s*'                 # key:
-            r'("(?:[^"\\]|\\.)*"|'                      #   "quoted string"
-            r'\'(?:[^\'\\]|\\.)*\'|'                    #   'quoted string'
-            r'\d+|None)',                               #   integer or None
+            r'(\b[A-Za-z_]\w*\b)\s*:\s*'         # key:
+            r'("(?:[^"\\]|\\.)*"|'              #   "quoted"
+            r'\'(?:[^\'\\]|\\.)*\'|'            #   'quoted'
+            r'\d+|None)',                       #   integer or None
             r'\1=\2',
             t
         )
 
-        # 2) Unwrap inline single-backticks if present
-        if t.startswith("`") and t.endswith("`"):
-            t = t[1:-1].strip()
+        candidate: str | None = None
 
-        # 3) Prepare literal patterns
-        LIT = r'(?:\"[^\"]*\"|\'[^\']*\'|\d+|None)'
-        KV  = rf'(?:[A-Za-z_]\w*\s*=\s*)?{LIT}'
-
-        # 4) Try fenced ```tool_code``` block
-        fenced_re = re.compile(
-            rf"```tool_code\s*"
-            rf"([A-Za-z_]\w*\s*\(\s*"
-            rf"(?:{KV}(?:\s*,\s*{KV})*)?\s*"
-            rf"\)\s*)```",
-            re.DOTALL
+        # 3) Attempt fenced ```tool_code``` / ```python``` / ```py``` block
+        m = re.search(
+            r"```(?:tool_code|python|py)\s*([\s\S]+?)```",
+            t,
+            flags=re.DOTALL
         )
-        m = fenced_re.search(t)
+        if m:
+            candidate = m.group(1).strip()
+        else:
+            # 4) Inline single-backticks
+            if t.startswith("`") and t.endswith("`"):
+                inner = t[1:-1].strip()
+                if "(" in inner and inner.endswith(")"):
+                    candidate = inner
 
-        # 5) If not found, fall back to a bare call on its own line
-        if not m:
-            bare_re = re.compile(
-                rf"^([A-Za-z_]\w*\s*\(\s*"
-                rf"(?:{KV}(?:\s*,\s*{KV})*)?\s*"
-                rf"\))\s*$",
-                re.DOTALL
-            )
-            m = bare_re.match(t)
+        # 5) Bare call on its own line if still nothing
+        if not candidate:
+            lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+            if lines:
+                first = lines[0]
+                if "(" in first and first.endswith(")"):
+                    candidate = first
 
-        if not m:
-            log_message("Parsed tool call from text: None", "DEBUG")
+        if not candidate:
+            logging.debug("Parsed tool call from text: None")
             return None
 
-        code = m.group(1).strip()
-        log_message(f"Parsed tool call from text: {code!r}", "DEBUG")
-        return code
+        # 6) AST-validate: ensure it’s exactly a Name(...) call
+        try:
+            expr = ast.parse(candidate, mode="eval")
+            call = expr.body
+            if (
+                isinstance(expr, ast.Expression)
+                and isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+            ):
+                logging.debug(f"Parsed tool call from text: {candidate!r}")
+                return candidate
+        except Exception:
+            pass
+
+        logging.debug("Parsed tool call from text: None (AST check failed)")
+        return None
+
+
     
     # Here in this definition, we define a static method to add a subtask under an existing task. If the parent task does not exist or has an ID less than or equal to zero, the subtask will be created as a top-level task.
     @staticmethod
@@ -1274,71 +1309,73 @@ class Tools:
         ----------
         code : str
             The snippet to run.  It may already be wrapped in
-            ```python …```   or   ```py …``` fences – these are stripped
+            ```python``` / ```py``` / ```tool_code``` fences – these are stripped
             automatically so callers don’t have to worry.
         stdin : str
             Text piped to the child process’ STDIN.
         timeout : int
             Hard wall-clock limit (seconds).
         dedent : bool
-            If True, run `textwrap.dedent()` on the snippet after stripping
-            fences – makes copy-pasted indented code work.
+            If True, run `textwrap.dedent()` on the snippet after stripping fences
+            – makes copy-pasted indented code work.
 
         Returns
         -------
         dict
             {
-            "stdout":      <captured STDOUT str>,
-            "stderr":      <captured STDERR str>,
-            "returncode":  <int>,
+              "stdout":     <captured STDOUT str>,
+              "stderr":     <captured STDERR str>,
+              "returncode": <int>,
             }
-            On failure an ``"error"`` key is present instead.
+            On failure an `"error"` key is present instead.
         """
         import re, subprocess, sys, tempfile, textwrap, os
 
-        # 1) unwrap optional back-tick fences -----------------------------------
+        # 1) strip any ```python``` / ```py``` / ```tool_code``` fences
         fence_rx = re.compile(
-            r"```(?:python|py)?\s*([\s\S]*?)\s*```",
-            re.IGNORECASE,
+            r"```(?:python|py|tool_code)?\s*([\s\S]*?)\s*```",
+            re.IGNORECASE
         )
         m = fence_rx.search(code)
         if m:
             code = m.group(1)
 
+        # 2) optional dedent
         if dedent:
             code = textwrap.dedent(code)
 
-        # 2) write to a temporary .py file --------------------------------------
+        # 3) write to temp .py
         with tempfile.NamedTemporaryFile("w+", suffix=".py", delete=False) as tmp:
             tmp.write(code)
             tmp_path = tmp.name
 
-        # 3) run it in a clean subprocess ---------------------------------------
+        # 4) run it
         try:
             proc = subprocess.run(
                 [sys.executable, tmp_path],
                 input=stdin,
                 text=True,
                 capture_output=True,
-                timeout=timeout,
+                timeout=timeout
             )
             return {
                 "stdout": proc.stdout,
                 "stderr": proc.stderr,
-                "returncode": proc.returncode,
+                "returncode": proc.returncode
             }
 
         except subprocess.TimeoutExpired:
-            return {"error": f"Timed-out after {timeout}s"}
+            return {"error": f"Timed out after {timeout}s"}
 
-        except Exception as e:                       # any other unexpected error
+        except Exception as e:
             return {"error": str(e)}
 
-        finally:                                     # always clean up the temp file
+        finally:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
 
     # This static method runs a tool function in-process, parsing the tool call from a string. It executes the function and returns its output or an exception message.
     @staticmethod
@@ -1620,6 +1657,182 @@ class Tools:
         except Exception as e:                     # pragma: no-cover
             return f"Error removing tool: {e}"
 
+    @staticmethod
+    def interact_with_knowledge_graph(
+        graph: nx.DiGraph,
+        node_type: str,
+        node_id: str,
+        relation: Optional[str] = None,
+        target_node_id: Optional[str] = None,
+        attributes_to_retrieve: Optional[List[str]] = None,
+        new_attribute: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Interacts with a NetworkX knowledge graph.  This method allows an agent to:
+        1. Retrieve information about a node.
+        2. Find nodes related to a given node.
+        3. Add attributes to a node.
+
+        Args:
+            graph (nx.DiGraph): The NetworkX knowledge graph.
+            node_type (str): The type of node to interact with (e.g., "agent", "task").
+            node_id (str): The ID of the node to interact with.
+            relation (Optional[str]): The type of relationship to search for (e.g., "assigned_to").
+                                     If provided, `target_node_id` must also be provided.
+            target_node_id (Optional[str]): The ID of the target node for a relationship search.
+            attributes_to_retrieve (Optional[List[str]]): A list of attributes to retrieve from the node.
+                                                          If None, all attributes are retrieved.
+            new_attribute (Optional[Dict[str, Any]]): A dictionary containing a new attribute to add to the node.
+                                                      e.g., {"priority": "high"}
+
+        Returns:
+            Dict[str, Any]: A dictionary containing the results of the interaction.
+                            The dictionary will have a "status" key ("success" or "error") and a "data" key
+                            containing the retrieved data or an error message.
+
+        Raises:
+            TypeError: If the graph is not a NetworkX DiGraph.
+            ValueError: If invalid arguments are provided.
+        """
+
+        if not isinstance(graph, nx.DiGraph):
+            raise TypeError("Graph must be a NetworkX DiGraph.")
+
+        try:
+            if not graph.has_node(node_id):
+                return {"status": "error", "data": f"Node with ID '{node_id}' not found."}
+
+            node_data = graph.nodes[node_id]
+
+            if relation and target_node_id:
+                if not graph.has_edge(node_id, target_node_id):
+                    return {"status": "error", "data": f"No edge with relation '{relation}' between '{node_id}' and '{target_node_id}'."}
+                edge_data = graph.edges[node_id, target_node_id]
+                result = edge_data
+            elif new_attribute:
+                graph.nodes[node_id].update(new_attribute)  # Update node attributes
+                result = graph.nodes[node_id]
+            else:
+                if attributes_to_retrieve:
+                    result = {attr: node_data.get(attr) for attr in attributes_to_retrieve if attr in node_data}
+                else:
+                    result = dict(node_data)  # Return all attributes
+
+            return {"status": "success", "data": result}
+
+        except Exception as e:
+            logging.error(f"Error interacting with graph: {e}")
+            return {"status": "error", "data": f"An unexpected error occurred: {e}"}
+
+    @staticmethod
+    def create_knowledge_graph(
+        node_data: List[Dict[str, Any]],
+        edge_data: List[Tuple[str, str, Dict[str, Any]]],
+        validate_nodes: bool = True  # Added validation flag
+    ) -> nx.DiGraph:
+        """
+        Creates a NetworkX knowledge graph from node and edge data.
+
+        Args:
+            node_data (List[Dict[str, Any]]): A list of dictionaries, where each dictionary represents a node.
+            edge_data (List[Tuple[str, str, Dict[str, Any]]]): A list of tuples, where each tuple represents an edge
+                                                                (source_node_id, target_node_id, edge_attributes).
+            validate_nodes (bool): Whether to validate that source and target nodes exist before adding edges.
+
+        Returns:
+            nx.DiGraph: The created NetworkX knowledge graph.
+
+        Raises:
+            TypeError: If input data is not in the correct format.
+            ValueError: If node or edge data is invalid.
+        """
+
+        if not isinstance(node_data, list) or not all(isinstance(node, dict) for node in node_data):
+            raise TypeError("node_data must be a list of dictionaries.")
+        if not isinstance(edge_data, list) or not all(isinstance(edge, tuple) and len(edge) == 3 for edge in edge_data):
+            raise TypeError("edge_data must be a list of tuples (source, target, attributes).")
+
+        graph = nx.DiGraph()
+
+        # Add nodes in bulk
+        graph.add_nodes_from(node_data)
+
+        # Add edges in bulk, with validation
+        for source, target, attributes in edge_data:
+            if validate_nodes and not (graph.has_node(source) and graph.has_node(target)):
+                logging.warning(f"Skipping edge ({source}, {target}) because source or target node does not exist.")
+                continue  # Skip this edge
+            graph.add_edge(source, target, **attributes)
+
+        return graph
+
+    @staticmethod
+    def create_sqlite_db(db_name: str = "database.db") -> sqlite3.Connection:
+        """
+        Creates an SQLite database and returns a connection object.
+
+        Args:
+            db_name (str): The name of the database file.
+
+        Returns:
+            sqlite3.Connection: A connection object to the database.
+        """
+        try:
+            conn = sqlite3.connect(db_name)
+            print(f"Database '{db_name}' created successfully.")
+            return conn
+        except sqlite3.Error as e:
+            print(f"Error creating database: {e}")
+            return None
+
+    @staticmethod
+    def interact_with_sqlite_db(
+        conn: sqlite3.Connection,
+        query: str,
+        params: Tuple[Any, ...] = None
+    ) -> pd.DataFrame:
+        """
+        Executes a query against an SQLite database and returns the results as a Pandas DataFrame.
+
+        Args:
+            conn (sqlite3.Connection): The connection object to the database.
+            query (str): The SQL query to execute.
+            params (Tuple[Any, ...]): Parameters to pass to the query (optional).
+
+        Returns:
+            pd.DataFrame: A Pandas DataFrame containing the query results.  Returns an empty DataFrame on error.
+        """
+        try:
+            df = pd.read_sql_query(query, conn, params=params)
+            return df
+        except pd.Error as e:
+            print(f"Error executing query: {e}")
+            return pd.DataFrame()  # Return an empty DataFrame on error
+
+    @staticmethod
+    def get_table_info(conn: sqlite3.Connection) -> List[Dict[str, str]]:
+        """
+        Retrieves information about the tables in an SQLite database, including table names and column names.
+
+        Args:
+            conn (sqlite3.Connection): The connection object to the database.
+
+        Returns:
+            List[Dict[str, str]]: A list of dictionaries, where each dictionary represents a table and its columns.
+                                  Each dictionary has the following keys: "table_name" and "columns".
+        """
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        table_names = [row[0] for row in cursor.fetchall()]
+
+        table_info = []
+        for table_name in table_names:
+            cursor.execute(f"PRAGMA table_info({table_name});")
+            columns = [row[1] for row in cursor.fetchall()]  # Column names
+            table_info.append({"table_name": table_name, "columns": columns})
+
+        return table_info
+    
     # This static method reloads all external tools by detaching any previously loaded tools, purging their modules from `sys.modules`, and then re-importing everything found in the `external_tools` directory. It returns a confirmation message.
     @staticmethod
     def reload_external_tools() -> str:
@@ -3215,26 +3428,71 @@ class Tools:
 
     # This static method invokes the secondary LLM (for tool processing) with a user prompt and an optional temperature. It streams tokens to the console as they arrive and returns the full assistant message content as a string.
     @staticmethod
-    def secondary_agent_tool(prompt: str, temperature: float = 0.7) -> str:
+    def secondary_agent_tool(
+        prompt: str,
+        *,
+        temperature: float = 0.7,
+        system: str | None = None,
+        context: object | None = None,
+    ) -> str:
         """
-        Invoke the secondary LLM (for tool processing) with a user prompt
-        and an optional temperature. Streams tokens to console as they arrive,
-        and returns the full assistant message content as a string.
+        Invoke the secondary LLM (for tool processing) with a user prompt,
+        optional temperature, and optional system instructions and context.
+
+        Streams tokens to the console as they arrive, and returns the full
+        assistant message content as a string.
+
+        Args:
+            prompt: The main user question or instruction.
+            temperature: Sampling temperature for the LLM.
+            system:    Optional system-level instruction to inject *before*
+                       context and prompt.
+            context:   Optional contextual data (any type) that will be
+                       stringified and injected *before* the prompt.
+
+        Usage:
+            ```python
+            # simple use:
+            secondary_agent_tool("Summarize X for me")
+
+            # with extra system instructions and context:
+            secondary_agent_tool(
+                prompt="What’s the bug here?",
+                system="You are a seasoned Python debugger.",
+                context=source_code_str
+            )
+            ```
         """
         secondary_model = config.get("secondary_model")
+        # build message list in the required order
+        messages: list[dict[str, str]] = []
+        if system is not None:
+            messages.append({"role": "system", "content": system})
+        if context is not None:
+            # stringify any type of context
+            messages.append({"role": "system", "content": str(context)})
+        # finally the user prompt
+        messages.append({"role": "user", "content": prompt})
+
         payload = {
             "model": secondary_model,
             "temperature": temperature,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "stream": True
         }
+
         try:
-            log_message(f"Calling secondary agent tool (streaming) with prompt={prompt!r} temperature={temperature}", "PROCESS")
+            log_message(
+                f"Calling secondary agent tool (streaming) "
+                f"with prompt={prompt!r}, temperature={temperature}, "
+                f"system={system!r}, context={'<provided>' if context is not None else None}",
+                "PROCESS"
+            )
             content = ""
             print("⟳ Secondary Agent Tool Stream:", end="", flush=True)
             for part in chat(
                 model=secondary_model,
-                messages=payload["messages"],
+                messages=messages,
                 stream=True
             ):
                 tok = part["message"]["content"]
@@ -3243,9 +3501,11 @@ class Tools:
             print()  # newline after stream finishes
             log_message("Secondary agent tool stream complete.", "SUCCESS")
             return content
+
         except Exception as e:
             log_message(f"Error in secondary agent tool: {e}", "ERROR")
             return f"Error in secondary agent: {e}"
+
 
 # This exception is raised to stop a stream when the Watchdog detects a runaway or hallucinating output.
 class StopStreamException(Exception):
@@ -4627,8 +4887,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         self.observer.log_stage_end(ctx.run_id, "tool_decision")
         yield "", True
 
-
-
     def _stage_task_decomposition(self, ctx) -> list[str]:
         """
         Build a list of tool calls that will achieve the user request.
@@ -4737,15 +4995,12 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         log_message(f"Task plan accepted: {cleaned}", "INFO")
         return cleaned
 
-
-
-
     # ---------------------------------------------------------------
     # Stage : plan_validation   (cursor initialisation added)
     # ---------------------------------------------------------------
     def _stage_plan_validation(self, ctx):
         """
-        Validate -- and, if needed, *refine* -- ``ctx.plan`` (list[str] tool calls).
+        Validate -- and, if needed, *refine* -- ctx.plan (list[str] tool calls).
 
         Sets / updates on ctx:
             • plan_validated : bool
@@ -4754,14 +5009,13 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             • plan_idx  (cursor → execution progress)
             • plan_done (boolean → all steps completed successfully)
         """
-        import json, re, ast, inspect, textwrap
+        import re, inspect, textwrap, json, logging
 
         plan: list[str] = getattr(ctx, "plan", [])
         if not plan:
             ctx.plan_validated = False
             ctx.validation_note = "No plan generated."
-            log_message("[plan_validation] Empty plan – nothing to validate.", "WARNING")
-            # initialise cursor even in failure path
+            logging.warning("[plan_validation] Empty plan – nothing to validate.")
             ctx.plan_idx = 0
             ctx.plan_done = False
             return
@@ -4769,56 +5023,69 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # ── helper: LLM semantic guard for *each* call ─────────────────────
         def _llm_check(call: str) -> tuple[bool, str, str]:
             """
-            Returns (ok: bool, reason: str, suggestion: str | 'NO_TOOL')
+            Returns (ok: bool, reason: str, suggestion: str|NO_TOOL)
             """
+            # gather available tools + signatures
+            tools_meta = [
+                f"{name}{inspect.signature(fn)}"
+                for name, fn in inspect.getmembers(Tools, inspect.isfunction)
+                if not name.startswith("_")
+            ]
             prompt = textwrap.dedent(f"""
                 USER REQUEST:
                 «{ctx.user_message}»
+
+                FULL PLAN:
+                {json.dumps(plan, indent=2)}
 
                 CANDIDATE CALL:
                 ```tool_code
                 {call}
                 ```
 
-                Reply in ONE line of **valid JSON**:
-                {{"valid": true|false, "reason": "...", "suggest": "<call>|NO_TOOL"}}
-            """)
-            raw = chat(
+                AVAILABLE TOOLS:
+                {"; ".join(tools_meta)}
+
+                Reply in ONE line of valid JSON:
+                {{ "valid": true|false,
+                   "reason": "...",
+                   "suggest": "<alternative_call>|NO_TOOL" }}
+            """).strip()
+
+            resp = chat(
                 model=self.config_manager.config["secondary_model"],
                 messages=[{"role": "user", "content": prompt}],
                 stream=False
-            )["message"]["content"].strip()
-            raw = re.sub(r"```(?:json)?|```", "", raw, flags=re.I).strip()
+            )
+            content = resp["message"]["content"]
+            # drop any fences
+            raw = re.sub(r"```(?:json)?|```", "", content, flags=re.I).strip()
             try:
-                out = json.loads(raw)
-                return (
-                    bool(out.get("valid")),
-                    str(out.get("reason", "")).strip(),
-                    str(out.get("suggest", "NO_TOOL")).strip()
-                )
+                o = json.loads(raw)
+                return bool(o.get("valid")), o.get("reason","").strip(), o.get("suggest","NO_TOOL").strip()
             except Exception as e:
-                return False, f"Unparsable validator JSON: {e}", "NO_TOOL"
+                return False, f"Invalid JSON from validator: {e}", "NO_TOOL"
 
-        # ── pass-1 : syntax / availability check ───────────────────────────
-        valid_calls: list[str] = []
-        tool_names = {n for n, _ in inspect.getmembers(Tools, inspect.isfunction)
-                    if not n.startswith("_")}
-
+        # ── pass-1: syntax & availability ─────────────────────────────────
+        valid_calls = []
+        tool_names = {
+            name for name, _ in inspect.getmembers(Tools, inspect.isfunction)
+            if not name.startswith("_")
+        }
         ctx.needs_tool_work = False
-        for raw in plan:
-            call = raw.strip()
-            call = re.sub(r"^```tool_code\s*|\s*```$", "", call, flags=re.I).strip()
 
+        for raw in plan:
+            # strip fences & whitespace
+            call = re.sub(r"^```tool_code\s*|\s*```$", "", raw, flags=re.I).strip()
             parsed = Tools.parse_tool_call(call)
             if not parsed:
-                log_message(f"[plan_validation] Dropped invalid syntax: {raw!r}", "ERROR")
+                logging.error(f"[plan_validation] Dropped invalid syntax: {raw!r}")
                 continue
 
-            fn_name = parsed.split("(", 1)[0]
-            if fn_name not in tool_names:
+            name = parsed.split("(",1)[0]
+            if name not in tool_names:
                 ctx.needs_tool_work = True
-                log_message(f"[plan_validation] Helper {fn_name} missing – triggers tool-improvement.", "INFO")
-
+                logging.info(f"[plan_validation] Unknown tool `{name}` – will trigger tool_self_improvement.")
             valid_calls.append(parsed)
 
         if not valid_calls:
@@ -4828,26 +5095,27 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             ctx.plan_done = False
             return
 
-        # ── pass-2 : semantic approval per call  ---------------------------
-        final_plan: list[str] = []
+        # ── pass-2: semantic LLM check ────────────────────────────────────
+        final_plan = []
         for call in valid_calls:
-            ok, reason, sugg = _llm_check(call)
+            ok, reason, suggest = _llm_check(call)
             if ok:
                 final_plan.append(call)
-                log_message(f"[plan_validation] ✅ {call} – {reason}", "INFO")
+                logging.info(f"[plan_validation] ✅ {call} – {reason}")
             else:
-                log_message(f"[plan_validation] ❌ {call} – {reason}", "WARNING")
-                if sugg and sugg.upper() != "NO_TOOL" and Tools.parse_tool_call(sugg):
-                    final_plan.append(sugg)
-                    log_message(f"[plan_validation]   ↳ replaced with {sugg}", "INFO")
+                logging.warning(f"[plan_validation] ❌ {call} – {reason}")
+                # if LLM suggests a replacement, validate & use it
+                if suggest.upper() != "NO_TOOL" and Tools.parse_tool_call(suggest):
+                    final_plan.append(suggest)
+                    logging.info(f"[plan_validation]   ↳ Replaced with {suggest}")
 
-        # ── pass-3 : commit -------------------------------------------------
+        # ── pass-3: commit results ────────────────────────────────────────
         if final_plan:
             ctx.plan_validated = (len(final_plan) == len(valid_calls))
             ctx.plan = final_plan
             ctx.validation_note = (
-                "Plan approved." if ctx.plan_validated else
-                "Plan partially revised during validation."
+                "Plan approved." if ctx.plan_validated
+                else "Plan partially revised during validation."
             )
         else:
             ctx.plan_validated = False
@@ -4855,15 +5123,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             ctx.plan = []
 
         ctx.ctx_txt += f"\n[Plan validation] {ctx.validation_note}"
-
-        # NEW  → initialise persistent cursor & completion flag
         ctx.plan_idx = 0
         ctx.plan_done = False
 
         if not getattr(ctx, "skip_tts", True):
             self.tts_manager.enqueue(ctx.validation_note)
-
-
     # ------------------------------------------------------------------
     #  Stage: execute_actions
     # ------------------------------------------------------------------
@@ -7041,48 +7305,45 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # 1) Stream the tool decision and collect tokens as STRINGS
         gathered = []
         for chunk, done in self._stream_tool(ctx):
-            # chunk might be str, dict, or something else
             if isinstance(chunk, str):
                 token_str = chunk
             elif isinstance(chunk, dict):
-                # extract whatever content fields you expect
-                token_str = (
-                    chunk.get("message", {}).get("content", "")
-                    or chunk.get("content", "")
+                raw_val = (
+                    chunk.get("content")
+                    or chunk.get("message", {}).get("content")
                     or ""
                 )
+                token_str = raw_val if isinstance(raw_val, str) else str(raw_val)
             else:
-                # catch-all: convert to string
                 token_str = str(chunk)
-
             gathered.append(token_str)
             if done:
                 break
 
-        # 2) Now safe to join
+        # 2) Strip any fences and join
         raw = re.sub(
-            r"^```tool_code\s*|\s*```$",
+            r"^```(?:tool_code|python|py)\s*|\s*```$",
             "",
             "".join(gathered),
             flags=re.DOTALL
         ).strip().strip("`")
 
-        # 3) Parse & register
+        # 3) Parse & register the tool call
         call = Tools.parse_tool_call(raw)
         ctx.next_tool_call = call
 
-        # 4) Detect if this helper already exists
+        # 4) Check if this tool exists already
         known = {
-            n for n, f in inspect.getmembers(Tools, inspect.isfunction)
-            if not n.startswith("_")
+            name for name, fn in inspect.getmembers(Tools, inspect.isfunction)
+            if not name.startswith("_")
         }
         if isinstance(call, str):
             name = call.split("(", 1)[0]
-            ctx.needs_tool_work = (name not in known)
+            ctx.needs_tool_work = name not in known
         else:
             ctx.needs_tool_work = False
 
-        # 5) Generate a one-sentence “what I’m about to do” summary
+        # 5) Optionally generate a one-sentence “what I’m about to do”
         plan_msg = ""
         if call:
             resp = chat(
@@ -7090,30 +7351,33 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 messages=[
                     {
                         "role": "system",
-                        "content": "Speak one casual sentence explaining what the upcoming tool call will do."
+                        "content": (
+                            "Speak one casual sentence explaining what the "
+                            "upcoming tool call will do."
+                        )
                     },
                     {
                         "role": "user",
-                        "content": f"We are about to run {call} for the user request: {ctx.user_message}"
+                        "content": (
+                            f"We are about to run {call} for the user request: "
+                            f"{ctx.user_message}"
+                        )
                     }
                 ],
                 stream=False
             )
             plan_msg = resp.get("message", {}).get("content", "").strip()
-            if plan_msg and not ctx.skip_tts:
+            if plan_msg and not getattr(ctx, "skip_tts", False):
                 self.tts_manager.enqueue(plan_msg)
 
+        # 6) Record and force next stages
         ctx.ctx_txt += f"\n[Planning summary] {plan_msg or '(no tool)'}"
         ctx.stage_outputs["planning_summary"] = plan_msg
-
-        # 6) Force the next stages
-        ctx._forced_next = [
-            "define_criteria",
-            "task_decomposition",
-            "plan_validation"
-        ]
+        ctx._forced_next = ["define_criteria", "task_decomposition", "plan_validation"]
 
         return plan_msg
+
+
 
     # ------------------------------
     # Stage 8: tool_chaining
