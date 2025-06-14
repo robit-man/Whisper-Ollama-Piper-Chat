@@ -2628,7 +2628,7 @@ class Tools:
 
     # This static method performs a quick DuckDuckGo search for a given topic. It opens the DuckDuckGo homepage, inputs the search query, waits for results, and optionally deep-scrapes the first few results in new tabs. It returns a list of dictionaries containing the title, URL, snippet, summary, and full page HTML content.
     @staticmethod
-    def duckduckgo_search(        # ‚Üê new canonical name
+    def duckduckgo_search(        # ← new canonical name
         topic: str,
         num_results: int = 5,
         wait_sec: int = 1,
@@ -2636,12 +2636,18 @@ class Tools:
     ) -> list:
         """
         Ultra-quick DuckDuckGo search (event-driven, JS injection).
-        ‚Ä¢ Opens the first *num_results* links in separate tabs and deep-scrapes each.
-        ‚Ä¢ Returns: title, url, snippet, summary, and full page HTML (`content`).
-        ‚Ä¢ Never blocks more than 5 s on any wait‚Äîeverything is aggressively polled.
+        • Opens the first *num_results* links in separate tabs and deep-scrapes each.
+        • Returns: title, url, snippet, summary, and full page HTML (`content`).
+        • Never blocks more than 5 s on any wait—everything is aggressively polled.
         """
+        import html, traceback, time
+        from bs4 import BeautifulSoup
+        from selenium.common.exceptions import TimeoutException, NoSuchElementException
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
 
-        log_message(f"[duckduckgo_search] ‚ñ∂ {topic!r}", "INFO")
+        log_message(f"[duckduckgo_search] ▶ {topic!r}", "INFO")
 
         # clamp waits to max 5 s
         wait_sec = min(wait_sec, 5)
@@ -2654,12 +2660,12 @@ class Tools:
         results = []
 
         try:
-            # 1Ô∏è‚É£ Home page
+            # 1️⃣ Home page
             drv.get("https://duckduckgo.com/")
             wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
             log_message("[duckduckgo_search] Home page ready.", "DEBUG")
 
-            # 2Ô∏è‚É£ Cookie banner
+            # 2️⃣ Cookie banner
             try:
                 btn = wait.until(EC.element_to_be_clickable(
                     (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler")
@@ -2669,7 +2675,7 @@ class Tools:
             except TimeoutException:
                 pass
 
-            # 3Ô∏è‚É£ Locate search box
+            # 3️⃣ Locate search box
             selectors = (
                 "input#search_form_input_homepage",
                 "input#searchbox_input",
@@ -2690,7 +2696,7 @@ class Tools:
             )
             log_message("[duckduckgo_search] Query submitted.", "DEBUG")
 
-            # 4Ô∏è‚É£ Wait for results
+            # 4️⃣ Wait for results
             try:
                 wait.until(lambda d: "?q=" in d.current_url)
                 wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, "#links .result, #links [data-nr]"))
@@ -2698,7 +2704,7 @@ class Tools:
             except TimeoutException:
                 log_message("[duckduckgo_search] Results timeout.", "WARNING")
 
-            # 5Ô∏è‚É£ Gather top anchors
+            # 5️⃣ Gather top anchors
             anchors = drv.find_elements(
                 By.CSS_SELECTOR,
                 "a.result__a, a[data-testid='result-title-a']"
@@ -2725,7 +2731,7 @@ class Tools:
                     summary = snippet
                     page_content = ""
 
-                    # 6Ô∏è‚É£ Deep scrape in new tab
+                    # 6️⃣ Deep scrape in new tab
                     if deep_scrape and href:
                         drv.switch_to.new_window("tab")
                         drv.get(href)
@@ -2795,6 +2801,8 @@ class Tools:
 
         log_message(f"[duckduckgo_search] Collected {len(results)} results.", "SUCCESS")
         return results
+
+
     # This method assigns the duckduckgo_search method to a variable for compatibility with existing code that expects this name.
     ddg_search = duckduckgo_search
 
@@ -4450,15 +4458,15 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
     # ------------------------------------------------------------------ #
     def _stage_self_repair(self, ctx: Context):
         """
-        ‚Ä¢ Attempts one automated fix for whatever is stored in ctx.last_failure.
-        ‚Ä¢ Each time it runs it ALSO trims ctx.ctx_txt to a fixed window so the
+        • Attempts one automated fix for whatever is stored in ctx.last_failure.
+        • Each time it runs it ALSO trims ctx.ctx_txt to a fixed window so the
           context never grows without bound.
 
         Supported failure types (unchanged):
             missing_argument | unknown_tool | runtime_error | incomplete_plan
         """
 
-        # ‚îÄ‚îÄ 0Ô∏è‚É£  Pull & clear the failure record safely ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        # ── 0️⃣  Pull & clear the failure record safely ───────────────────
         fail = getattr(ctx, "last_failure", None)
         if not fail:
             return
@@ -4467,39 +4475,39 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         except AttributeError:
             pass   # ctx might be a dict-like shim; safe to ignore
 
-        # ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        # ──────────────────────────────────────────────────────────────────
         #  A. Trim the running context log BEFORE doing any heavy work
-        # ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        # ──────────────────────────────────────────────────────────────────
         MAX_TOKENS = 2_000                     # tweak as you like
         ctx_txt    = getattr(ctx, "ctx_txt", "")
         tokens     = ctx_txt.split()
         if len(tokens) > MAX_TOKENS:
             ctx.ctx_txt = (
-                "[Context truncated after self-repair]\n‚Ä¶ "
+                "[Context truncated after self-repair]\n… "
                 + " ".join(tokens[-MAX_TOKENS:])
             )
 
-        # ‚îÄ‚îÄ 1Ô∏è‚É£  Log the failure we‚Äôre about to handle ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        # ── 1️⃣  Log the failure we’re about to handle ────────────────────
         ftype, payload, stage = fail.get("type"), fail.get("payload"), fail.get("stage")
         note = f"[Self-repair] Detected {ftype} in {stage}: {payload}"
         ctx.ctx_txt += "\n" + note
         log_message(note, "WARNING")
 
-        # ‚îÄ‚îÄ 2Ô∏è‚É£  Ask the LLM for ONE corrective helper call ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        # ── 2️⃣  Ask the LLM for ONE corrective helper call ───────────────
         prompt = textwrap.dedent(f"""
             You are the SELF-REPAIR AGENT.
 
             Failure details:
-              ‚Ä¢ type   : {ftype}
-              ‚Ä¢ payload: {payload!r}
-              ‚Ä¢ stage  : {stage}
+              • type   : {ftype}
+              • payload: {payload!r}
+              • stage  : {stage}
 
             Allowed helpers (return exactly ONE inside ```tool_code```):
-              ‚Ä¢ search_internet(query)
-              ‚Ä¢ create_tool(name, code, overwrite=True)
-              ‚Ä¢ run_tool_once("foo(arg=123)")
-              ‚Ä¢ get_current_date()
-              ‚Ä¢ NO_TOOL   (if you cannot fix this)
+              • search_internet(query)
+              • create_tool(name, code, overwrite=True)
+              • run_tool_once("foo(arg=123)")
+              • get_current_date()
+              • NO_TOOL   (if you cannot fix this)
         """).strip()
 
         raw = chat(
@@ -4513,17 +4521,18 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             ctx.ctx_txt += "\n[Self-repair] No automated fix available."
             return
 
-        # ‚îÄ‚îÄ 3Ô∏è‚É£  Execute the proposed fix immediately ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        # ── 3️⃣  Execute the proposed fix immediately ─────────────────────
         try:
             outcome = self.run_tool(call)
         except Exception as e:
             outcome = f"Error during self-repair call: {e}"
 
-        ctx.ctx_txt += f"\n[Self-repair] {call} ‚Üí {outcome}"
+        ctx.ctx_txt += f"\n[Self-repair] {call} → {outcome}"
 
-        # ‚îÄ‚îÄ 4Ô∏è‚É£  Re-queue the failed stage so it gets another chance ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        # ── 4️⃣  Re-queue the failed stage so it gets another chance ──────
         ctx._forced_next = [stage] + getattr(ctx, "_forced_next", [])
         # (no explicit return value)
+
 
     def _stage_checkpoint(self, ctx: Context):
         """
@@ -7055,7 +7064,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             ctx.ctx_txt += "[RL Exploration Enabled]\n"
         else:
             prompt = self.rl_manager.best_prompt(base_prompt)
-
         self.config_manager.config["system"] = prompt
 
         # 5) run the fractal pipeline (uses _expand for dynamic routing)
@@ -7072,15 +7080,18 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # (TTS of the final response is done only in _stage_final_inference)
         return resp
 
+
     def _run_fractal_pipeline(self, ctx: Context) -> str:
         """
         Fractal, queue-driven engine with tool-plan critique & retry.
         Uses _expand() to choose next stages dynamically.
         """
+        import inspect
+        from collections import deque
+
         run_id = ctx.run_id
         queue  = deque([ self._Stage("context_analysis") ])
 
-        # ensure we have a place to collect results/failures
         ctx.tool_failures = {}
         if not hasattr(ctx, "tool_summaries"):
             ctx.tool_summaries = []
@@ -7095,16 +7106,15 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             if cnt > 3:
                 continue
 
-            # dispatch to handler
             handler = getattr(self, f"_stage_{name}", None)
             if not handler:
                 continue
 
-            # ── notify callback of stage start
-            if getattr(ctx, "stage_callback", None):
+            # callback: announce stage name if no prior output this stage
+            if ctx.stage_callback:
                 try:
-                    ctx.stage_callback(name)
-                except Exception as _:
+                    ctx.stage_callback(f"[Stage] {name} …")
+                except Exception:
                     pass
 
             self.observer.log_stage_start(run_id, name)
@@ -7114,17 +7124,25 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             try:
                 result = handler(ctx, *args) if args else handler(ctx)
             except Exception as e:
-                # record failure & schedule self-repair
                 ctx.last_failure = {"type": "exception", "payload": str(e), "stage": name}
                 log_message(f"[{ctx.name}] '{name}' exception: {e}", "ERROR")
                 queue.appendleft(self._Stage("self_repair"))
+                self.observer.log_stage_end(run_id, name)
                 continue
             finally:
                 self.observer.log_stage_end(run_id, name)
 
-            # capture any string output
+            # if the handler returned a non-empty string, fire callback with it
             if isinstance(result, str) and result:
                 ctx.stage_outputs[name] = result
+                if ctx.stage_callback:
+                    try:
+                        ctx.stage_callback(result)
+                    except Exception:
+                        pass
+                # if this stage is final_inference, capture it
+                if name == "final_inference":
+                    ctx.final_response = result
 
             # special-case: execute_actions must run plan items
             if name == "execute_actions":
@@ -7137,12 +7155,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                         ctx.tool_failures[call] = str(e)
                         log_message(f"[{ctx.name}] tool execution failed for {call}: {e}", "ERROR")
                         break
-                # then enqueue whatever expand() says next
                 for nxt in self._expand(name, ctx):
                     queue.append(self._Stage(nxt))
                 continue
 
-            # regular expansion for everything else
+            # enqueue next stages
             for nxt in self._expand(name, ctx):
                 queue.append(self._Stage(nxt))
 
