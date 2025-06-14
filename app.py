@@ -8229,9 +8229,16 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             code = Tools.parse_tool_call(raw)
             if not code or code.upper() == "NO_TOOL":
                 break
+            # ────── NEW: skip calls we've already run this turn ──────
+            executed = ctx.setdefault("_executed_tools", set())
+            if code in executed:
+                log_message(f"[Tool chaining] Skipping duplicate call: {code}", "INFO")
+                continue              # try another suggestion instead
+            executed.add(code)
+            # ─────────────────────────────────────────────────────────
 
             fn = code.split("(", 1)[0]
-            if fn in invoked:
+            if fn in invoked:         # per-loop duplicate safety (old logic)
                 break
             invoked.add(fn)
 
