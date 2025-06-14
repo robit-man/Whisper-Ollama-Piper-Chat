@@ -4446,27 +4446,46 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         return True, "OK"
 
     # ------------------------------------------------------------------ #
-    #  Stage : self_repair                                               #
+    #  Stage : self_repair  (with automatic context-flush)               #
     # ------------------------------------------------------------------ #
     def _stage_self_repair(self, ctx: Context):
         """
         Examine ctx.last_failure (a dict injected by run_tool or any stage
         that throws) and try one automated fix **without user interaction**.
-        """
-        # fetch and clear the failure flag from the Context object
-        fail = getattr(ctx, "last_failure", None)
-        if not fail:
-            return  # nothing to do
-        delattr(ctx, "last_failure")
 
-        ftype   = fail.get("type")
-        payload = fail.get("payload")
-        stage   = fail.get("stage")
+        On every entry we ALSO prune ctx.ctx_txt to protect against unbounded
+        growth so that each turn starts from a fresh, compact context window.
+
+        Supported failure types out-of-the-box:
+        ‚Ä¢ missing_argument      ‚Üí ask the LLM to supply a literal value
+        ‚Ä¢ unknown_tool          ‚Üí call create_tool(‚Ä¶) stub generator
+        ‚Ä¢ runtime_error         ‚Üí retry once with sanitized args
+        """
+
+        # ‚îÄ‚îÄ 0Ô∏è‚É£  Quick exit if nothing to fix ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        fail = ctx.pop("last_failure", None)
+        if not fail:
+            return
+
+        # ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        #  A. *** Trim the context before doing anything else ***
+        #     ‚Äì keeps only the last ~2 000 tokens (‚âà 8 000-10 KB).
+        # ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        MAX_TOKENS   = 2_000                       # hard cap
+        ctx_lines    = (ctx.ctx_txt or "").split()
+        if len(ctx_lines) > MAX_TOKENS:
+            ctx.ctx_txt = "[Context truncated after self-repair]\n‚Ä¶ " \
+                          + " ".join(ctx_lines[-MAX_TOKENS:])
+        # ----------------------------------------------------------------
+
+        ftype   = fail["type"]
+        payload = fail["payload"]
+        stage   = fail["stage"]
         note    = f"[Self-repair] Detected {ftype} in {stage}: {payload}"
         ctx.ctx_txt += "\n" + note
         log_message(note, "WARNING")
 
-        # 1️⃣ Try to synthesise a corrective tool-call via LLM -------------
+        # 1Ô∏è‚É£  Try to synthesise a corrective tool-call via LLM ------------
         prompt = textwrap.dedent(f"""
             You are the SELF-REPAIR AGENT.
 
@@ -4476,11 +4495,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             stage  : {stage}
 
             Available helpers (ONE call only):
-            • search_internet(query)
-            • create_tool(name, code, overwrite=True)
-            • run_tool_once("foo(arg=123)")
-            • get_current_date()
-            • NO_OP  (if you cannot fix this)
+            ‚Ä¢ search_internet(query)
+            ‚Ä¢ create_tool(name, code, overwrite=True)
+            ‚Ä¢ run_tool_once("foo(arg=123)")
+            ‚Ä¢ get_current_date()
+            ‚Ä¢ NO_OP  (if you cannot fix this)
 
             Return exactly one ```tool_code``` block.
         """).strip()
@@ -4492,24 +4511,22 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         )["message"]["content"]
 
         call = Tools.parse_tool_call(raw)
-        if not call or call.upper() == "NO_OP":
+        if not call or call.upper() == "NO_TOOL":
             ctx.ctx_txt += "\n[Self-repair] No automated fix available."
             return
 
-        # 2️⃣ Execute the proposed fix immediately -------------------------
+        # 2Ô∏è‚É£  Execute the proposed fix immediately ------------------------
         try:
             out = self.run_tool(call)
         except Exception as e:
             out = f"Error during self-repair call: {e}"
 
-        ctx.ctx_txt += f"\n[Self-repair] {call} → {out}"
+        ctx.ctx_txt += f"\n[Self-repair] {call} ‚Üí {out}"
 
-        # 3️⃣ Re-queue the stage that failed so it gets a second chance ----
-        existing = getattr(ctx, "_forced_next", [])
-        ctx._forced_next = [stage] + existing
-        return
+        # 3Ô∏è‚É£  Re-queue the failed stage so it gets a second chance ---------
+        ctx._forced_next = [stage] + (getattr(ctx, "_forced_next", []))
 
-
+        # nothing to return
 
     def _stage_checkpoint(self, ctx: Context):
         """
