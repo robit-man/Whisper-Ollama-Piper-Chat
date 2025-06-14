@@ -4446,67 +4446,65 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         return True, "OK"
 
     # ------------------------------------------------------------------ #
-    #  Stage : self_repair  (with automatic context-flush)               #
+    #  Stage : self_repair  (now attr-safe + context-trim)               #
     # ------------------------------------------------------------------ #
     def _stage_self_repair(self, ctx: Context):
         """
-        Examine ctx.last_failure (a dict injected by run_tool or any stage
-        that throws) and try one automated fix **without user interaction**.
+        ‚Ä¢ Attempts one automated fix for whatever is stored in ctx.last_failure.
+        ‚Ä¢ Each time it runs it ALSO trims ctx.ctx_txt to a fixed window so the
+          context never grows without bound.
 
-        On every entry we ALSO prune ctx.ctx_txt to protect against unbounded
-        growth so that each turn starts from a fresh, compact context window.
-
-        Supported failure types out-of-the-box:
-        ‚Ä¢ missing_argument      ‚Üí ask the LLM to supply a literal value
-        ‚Ä¢ unknown_tool          ‚Üí call create_tool(‚Ä¶) stub generator
-        ‚Ä¢ runtime_error         ‚Üí retry once with sanitized args
+        Supported failure types (unchanged):
+            missing_argument | unknown_tool | runtime_error | incomplete_plan
         """
 
-        # ‚îÄ‚îÄ 0Ô∏è‚É£  Quick exit if nothing to fix ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
-        fail = ctx.pop("last_failure", None)
+        # ‚îÄ‚îÄ 0Ô∏è‚É£  Pull & clear the failure record safely ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        fail = getattr(ctx, "last_failure", None)
         if not fail:
             return
+        try:
+            delattr(ctx, "last_failure")
+        except AttributeError:
+            pass   # ctx might be a dict-like shim; safe to ignore
 
         # ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
-        #  A. *** Trim the context before doing anything else ***
-        #     ‚Äì keeps only the last ~2 000 tokens (‚âà 8 000-10 KB).
+        #  A. Trim the running context log BEFORE doing any heavy work
         # ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
-        MAX_TOKENS   = 2_000                       # hard cap
-        ctx_lines    = (ctx.ctx_txt or "").split()
-        if len(ctx_lines) > MAX_TOKENS:
-            ctx.ctx_txt = "[Context truncated after self-repair]\n‚Ä¶ " \
-                          + " ".join(ctx_lines[-MAX_TOKENS:])
-        # ----------------------------------------------------------------
+        MAX_TOKENS = 2_000                     # tweak as you like
+        ctx_txt    = getattr(ctx, "ctx_txt", "")
+        tokens     = ctx_txt.split()
+        if len(tokens) > MAX_TOKENS:
+            ctx.ctx_txt = (
+                "[Context truncated after self-repair]\n‚Ä¶ "
+                + " ".join(tokens[-MAX_TOKENS:])
+            )
 
-        ftype   = fail["type"]
-        payload = fail["payload"]
-        stage   = fail["stage"]
-        note    = f"[Self-repair] Detected {ftype} in {stage}: {payload}"
+        # ‚îÄ‚îÄ 1Ô∏è‚É£  Log the failure we‚Äôre about to handle ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        ftype, payload, stage = fail.get("type"), fail.get("payload"), fail.get("stage")
+        note = f"[Self-repair] Detected {ftype} in {stage}: {payload}"
         ctx.ctx_txt += "\n" + note
         log_message(note, "WARNING")
 
-        # 1Ô∏è‚É£  Try to synthesise a corrective tool-call via LLM ------------
+        # ‚îÄ‚îÄ 2Ô∏è‚É£  Ask the LLM for ONE corrective helper call ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
         prompt = textwrap.dedent(f"""
             You are the SELF-REPAIR AGENT.
 
             Failure details:
-            type   : {ftype}
-            payload: {payload!r}
-            stage  : {stage}
+              ‚Ä¢ type   : {ftype}
+              ‚Ä¢ payload: {payload!r}
+              ‚Ä¢ stage  : {stage}
 
-            Available helpers (ONE call only):
-            ‚Ä¢ search_internet(query)
-            ‚Ä¢ create_tool(name, code, overwrite=True)
-            ‚Ä¢ run_tool_once("foo(arg=123)")
-            ‚Ä¢ get_current_date()
-            ‚Ä¢ NO_OP  (if you cannot fix this)
-
-            Return exactly one ```tool_code``` block.
+            Allowed helpers (return exactly ONE inside ```tool_code```):
+              ‚Ä¢ search_internet(query)
+              ‚Ä¢ create_tool(name, code, overwrite=True)
+              ‚Ä¢ run_tool_once("foo(arg=123)")
+              ‚Ä¢ get_current_date()
+              ‚Ä¢ NO_TOOL   (if you cannot fix this)
         """).strip()
 
         raw = chat(
             model=self.config_manager.config["secondary_model"],
-            messages=[{"role":"system","content":prompt}],
+            messages=[{"role": "system", "content": prompt}],
             stream=False
         )["message"]["content"]
 
@@ -4515,18 +4513,17 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             ctx.ctx_txt += "\n[Self-repair] No automated fix available."
             return
 
-        # 2Ô∏è‚É£  Execute the proposed fix immediately ------------------------
+        # ‚îÄ‚îÄ 3Ô∏è‚É£  Execute the proposed fix immediately ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
         try:
-            out = self.run_tool(call)
+            outcome = self.run_tool(call)
         except Exception as e:
-            out = f"Error during self-repair call: {e}"
+            outcome = f"Error during self-repair call: {e}"
 
-        ctx.ctx_txt += f"\n[Self-repair] {call} ‚Üí {out}"
+        ctx.ctx_txt += f"\n[Self-repair] {call} ‚Üí {outcome}"
 
-        # 3Ô∏è‚É£  Re-queue the failed stage so it gets a second chance ---------
-        ctx._forced_next = [stage] + (getattr(ctx, "_forced_next", []))
-
-        # nothing to return
+        # ‚îÄ‚îÄ 4Ô∏è‚É£  Re-queue the failed stage so it gets another chance ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        ctx._forced_next = [stage] + getattr(ctx, "_forced_next", [])
+        # (no explicit return value)
 
     def _stage_checkpoint(self, ctx: Context):
         """
