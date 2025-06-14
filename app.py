@@ -3821,10 +3821,23 @@ class WatchdogManager:
         # tokenizer for token-based slicing
         self._tokenizer = tiktoken.get_encoding("cl100k_base")
 
+    # NEW (1) – give the watchdog a handle to RLManager once, at start-up
+    def bind_rl_manager(self, rl_manager: "RLManager"):
+        self._rl = rl_manager            # weak ref; no other changes needed
+
+    # ------------------------------------------------------------------
+    #  Quality / health evaluation  (REPLACEMENT)
+    # ------------------------------------------------------------------
     def evaluate_run(self, ctx) -> tuple[float, list[str]]:
+        """
+        • Rate the run with a quality-LLM (unchanged logic)
+        • Immediately ask RLManager to sweep & self-repair.
+          Any fixes are surfaced as suggestions for stage tweaks.
+        """
+        # ---------- original quality rating ----------
         report = {
-            "stages":         ctx.stage_counts,
-            "ctx_txt":        ctx.ctx_txt[:2000],
+            "stages":  ctx.stage_counts,
+            "ctx_txt": ctx.ctx_txt[:2000],
             "final_response": ctx.final_response
         }
         system = (
@@ -3835,17 +3848,28 @@ class WatchdogManager:
             "Output JSON: {\"score\": float, \"suggestions\": [strings]}."
         )
         user = f"Run report:\n```json\n{json.dumps(report, indent=2)}\n```"
-        resp = chat(
-            model=self.quality_model,
-            messages=[{"role":"system","content":system},
-                      {"role":"user","content":user}],
-            stream=False
-        )["message"]["content"]
         try:
+            resp = chat(
+                model=self.quality_model,
+                messages=[{"role":"system","content":system},
+                          {"role":"user","content":user}],
+                stream=False
+            )["message"]["content"]
             out = json.loads(resp)
-            return float(out.get("score", 0.0)), out.get("suggestions", [])
-        except:
-            return 0.0, []
+            score = float(out.get("score", 0.0))
+            suggestions = out.get("suggestions", [])
+        except Exception as e:
+            log_message(f"[Watchdog] quality-LLM parse error: {e}", "ERROR")
+            score, suggestions = 0.0, []
+
+        # ---------- NEW (2) – RLManager hygiene & learning ----------
+        if hasattr(self, "_rl"):
+            if self._rl.self_repair():            # light consistency sweep
+                suggestions.append("RLManager state auto-repaired")
+            if self._rl.digest_recent_tool_events():   # learn tool fixes
+                suggestions.append("Tool-usage rules updated")
+
+        return score, suggestions
 
     def monitor_stream(self, stream_generator, ctx):
         """
@@ -3977,6 +4001,46 @@ class RLManager:
     def __init__(self):
         self.history = []             # list[ (prompt: str, stages: list[str], reward: float) ]
         self.last_selected = None     # last (prompt, stages) returned by select()
+
+    # ------------------------------------------------------------------ #
+    #  Integrity-check invoked by watchdog self-tests                    #
+    # ------------------------------------------------------------------ #
+    def self_repair(self, *_, **__) -> list[str]:
+        """
+        Sweep the internal history for malformed rows, reward outliers,
+        or window overflow.
+
+        Returns a list of human-readable notes describing each fix.
+        An empty list ⇒ nothing needed fixing.
+        """
+        notes, cleaned = [], []
+
+        for rec in self.history:
+            if (isinstance(rec, tuple) and len(rec) == 3 and
+                isinstance(rec[0], str) and isinstance(rec[1], list) and
+                isinstance(rec[2], (int, float))):
+                prompt, stages, reward = rec
+                # clip extreme rewards
+                if reward < -1e6 or reward > 1e6:
+                    reward = max(min(reward, 1e6), -1e6)
+                    notes.append("clipped extreme reward")
+                cleaned.append((prompt, stages, reward))
+            else:
+                notes.append("dropped malformed record")
+
+        # enforce rolling window
+        if len(cleaned) > self.WINDOW:
+            cleaned = cleaned[-self.WINDOW:]
+            notes.append("trimmed history window")
+
+        self.history = cleaned
+        return notes
+    # ────────────────────────────────────────────────────────────────
+    # 2. stub for future learning from tool telemetry (safe no-op)
+    # ────────────────────────────────────────────────────────────────
+    def digest_recent_tool_events(self) -> list[str]:
+        """Placeholder: return [] until you wire actual telemetry in."""
+        return []
 
     def record(self, prompt: str, stages: list[str], reward: float):
         """
@@ -4361,11 +4425,26 @@ class ChatManager:
         self.memory_manager   = memory_manager
         self.mode_manager     = mode_manager
 
-        # Observability & learning
-        real_obs              = Observer()
-        self.observer         = ObservabilityManager(real_obs)
+        # ───────────────────────────────────────────────────────────────
+        # Learning & observability singletons
+        # ───────────────────────────────────────────────────────────────
+        self.rl_manager = RLManager()                     # ① create RL first
 
-        self.rl_manager       = RLManager()
+        quality_model   = self.config_manager.config.get( # ② pick the model
+            "secondary_model",                            #   fallback → primary
+            self.config_manager.config.get("primary_model")
+        )
+
+        real_obs  = Observer()
+        self.observer = ObservabilityManager(real_obs)
+
+        # Bind RLManager + quality model into the watchdog (if present)
+        if hasattr(self.observer, "watchdog"):
+            wd = self.observer.watchdog
+            wd._rl = self.rl_manager                      # ③ give watchdog RL
+            wd.quality_model  = quality_model             # ④ set scoring model
+            wd.halluc_model   = quality_model             #     (same for now)
+        
         self.prompt_evaluator = PromptEvaluator()
         self._temp_bump       = 0.0
 
@@ -8192,14 +8271,27 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
     # Stage 9: assemble_prompt
     # ------------------------------
     def _stage_assemble_prompt(self, ctx):
+        import json
+
+        # 1) Context narrative block
         assembled = f"```context_analysis\n{ctx['ctx_txt'].strip()}\n```"
+
+        # 2) Tool output block  (coerce every item to str)
         if ctx["tool_summaries"]:
-            assembled += "\n```tool_output\n" + "\n\n".join(ctx["tool_summaries"]) + "\n```"
+            to_str = [
+                s if isinstance(s, str) else json.dumps(s, indent=2)
+                for s in ctx["tool_summaries"]
+            ]
+            assembled += "\n```tool_output\n" + "\n\n".join(to_str) + "\n```"
+
+        # 3) Current user message
         assembled += "\n" + ctx["user_message"]
-        # record & embed
+
+        # 4) Book-keep & embed
         self.history_manager.add_entry("user", assembled)
         _ = Utils.embed_text(assembled)
-        log_message(f"Final prompt prepared", "DEBUG")
+
+        log_message("Final prompt prepared", "DEBUG")
         ctx["assembled"] = assembled
         return None
     
