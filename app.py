@@ -943,121 +943,139 @@ os.makedirs(TTS_OUTPUT_DIR, exist_ok=True)
 
 class TTSManager:
     """
-    Dual‐mode TTS:
+    Dual-mode TTS:
       • live: speak immediately via Piper.
-      • file: synthesize to .ogg files for external delivery.
-    Toggle at runtime with set_mode("live") or set_mode("file").
+      • file: buffer all texts and synthesize a single .ogg for delivery.
+    Switch with set_mode("live") or set_mode("file").
     """
     def __init__(self):
-        self._mode    = "live"          # or "file"
-        self._queue   = Queue()         # items = (text:str, callback:Optional[callable])
-        self._event   = threading.Event()
-        self._lock    = threading.Lock()
-        self._files   = []              # generated .ogg files
-        self._running = True
+        self._mode          = "live"       # or "file"
+        self._live_queue    = Queue()      # only for live-mode items
+        self._pending_texts = []           # buffer for file-mode
+        self._last_text     = None         # to dedupe repeats
+        self._lock          = threading.Lock()
+        self._running       = True
 
-        threading.Thread(target=self._worker, daemon=True).start()
+        # start live-playback worker
+        threading.Thread(target=self._live_worker, daemon=True).start()
 
     def set_mode(self, mode: str):
         if mode not in ("live", "file"):
             raise ValueError("TTS mode must be 'live' or 'file'")
         log_message(f"TTS mode switching to: {mode}", "INFO")
-        # flush any previous state
+        # clear out any old state
         with self._lock:
-            self._files.clear()
-            self._event.clear()
+            self._pending_texts.clear()
+            self._last_text = None
         while True:
-            try:
-                self._queue.get_nowait()
+            try:    self._live_queue.get_nowait()
             except Empty:
                 break
         self._mode = mode
 
     def enqueue(self, text: str):
+        """In live mode → queue for immediate play. In file mode → buffer for one OGG."""
         if not text:
             return
-        mode = self._mode
-        log_message(f"Enqueue TTS ({mode}): {text}", "INFO")
-        # live mode uses a dummy callback to go into _do_live branch
-        callback = (lambda _: None) if mode == "live" else None
-        self._queue.put((text, callback))
+        cleaned = clean_text(re.sub(r"[\*#~]", "", text)).strip()
+        if not cleaned:
+            return
+
+        if self._mode == "live":
+            log_message(f"Enqueue TTS (live): {cleaned}", "INFO")
+            # push into live queue with dummy callback
+            self._live_queue.put((cleaned, lambda _: None))
+        else:
+            # file mode: buffer, skip duplicates
+            with self._lock:
+                if cleaned != self._last_text:
+                    self._pending_texts.append(cleaned)
+                    self._last_text = cleaned
+                    log_message(f"Enqueue TTS (file): {cleaned}", "INFO")
+                else:
+                    log_message("Skipping duplicate TTS in file buffer", "DEBUG")
 
     def wait_for_latest_ogg(self, timeout: float = 30.0) -> str:
-        if not self._event.wait(timeout):
-            raise TimeoutError("No new TTS file within timeout")
-        with self._lock:
-            if not self._files:
-                raise RuntimeError("Signaled but no file recorded")
-            path = self._files.pop(0)
-            if not self._files:
-                self._event.clear()
-            return path
+        """
+        Produce—and return the path to—a single .ogg containing ALL buffered texts.
+        Blocks until at least one text has been enqueued, or raises TimeoutError.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                if self._pending_texts:
+                    batch = self._pending_texts[:]
+                    self._pending_texts.clear()
+                    self._last_text = None
+                    break
+            time.sleep(0.05)
+        else:
+            raise TimeoutError("No TTS texts to synthesize within timeout")
+
+        combined = "\n".join(batch)
+        fname   = f"{datetime.utcnow():%Y%m%dT%H%M%S}_{uuid.uuid4().hex}.ogg"
+        outpath = os.path.join(TTS_OUTPUT_DIR, fname)
+
+        try:
+            log_message(f"[TTS file] Synthesizing combined text to: {outpath}", "INFO")
+            process_tts_request(combined, outpath)
+
+            # wait for file to finish writing
+            prev_sz = -1
+            for _ in range(20):
+                if os.path.exists(outpath):
+                    sz = os.path.getsize(outpath)
+                    if sz > 0 and sz == prev_sz:
+                        break
+                    prev_sz = sz
+                time.sleep(0.1)
+            else:
+                raise RuntimeError(f"TTS file never stabilized: {outpath}")
+
+            log_message(f"[TTS file] Ready: {outpath}", "SUCCESS")
+            return outpath
+
+        except Exception as e:
+            log_message(f"[TTS file] Error synthesizing: {e}", "ERROR")
+            raise
 
     def stop(self):
+        """Shutdown the live-playback worker and clear everything."""
         log_message("Stopping TTS worker.", "PROCESS")
         self._running = False
-        self._queue.put((None, None))
-        self._event.set()
-        # clear queue
-        while True:
-            try: self._queue.get_nowait()
-            except Empty: break
+        # wake up worker
+        self._live_queue.put((None, None))
+        with self._lock:
+            self._pending_texts.clear()
+            self._last_text = None
 
     def start(self):
+        """(Re)start the TTS manager if it was stopped."""
         log_message("Starting TTS worker.", "PROCESS")
         self._running = True
 
-    def _worker(self):
-        log_message("TTS worker thread started.", "DEBUG")
+    def _live_worker(self):
+        """Background thread: drain live-queue and play immediately."""
+        log_message("TTS live-worker thread started.", "DEBUG")
         while self._running:
-            item = self._queue.get()
+            item = self._live_queue.get()
             if item is None or item == (None, None):
-                self._queue.task_done()
+                self._live_queue.task_done()
                 break
 
             text, callback = item
-            cleaned = clean_text(re.sub(r"[\*#~]", "", text))
-
-            # ─── live mode ───
-            if callback is not None:
-                try:
-                    self._do_live(cleaned)
-                    callback(None)
-                except Exception as e:
-                    log_message(f"TTS live error: {e}", "ERROR")
-                finally:
-                    self._queue.task_done()
-                continue
-
-            # ─── file mode ───
-            fname   = f"{datetime.utcnow():%Y%m%dT%H%M%S}_{uuid.uuid4().hex}.ogg"
-            outpath = os.path.join(TTS_OUTPUT_DIR, fname)
             try:
-                process_tts_request(cleaned, outpath)
-
-                prev_sz = -1
-                for _ in range(20):
-                    if os.path.exists(outpath):
-                        sz = os.path.getsize(outpath)
-                        if sz > 0 and sz == prev_sz:
-                            break
-                        prev_sz = sz
-                    time.sleep(0.1)
-                else:
-                    raise RuntimeError(f"TTS file never stabilized: {outpath}")
-
-                log_message(f"[TTS] File ready: {outpath}", "INFO")
-                with self._lock:
-                    self._files.append(outpath)
-                    self._event.set()
-
+                self._do_live(text)
+                callback(None)
             except Exception as e:
-                log_message(f"[TTS] file‐mode error: {e}", "ERROR")
-                time.sleep(1)
+                log_message(f"TTS live error: {e}", "ERROR")
             finally:
-                self._queue.task_done()
+                self._live_queue.task_done()
 
     def _do_live(self, cleaned: str):
+        """
+        Exactly same as your previous Piper→aplay code for immediate playback.
+        """
         volume     = config.get("tts_volume", 0.2)
         script_dir = os.path.dirname(os.path.abspath(__file__))
         piper_exe  = os.path.join(script_dir, "piper", "piper")
@@ -1069,40 +1087,41 @@ class TTSManager:
             cmd_piper.insert(3, "--debug")
         cmd_aplay = ["aplay", "--buffer-size=777", "-r", "22050", "-f", "S16_LE"]
 
-        payload = json.dumps({
-            "text": cleaned,
+        payload = __import__("json").dumps({
+            "text":   cleaned,
             "config": onnx_json,
-            "model": onnx_model
+            "model":  onnx_model
         })
         log_message(f"[TTS live] Playing: {cleaned!r}", "INFO")
 
         try:
+            import numpy as np
             with tts_lock:
                 stderr_dest = subprocess.PIPE if TTS_DEBUG else subprocess.DEVNULL
-                proc       = subprocess.Popen(cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_dest)
-                proc_aplay = subprocess.Popen(cmd_aplay, stdin=subprocess.PIPE)
+                p1 = subprocess.Popen(cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_dest)
+                p2 = subprocess.Popen(cmd_aplay, stdin=subprocess.PIPE)
 
-            proc.stdin.write(payload.encode("utf-8"))
-            proc.stdin.close()
+            p1.stdin.write(payload.encode("utf-8"))
+            p1.stdin.close()
 
             def adjust(chunk: bytes) -> bytes:
                 arr = np.frombuffer(chunk, dtype=np.int16).astype(float) * volume
                 return np.clip(arr, -32768, 32767).astype(np.int16).tobytes()
 
             while True:
-                chunk = proc.stdout.read(4096)
+                chunk = p1.stdout.read(4096)
                 if not chunk:
                     break
                 if volume != 1.0:
                     chunk = adjust(chunk)
-                proc_aplay.stdin.write(chunk)
+                p2.stdin.write(chunk)
 
-            proc_aplay.stdin.close()
-            proc.wait()
-            proc_aplay.wait()
+            p2.stdin.close()
+            p1.wait()
+            p2.wait()
 
             if TTS_DEBUG:
-                err = proc.stderr.read().decode(errors="ignore").strip()
+                err = p1.stderr.read().decode(errors="ignore").strip()
                 if err:
                     log_message("[Piper STDERR] " + err, "ERROR")
 
@@ -6291,7 +6310,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             self._idle_stop.set()
             log_message("Idle monitor stopped.", "INFO")
 
-
     # ----------------------------------------
     # NEW: Chain-of-Thought Agent
     # ----------------------------------------
@@ -6318,7 +6336,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             try:
                 with open(thoughts_path, "r", encoding="utf-8") as f:
                     prior = json.load(f)
-            except:
+            except Exception:
                 prior = []
 
         # 2) Prepare the prompt for the reflection agent
@@ -6337,11 +6355,10 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             "Be precise, avoid filler, and use direct, active language."
         )
 
-
         # Format prior reflections as bullets
         if prior:
             prior_block = "\n".join(
-                f"{i+1}. {entry['chain_of_thought']}"
+                f"{i+1}. {entry.get('chain_of_thought', str(entry))}"
                 for i, entry in enumerate(prior)
             )
         else:
@@ -6358,17 +6375,34 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             stages.append(f"Memory summary: {memory_summary}")
         if planning_summary:
             stages.append(f"Planning summary: {planning_summary}")
-        if tool_summaries:
-            stages.append("Tool outputs:\n" + "\n".join(tool_summaries))
+
+        # Safely stringify tool_summaries (in case any items are dicts)
+        safe_tools: list[str] = []
+        for ts in tool_summaries or []:
+            if isinstance(ts, dict):
+                if "summary" in ts:
+                    safe_tools.append(str(ts["summary"]))
+                elif "content" in ts:
+                    safe_tools.append(str(ts["content"]))
+                else:
+                    safe_tools.append(json.dumps(ts))
+            else:
+                safe_tools.append(str(ts))
+        if safe_tools:
+            stages.append("Tool outputs:")
+            for s in safe_tools:
+                stages.append(f"  - {s}")
+
         stages.append(f"Final response: {final_response}")
 
+        # Build the new-block bullet list
         new_block = "\n".join(f"- {s}" for s in stages)
 
         # 3) Call the secondary model
         payload = [
-            {"role": "system",  "content": system},
+            {"role": "system",    "content": system},
             {"role": "assistant", "content": f"Prior reflections:\n{prior_block}"},
-            {"role": "user",    "content": f"New stages:\n{new_block}\n\nPlease append the next reflection to the narrative."}
+            {"role": "user",      "content": f"New stages:\n{new_block}\n\nPlease append the next reflection to the narrative."}
         ]
         resp = chat(
             model=self.config_manager.config["secondary_model"],
@@ -6377,8 +6411,8 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         )["message"]["content"].strip()
 
         # 4) Return just the new reflection (no numbering)
-        #    The calling code will append it to thoughts.json.
         return resp
+
 
     # ----------------------------------------
     # NEW: Notification & Audit
