@@ -166,9 +166,14 @@ if not os.path.exists(SETUP_MARKER):
     if sys.platform.startswith("linux") and shutil.which("apt-get"):
         try:
             subprocess.check_call(["sudo", "apt-get", "update"])
-            subprocess.check_call(["sudo", "apt-get", "install", "-y", "libsqlite3-dev"])
+            # install both sqlite3-dev and ffmpeg in one go
+            subprocess.check_call([
+                "sudo", "apt-get", "install", "-y",
+                "libsqlite3-dev",
+                "ffmpeg"
+            ])
         except subprocess.CalledProcessError as e:
-            log_message(f"Failed to install libsqlite3-dev: {e}", "ERROR")
+            log_message(f"Failed to install system packages: {e}", "ERROR")
             sys.exit(1)
 
     # 2) Python-level dependencies
