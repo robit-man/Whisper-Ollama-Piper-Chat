@@ -1,6 +1,7 @@
 whisper_env
 piper
 external_tools
+tts_output
 workspace
 chat_sessions
 .setup_complete

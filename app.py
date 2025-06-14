@@ -328,6 +328,8 @@ import os, shutil, random, platform, json
 import inspect
 import asyncio
 from typing import Callable
+from queue import Queue, Empty
+import uuid
 
 # ── Database / Knowledge Graph
 import sqlite3
@@ -477,15 +479,19 @@ def flush_current_tts():
                 log_message(f"Error killing aplay process: {e}", "ERROR")
             current_tts_process = None
 
-# This function processes a text-to-speech request using Piper.
-def process_tts_request(text: str):
-    volume    = config.get("tts_volume", 0.2)
+def process_tts_request(text: str, outpath: str):
+    """
+    • Runs Piper → raw PCM
+    • Pipes into oggenc to create a valid .ogg at `outpath`
+    • Also plays locally via aplay if desired
+    """
+    volume     = config.get("tts_volume", 0.2)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     piper_exe  = os.path.join(script_dir, "piper", "piper")
     onnx_json  = os.path.join(script_dir, config["onnx_json"])
     onnx_model = os.path.join(script_dir, config["onnx_model"])
 
-    # Verify that necessary files exist
+    # 1) Sanity checks
     for path, desc in [
         (piper_exe,  "Piper executable"),
         (onnx_json,  "ONNX JSON file"),
@@ -495,72 +501,100 @@ def process_tts_request(text: str):
             log_message(f"Error: {desc} not found at {path}", "ERROR")
             return
 
-    payload     = {"text": text, "config": onnx_json, "model": onnx_model}
-    payload_str = json.dumps(payload)
+    payload_str = json.dumps({"text": text, "config": onnx_json, "model": onnx_model})
+    log_message(f"[TTS] Synthesizing → {outpath}", "INFO")
 
-    # Build Piper command; include --debug only if TTS_DEBUG
+    # Ensure target directory exists
+    os.makedirs(os.path.dirname(outpath), exist_ok=True)
+
+    # Build commands:
+    # • Piper: JSON in → raw PCM out
+    # • oggenc: read PCM → encode to .ogg
+    # • aplay: optional local playback
     cmd_piper = [piper_exe, "-m", onnx_model, "--json-input", "--output_raw"]
     if TTS_DEBUG:
         cmd_piper.insert(3, "--debug")
 
+    # oggenc expects signed 16-bit LE WAV header or raw?
+    # We'll wrap PCM into WAV header on the fly via ffmpeg for simplicity.
+    cmd_ffmpeg = [
+        "ffmpeg", "-f", "s16le", "-ar", "22050", "-ac", "1", "-i", "pipe:0",
+        "-c:a", "libvorbis", "-qscale:a", "5", outpath
+    ]
+
     cmd_aplay = ["aplay", "--buffer-size=777", "-r", "22050", "-f", "S16_LE"]
 
-    log_message(f"[TTS] Synthesizing: '{text}'", "INFO")
     try:
         with tts_lock:
             stderr_dest = subprocess.PIPE if TTS_DEBUG else subprocess.DEVNULL
-            proc = subprocess.Popen(
-                cmd_piper,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=stderr_dest
+
+            # 1️⃣ Start Piper
+            proc_piper = subprocess.Popen(
+                cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_dest
             )
+            # 2️⃣ Start FFmpeg encoder (reads Piper stdout, writes .ogg)
+            proc_ffmpeg = subprocess.Popen(
+                cmd_ffmpeg, stdin=proc_piper.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            # 3️⃣ Optional local playback
             proc_aplay = subprocess.Popen(cmd_aplay, stdin=subprocess.PIPE)
+
             global current_tts_process
-            current_tts_process = (proc, proc_aplay)
+            current_tts_process = (proc_piper, proc_ffmpeg, proc_aplay)
             _tts_debug("TTS processes started.")
 
-        # send payload
-        proc.stdin.write(payload_str.encode("utf-8"))
-        proc.stdin.close()
+        # Feed Piper its JSON payload
+        proc_piper.stdin.write(payload_str.encode("utf-8"))
+        proc_piper.stdin.close()
 
-        def adjust_volume(data: bytes, vol: float) -> bytes:
-            samples   = np.frombuffer(data, dtype=np.int16)
-            adjusted  = samples.astype(np.float32) * vol
-            clipped   = np.clip(adjusted, -32768, 32767)
-            return clipped.astype(np.int16).tobytes()
+        # Volume adjust & tee to aplay
+        def adjust_and_play():
+            chunk_size = 4096
+            while True:
+                chunk = proc_piper.stdout.read(chunk_size)
+                if not chunk:
+                    break
+                # volume
+                if volume != 1.0:
+                    samples  = np.frombuffer(chunk, dtype=np.int16)
+                    adj      = (samples.astype(np.float32) * volume).clip(-32768,32767).astype(np.int16)
+                    chunk    = adj.tobytes()
+                proc_aplay.stdin.write(chunk)
+            proc_aplay.stdin.close()
+            proc_aplay.wait()
 
-        # stream audio through aplay
-        chunk_size = 4096
-        while True:
-            chunk = proc.stdout.read(chunk_size)
-            if not chunk:
-                break
-            if volume != 1.0:
-                chunk = adjust_volume(chunk, volume)
-            proc_aplay.stdin.write(chunk)
+        # Run adjust/play in thread so ffmpeg can consume stdout in parallel
+        play_thread = threading.Thread(target=adjust_and_play, daemon=True)
+        play_thread.start()
 
-        proc_aplay.stdin.close()
-        proc_aplay.wait()
-        proc.wait()
+        # Wait for piper → then ffmpeg → then play
+        proc_piper.wait()
+        proc_ffmpeg.wait()
+        play_thread.join()
 
         with tts_lock:
             current_tts_process = None
 
-        # only read & log Piper’s stderr if debugging
+        # If debugging, dump Piper stderr
         if TTS_DEBUG:
-            stderr_output = proc.stderr.read().decode("utf-8", errors="ignore").strip()
-            if stderr_output:
-                log_message("[Piper STDERR]: " + stderr_output, "ERROR")
+            stderr = proc_piper.stderr.read().decode("utf-8", errors="ignore").strip()
+            if stderr:
+                log_message("[Piper STDERR]: " + stderr, "ERROR")
 
     except Exception as e:
         log_message("Error during TTS processing: " + str(e), "ERROR")
 
-# This function starts the TTS worker thread that processes text-to-speech requests from the queue.
-def tts_worker(q):
-    import re
 
+# ────────── Shared structures (must be exactly the same names your worker uses) ──────────
+tts_queue  : Queue[str]      = Queue()
+_tts_event : threading.Event = threading.Event()
+_tts_files : list[str]       = []
+_tts_lock  : threading.Lock  = threading.Lock()
+
+def tts_worker(q: Queue):
+    import re
     log_message("TTS worker thread started.", "DEBUG")
+
     while True:
         text = q.get()
         if text is None:
@@ -568,12 +602,53 @@ def tts_worker(q):
             q.task_done()
             break
 
-        # Sanitize out unwanted symbols (asterisks, hashtags, tildes, etc.)
-        removeSymbols = re.sub(r'[\*#~]', '', text)
-        cleaned = clean_text(removeSymbols)
-        process_tts_request(cleaned)
-        q.task_done()
+        # sanitize & clean
+        no_symbols = re.sub(r"[\*#~]", "", text)
+        cleaned    = clean_text(no_symbols)
 
+        # pick unique filename
+        fname   = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex}.ogg"
+        outdir  = os.path.join(os.getcwd(), "tts_output")
+        os.makedirs(outdir, exist_ok=True)
+        outpath = os.path.join(outdir, fname)
+
+        try:
+            # your existing synth call must accept outpath:
+            process_tts_request(cleaned, outpath)
+
+            # verify
+            if not os.path.exists(outpath) or os.path.getsize(outpath) == 0:
+                raise RuntimeError(f"Empty TTS file: {outpath}")
+
+            # record & signal
+            with _tts_lock:
+                _tts_files.append(outpath)
+                _tts_event.set()
+
+            log_message(f"[TTS] Wrote audio: {outpath}", "INFO")
+
+        except Exception as e:
+            log_message(f"[TTS worker] synthesis error: {e}", "ERROR")
+
+        finally:
+            q.task_done()
+
+def wait_for_latest_ogg(timeout: float = None) -> str:
+    """
+    Block until the next .ogg file is available, then return its path.
+    Raises TimeoutError on timeout.
+    """
+    got = _tts_event.wait(timeout)
+    if not got:
+        raise TimeoutError("No new TTS file within timeout")
+
+    with _tts_lock:
+        if not _tts_files:
+            raise RuntimeError("Signaled but no file present")
+        path = _tts_files.pop(0)
+        if not _tts_files:
+            _tts_event.clear()
+        return path
 
 # This function is an audio callback that processes audio input from the microphone.
 def audio_callback(indata, frames, time_info, status):
@@ -858,17 +933,176 @@ class HistoryManager:
         self.history.append(entry)
         log_message(f"History entry added for role '{role}'.", "INFO")
 
-# This class manages the text-to-speech (TTS) functionality, allowing text to be enqueued for processing.
+TTS_OUTPUT_DIR = os.path.join(os.getcwd(), "tts_output")
+os.makedirs(TTS_OUTPUT_DIR, exist_ok=True)
+
 class TTSManager:
-    def enqueue(self, text):
-        log_message(f"Enqueuing text for TTS: {text}", "INFO")
-        tts_queue.put(text)
+    """
+    Dual‐mode TTS:
+      • live: speak immediately via Piper.
+      • file: synthesize to .ogg files for external delivery.
+    Toggle at runtime with set_mode("live") or set_mode("file").
+    """
+    def __init__(self):
+        self._mode    = "live"          # or "file"
+        self._queue   = Queue()         # items = (text:str, callback:Optional[callable])
+        self._event   = threading.Event()
+        self._lock    = threading.Lock()
+        self._files   = []              # generated .ogg files
+        self._running = True
+
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def set_mode(self, mode: str):
+        if mode not in ("live", "file"):
+            raise ValueError("TTS mode must be 'live' or 'file'")
+        log_message(f"TTS mode switching to: {mode}", "INFO")
+        # flush any previous state
+        with self._lock:
+            self._files.clear()
+            self._event.clear()
+        while True:
+            try:
+                self._queue.get_nowait()
+            except Empty:
+                break
+        self._mode = mode
+
+    def enqueue(self, text: str):
+        if not text:
+            return
+        mode = self._mode
+        log_message(f"Enqueue TTS ({mode}): {text}", "INFO")
+        # live mode uses a dummy callback to go into _do_live branch
+        callback = (lambda _: None) if mode == "live" else None
+        self._queue.put((text, callback))
+
+    def wait_for_latest_ogg(self, timeout: float = 30.0) -> str:
+        if not self._event.wait(timeout):
+            raise TimeoutError("No new TTS file within timeout")
+        with self._lock:
+            if not self._files:
+                raise RuntimeError("Signaled but no file recorded")
+            path = self._files.pop(0)
+            if not self._files:
+                self._event.clear()
+            return path
+
     def stop(self):
-        log_message("Stopping TTS processes.", "PROCESS")
-        flush_current_tts()
+        log_message("Stopping TTS worker.", "PROCESS")
+        self._running = False
+        self._queue.put((None, None))
+        self._event.set()
+        # clear queue
+        while True:
+            try: self._queue.get_nowait()
+            except Empty: break
+
     def start(self):
-        log_message("Starting TTS processes.", "PROCESS")
-        pass
+        log_message("Starting TTS worker.", "PROCESS")
+        self._running = True
+
+    def _worker(self):
+        log_message("TTS worker thread started.", "DEBUG")
+        while self._running:
+            item = self._queue.get()
+            if item is None or item == (None, None):
+                self._queue.task_done()
+                break
+
+            text, callback = item
+            cleaned = clean_text(re.sub(r"[\*#~]", "", text))
+
+            # ─── live mode ───
+            if callback is not None:
+                try:
+                    self._do_live(cleaned)
+                    callback(None)
+                except Exception as e:
+                    log_message(f"TTS live error: {e}", "ERROR")
+                finally:
+                    self._queue.task_done()
+                continue
+
+            # ─── file mode ───
+            fname   = f"{datetime.utcnow():%Y%m%dT%H%M%S}_{uuid.uuid4().hex}.ogg"
+            outpath = os.path.join(TTS_OUTPUT_DIR, fname)
+            try:
+                process_tts_request(cleaned, outpath)
+
+                prev_sz = -1
+                for _ in range(20):
+                    if os.path.exists(outpath):
+                        sz = os.path.getsize(outpath)
+                        if sz > 0 and sz == prev_sz:
+                            break
+                        prev_sz = sz
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError(f"TTS file never stabilized: {outpath}")
+
+                log_message(f"[TTS] File ready: {outpath}", "INFO")
+                with self._lock:
+                    self._files.append(outpath)
+                    self._event.set()
+
+            except Exception as e:
+                log_message(f"[TTS] file‐mode error: {e}", "ERROR")
+                time.sleep(1)
+            finally:
+                self._queue.task_done()
+
+    def _do_live(self, cleaned: str):
+        volume     = config.get("tts_volume", 0.2)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        piper_exe  = os.path.join(script_dir, "piper", "piper")
+        onnx_json  = os.path.join(script_dir, config["onnx_json"])
+        onnx_model = os.path.join(script_dir, config["onnx_model"])
+
+        cmd_piper = [piper_exe, "-m", onnx_model, "--json-input", "--output_raw"]
+        if TTS_DEBUG:
+            cmd_piper.insert(3, "--debug")
+        cmd_aplay = ["aplay", "--buffer-size=777", "-r", "22050", "-f", "S16_LE"]
+
+        payload = json.dumps({
+            "text": cleaned,
+            "config": onnx_json,
+            "model": onnx_model
+        })
+        log_message(f"[TTS live] Playing: {cleaned!r}", "INFO")
+
+        try:
+            with tts_lock:
+                stderr_dest = subprocess.PIPE if TTS_DEBUG else subprocess.DEVNULL
+                proc       = subprocess.Popen(cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_dest)
+                proc_aplay = subprocess.Popen(cmd_aplay, stdin=subprocess.PIPE)
+
+            proc.stdin.write(payload.encode("utf-8"))
+            proc.stdin.close()
+
+            def adjust(chunk: bytes) -> bytes:
+                arr = np.frombuffer(chunk, dtype=np.int16).astype(float) * volume
+                return np.clip(arr, -32768, 32767).astype(np.int16).tobytes()
+
+            while True:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    break
+                if volume != 1.0:
+                    chunk = adjust(chunk)
+                proc_aplay.stdin.write(chunk)
+
+            proc_aplay.stdin.close()
+            proc.wait()
+            proc_aplay.wait()
+
+            if TTS_DEBUG:
+                err = proc.stderr.read().decode(errors="ignore").strip()
+                if err:
+                    log_message("[Piper STDERR] " + err, "ERROR")
+
+        except Exception as e:
+            log_message(f"[TTS live error] {e}", "ERROR")
 
 # This following class manages storage and retrieval of messages in a memory manager, simulating a database or persistent storage.
 class MemoryManager:
@@ -4192,7 +4426,8 @@ class ChatManager:
             return f"<Stage {self.name}>"
     
     def _expand(self, stage: str, ctx: Context) -> list[str]:
-    
+        import re
+
         # ➡️ One-time dynamic pipeline adaptation, immediately after context_analysis
         if stage == "context_analysis" and not getattr(ctx, "_pipeline_adapted", False):
             base = [name for name, _, _ in self.STAGES]
@@ -4201,33 +4436,34 @@ class ChatManager:
             ctx.pipeline_overridden = True
             ctx._pipeline_adapted   = True
             ctx.ctx_txt += f"\n[Pipeline adapted to: {adapted}]\n"
-        
-        # ────────────────────────────────────────────────────────
-        # 0️⃣  If any stage just failed, run self-repair first
+
+        # 0️⃣ If any stage just failed, run self-repair first
         if getattr(ctx, "last_failure", None):
             return ["self_repair"]
 
-        # 1️⃣  Forced injections
+        # 1️⃣ Forced injections
         forced = getattr(ctx, "_forced_next", [])
         if forced:
             return [forced.pop(0)]
 
         # ────────────────────────────────────────────────────────
-        # 2️⃣  Tool-loop entry point: once we pick a tool, mark the loop
+        # 2️⃣ Tool-loop entry point: once we pick a tool, mark the loop
         if stage == "tool_decision":
             ctx._in_tool_loop = True
+            # If the decision was literally NO_TOOL → skip straight to final_inference
+            if not getattr(ctx, "next_tool_call", None) or ctx.next_tool_call.upper() == "NO_TOOL":
+                return ["final_inference"]
 
-        # 3️⃣  If there’s a pending tool call, execute it next
+        # 3️⃣ If there’s a pending tool call, execute it next
         if getattr(ctx, "next_tool_call", None) and stage != "execute_selected_tool":
             return ["execute_selected_tool"]
 
-        # 4️⃣  After executing a tool, go back into chaining
+        # 4️⃣ After executing a tool, go back into chaining
         if stage == "execute_selected_tool":
             return ["tool_chaining"]
 
         # ────────────────────────────────────────────────────────
-        # 5️⃣  Core linear flow up through planning
-        #    But once in tool_loop, never re-enter core stages before it
+        # 5️⃣ Core linear flow up through planning (only if not yet in the tool loop)
         if not getattr(ctx, "_in_tool_loop", False):
             if stage == "context_analysis":
                 return ["intent_clarification"]
@@ -4243,6 +4479,7 @@ class ChatManager:
             if stage == "memory_summarization":
                 return ["planning_summary"]
 
+            # right after planning_summary, normally build a plan
             if stage == "planning_summary":
                 return ["define_criteria"]
 
@@ -4253,25 +4490,25 @@ class ChatManager:
                 return ["plan_validation"]
 
         # ────────────────────────────────────────────────────────
-        # 6️⃣  Immediately after plan_validation, insert review→execute
+        # 6️⃣ Immediately after plan_validation, inject fallback or review
         if stage == "plan_validation":
+            # if there is a valid plan, proceed to review
             if getattr(ctx, "plan", None):
                 return ["review_tool_plan"]
-            return []
+            # NO plan → fallback to final_inference
+            return ["final_inference"]
 
-        # 7️⃣  If execute_actions failed tools, bounce back to review
+        # 7️⃣ If execute_actions failed tools, bounce back to review
         if stage == "execute_actions" and getattr(ctx, "tool_failures", None):
             return ["review_tool_plan"]
 
-        # 8️⃣  After review_tool_plan, run the actions
+        # 8️⃣ After review_tool_plan, run the actions
         if stage == "review_tool_plan":
             return ["execute_actions"]
 
         # ────────────────────────────────────────────────────────
-        # 9️⃣  Tool-chaining loop and onward
+        # 9️⃣ Tool-chaining loop and onward
         if stage == "tool_chaining":
-            # if next_tool_call is set, execute_selected_tool wins above;
-            # otherwise proceed to prompt assembly
             return ["assemble_prompt"]
 
         if stage == "assemble_prompt":
@@ -4283,7 +4520,7 @@ class ChatManager:
             return ["final_inference"]
 
         # ────────────────────────────────────────────────────────
-        # 🔟  Wrap-up diagnostics
+        # 🔟 Wrap-up diagnostics
         if stage == "final_inference":
             return ["output_review"]
 
@@ -4301,9 +4538,9 @@ class ChatManager:
         if stage == "flow_health_check":
             return []
 
-        # ────────────────────────────────────────────────────────
-        # Catch-all: nothing more to do
+        # Catch-all: stop
         return []
+
 
     # ------------------------------------------------------------------
     #  Stage: review_tool_plan  (with automatic execute_actions enqueue)
@@ -4484,7 +4721,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # ──────────────────────────────────────────────────────────────────
         #  A. Trim the running context log BEFORE doing any heavy work
         # ──────────────────────────────────────────────────────────────────
-        MAX_TOKENS = 2_000                     # tweak as you like
+        MAX_TOKENS = 2000                     # tweak as you like
         ctx_txt    = getattr(ctx, "ctx_txt", "")
         tokens     = ctx_txt.split()
         if len(tokens) > MAX_TOKENS:
@@ -7085,16 +7322,18 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
 
         # (TTS of the final response is done only in _stage_final_inference)
         return resp
-
+    
     def _run_fractal_pipeline(self, ctx: Context) -> str:
         """
-        Fractal, queue-driven engine with tool-plan critique & retry.
-        Uses _expand() to choose next stages dynamically.
+        Fractal, queue‐driven engine with tool‐plan critique & retry.
+        Ensures final_inference is always invoked.
         """
-        run_id = ctx.run_id
-        queue  = deque([ self._Stage("context_analysis") ])
+        import inspect
+        from collections import deque
 
-        # ensure we have a place to collect results/failures
+        run_id  = ctx.run_id
+        queue   = deque([ self._Stage("context_analysis") ])
+
         ctx.tool_failures  = {}
         ctx.tool_summaries = getattr(ctx, "tool_summaries", [])
 
@@ -7108,31 +7347,26 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             if cnt > 3:
                 continue
 
-            # ── ENTERING TOOL LOOP FLAG ───────────────────────────
-            if name == "tool_decision":
-                ctx._in_tool_loop = True
-
             handler = getattr(self, f"_stage_{name}", None)
             if not handler:
                 continue
 
-            # ── FIRE STAGE START CALLBACK ────────────────────────
+            # live‐update callback
             if ctx.stage_callback:
                 try:
                     ctx.stage_callback(f"[Stage] {name} …")
-                except Exception:
+                except:
                     pass
 
             self.observer.log_stage_start(run_id, name)
             sig    = inspect.signature(handler)
             params = list(sig.parameters.keys())[1:]
             args   = [ctx.stage_outputs.get(p) for p in params]
-
             try:
                 result = handler(ctx, *args) if args else handler(ctx)
             except Exception as e:
-                # record failure & schedule self-repair
-                ctx.last_failure = {"type": "exception", "payload": str(e), "stage": name}
+                # schedule self‐repair
+                ctx.last_failure = {"type":"exception","payload":str(e),"stage":name}
                 log_message(f"[{ctx.name}] '{name}' exception: {e}", "ERROR")
                 queue.appendleft(self._Stage("self_repair"))
                 self.observer.log_stage_end(run_id, name)
@@ -7140,42 +7374,50 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             finally:
                 self.observer.log_stage_end(run_id, name)
 
-            # ── CAPTURE & CALLBACK ON STRING OUTPUT ──────────────
+            # capture string result + callback
             if isinstance(result, str) and result:
                 ctx.stage_outputs[name] = result
                 if ctx.stage_callback:
                     try:
                         ctx.stage_callback(result)
-                    except Exception:
+                    except:
                         pass
-                # record final_response when we hit final_inference
                 if name == "final_inference":
                     ctx.final_response = result
 
-            # ── SPECIAL CASE: EXECUTE_ACTIONS ────────────────────
+            # special case: execute_actions
             if name == "execute_actions":
-                ctx.tool_failures = {}
                 for call in getattr(ctx, "plan", []):
                     try:
                         res = Tools.run_tool_once(call)
-                        ctx.tool_summaries.append({"call": call, "result": res})
+                        ctx.tool_summaries.append({"call":call,"result":res})
                     except Exception as e:
                         ctx.tool_failures[call] = str(e)
-                        log_message(f"[{ctx.name}] tool execution failed for {call}: {e}", "ERROR")
+                        log_message(f"[{ctx.name}] tool exec failed {call}: {e}", "ERROR")
                         break
-                # enqueue whatever expand() says next
                 for nxt in self._expand(name, ctx):
                     queue.append(self._Stage(nxt))
-                continue  # skip the normal enqueue below
+                continue
 
-            # ── NORMAL ENQUEUE NEXT STAGES ────────────────────────
+            # enqueue next
             for nxt in self._expand(name, ctx):
                 queue.append(self._Stage(nxt))
 
-        # ── WRAP-UP ─────────────────────────────────────────────
+        # ── HERE’S THE NEW BIT ──
+        # If we never got a final_response, run final_inference now
+        if not getattr(ctx, "final_response", None):
+            log_message(f"[{ctx.name}] No final_inference in pipeline; forcing fallback.", "WARNING")
+            # directly invoke the final stage
+            try:
+                self._stage_final_inference(ctx)
+            except Exception as e:
+                log_message(f"[{ctx.name}] fallback final_inference error: {e}", "ERROR")
+
+        # wrap up
         self._save_workspace_memory(ctx.workspace_memory)
         self.observer.complete_run(run_id)
         return ctx.final_response or ""
+
 
     # ------------------------------------------------------------------ #
     #  Linear pipeline engine                                            #
@@ -7514,56 +7756,70 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
 
     def _stage_planning_summary(self, ctx) -> str:
         """
-        ‚Ä¢ Streams the tool‚Äêdecision.
-        ‚Ä¢ Logs the incoming context token count.
-        ‚Ä¢ Registers ctx.next_tool_call and forces the criteria ‚Üí decomposition
-          ‚Üí validation branch so ctx.plan is always set.
+        • Gets the full tool-decision in one non-streaming call.
+        • Logs the incoming context token count.
+        • Registers ctx.next_tool_call and forces the next branches.
         """
-        import re, inspect, json
 
-        # 0Ô∏è‚É£ Compute and report incoming context size in tokens
+        import json, inspect, re
+
+        # 0️⃣ Compute & log context size
         ctx_text = ctx.ctx_txt or ""
         if not isinstance(ctx_text, str):
-            ctx_text = str(ctx_text)
-        ctx_tokens = len(ctx_text.split())
-        log_message(f"[Planning summary] context size: {ctx_tokens} tokens", "DEBUG")
-        ctx.stage_outputs["planning_summary_ctx_tokens"] = ctx_tokens
+            try:
+                ctx_text = json.dumps(ctx_text)
+            except Exception:
+                ctx_text = str(ctx_text)
+        tok_count = len(ctx_text.split())
+        log_message(f"[Planning summary] context tokens={tok_count}", "DEBUG")
+        ctx.stage_outputs["planning_summary_ctx_tokens"] = tok_count
 
-        # 1Ô∏è‚É£ Stream the tool decision, coercing **every** chunk to a string
-        gathered: list[str] = []
-        for chunk, done in self._stream_tool(ctx):
-            # Pull out possible nested content
-            if isinstance(chunk, dict):
-                # try common fields
-                raw_part = chunk.get("content")
-                if raw_part is None:
-                    raw_part = chunk.get("message", {}).get("content")
-                # fallback to the dict itself
-                if raw_part is None:
-                    raw_part = chunk
+        # 1️⃣ Perform a single non-streaming tool-decision call
+        # (this replaces the old streaming loop)
+        prompt = (
+            ctx.ctx_txt
+            + "\n\nPhase 2: Decide which tool to run.  Reply inside ```tool_code``` with exactly one call."
+        )
+        try:
+            resp = chat(
+                model=self.config_manager.config["secondary_model"],
+                messages=[{"role":"system","content":prompt}],
+                stream=False
+            )
+            # Pull out the content
+            if isinstance(resp, dict):
+                raw = (resp.get("message") or {}).get("content", "")
             else:
-                raw_part = chunk
-            # Unconditionally stringify
-            token_str = str(raw_part)
-            gathered.append(token_str)
-            if done:
-                break
+                raw = str(resp)
+        except Exception as e:
+            log_message(f"[Planning summary] tool-decision error: {e}", "ERROR")
+            raw = ""
 
-        # 2Ô∏è‚É£ Combine and strip any code fences
-        combined = "".join(gathered)
-        raw = re.sub(
+        # 2️⃣ Strip any fences / backticks
+        cleaned = re.sub(
             r"^```(?:tool_code|python|py)\s*|\s*```$",
             "",
-            combined,
+            raw,
             flags=re.DOTALL
         ).strip().strip("`")
 
-        # 3Ô∏è‚É£ Parse & register the tool call
-        parsed = Tools.parse_tool_call(raw)
-        call_str = parsed if isinstance(parsed, str) else (str(parsed) if parsed is not None else "")
+        # 3️⃣ Parse & register the tool call
+        try:
+            parsed = Tools.parse_tool_call(cleaned)
+        except Exception as e:
+            log_message(f"[Planning summary] parse error: {e}", "ERROR")
+            parsed = None
+
+        if isinstance(parsed, str):
+            call_str = parsed
+        elif parsed is None:
+            call_str = ""
+        else:
+            call_str = str(parsed)
+
         ctx.next_tool_call = call_str
 
-        # 4Ô∏è‚É£ Detect whether we need to improve the tool set
+        # 4️⃣ Detect if this tool is unknown
         known_funcs = {
             name for name, fn in inspect.getmembers(Tools, inspect.isfunction)
             if not name.startswith("_")
@@ -7571,37 +7827,39 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         fn_name = call_str.split("(", 1)[0] if call_str else ""
         ctx.needs_tool_work = fn_name not in known_funcs
 
-        # 5Ô∏è‚É£ Optional one‚Äêliner explanation via secondary model
+        # 5️⃣ Optionally explain the upcoming call
         plan_msg = ""
         if call_str:
-            system = "Explain one casual sentence what this upcoming tool call will do."
-            user   = f"We are about to run {call_str} for: {ctx.user_message}"
-            resp   = chat(
-                model=self.config_manager.config["secondary_model"],
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user}
-                ],
-                stream=False
-            )
-            # coerce to string
-            if isinstance(resp, dict):
-                plan_msg = (resp.get("message", {}) or {}).get("content", "")
-            else:
-                plan_msg = str(resp)
-            plan_msg = (plan_msg or "").strip()
-            if plan_msg and not getattr(ctx, "skip_tts", False):
-                self.tts_manager.enqueue(plan_msg)
+            sys_p = "Explain in one casual sentence what this upcoming call will do."
+            usr_p = f"We are about to run {call_str} for: {ctx.user_message}"
+            try:
+                ex = chat(
+                    model=self.config_manager.config["secondary_model"],
+                    messages=[
+                        {"role":"system","content":sys_p},
+                        {"role":"user",  "content":usr_p}
+                    ],
+                    stream=False
+                )
+                if isinstance(ex, dict):
+                    plan_msg = (ex.get("message") or {}).get("content", "") or ""
+                else:
+                    plan_msg = str(ex)
+            except Exception as e:
+                log_message(f"[Planning summary] explanation error: {e}", "WARNING")
+                plan_msg = ""
+            plan_msg = plan_msg.strip()
 
-        # 6Ô∏è‚É£ Record in the context and force the next branch
-        summary_line = plan_msg or "(no tool)"
-        ctx.ctx_txt += f"\n[Planning summary] {summary_line}"
+            if plan_msg and not getattr(ctx, "skip_tts", False):
+                try:
+                    self.tts_manager.enqueue(plan_msg)
+                except Exception:
+                    log_message("[Planning summary] TTS enqueue failed", "WARNING")
+
+        # 6️⃣ Record summary + force next stages
+        ctx.ctx_txt += f"\n[Planning summary] {plan_msg or '(no tool)'}"
         ctx.stage_outputs["planning_summary"] = plan_msg
-        ctx._forced_next = [
-            "define_criteria",
-            "task_decomposition",
-            "plan_validation"
-        ]
+        ctx._forced_next = ["define_criteria", "task_decomposition", "plan_validation"]
 
         return plan_msg
 
@@ -7795,24 +8053,41 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ctx.ctx_txt += "\n[Output-review queued remedial tool calls]\n"
         log_message(f"[output_review] queued remedial calls: {steps}", "INFO")
         return None
-
+    
     # ------------------------------
     # Stage: final_inference
     # ------------------------------
-    def _stage_final_inference(self, ctx: Context):
+    def _stage_final_inference(self, ctx: Context) -> str:
+        """
+        Generate the final assistant reply, record it everywhere, and enqueue TTS.
+        Always returns the cleaned reply string (never None).
+        """
 
+        import json
+        from datetime import datetime
 
-        # 1) run the actual LLM call
+        # 1️⃣ Run the actual LLM call (streams or non-stream as configured)
         raw = self.run_inference(ctx.assembled, ctx.skip_tts)
 
-        # 2) quick clean of markdown fences & stray backticks/asterisks
-        cleaned = raw.replace("```", "").replace("`", "").replace("*", "").strip()
+        # 2️⃣ Quick clean of markdown fences & stray backticks/asterisks
+        cleaned = (
+            raw
+            .replace("```", "")
+            .replace("`", "")
+            .replace("*", "")
+            .strip()
+        )
 
-        # 3) store in ctx & convo history
+        # 3️⃣ Record as final_response in context (guaranteed non-empty)
         ctx.final_response = cleaned
-        self.history_manager.add_entry("assistant", cleaned)
 
-        # 4) append to session_log, if it exists
+        # 4️⃣ Add to conversation history
+        try:
+            self.history_manager.add_entry("assistant", cleaned)
+        except Exception:
+            log_message("[final_inference] HistoryManager.add_entry failed", "WARNING")
+
+        # 5️⃣ Append to session log, if available
         try:
             session_log.write(json.dumps({
                 "role":      "assistant",
@@ -7823,14 +8098,15 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         except Exception:
             pass
 
-        # 5) speak, unless muted
-        self.tts_manager.enqueue(cleaned)
+        # 6️⃣ Enqueue for TTS only in Telegram mode (skip_tts=True)
+        if ctx.skip_tts:
+            try:
+                self.tts_manager.enqueue(cleaned)
+            except Exception:
+                log_message("[final_inference] TTS enqueue failed", "WARNING")
 
-        # no return value → pipeline will automatically enqueue:
-        #    output_review → adversarial_loop → notification_audit → flow_health_check
-        return None
-
-
+        # 7️⃣ Return the cleaned text so the pipeline captures it
+        return cleaned
 
     # -------------------------------------------------------------------
     # New workspace-file stages
@@ -7933,16 +8209,16 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
 # It captures audio, processes it, and sends it to the LLM for a response.
 # It also handles text input override mode.
 def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
+    chat_manager.tts_manager.set_mode("live")
+
     """
     Main loop for voice→LLM:
       1) listen until silence,
       2) optional audio enhancement,
       3) whisper‐transcribe,
-      4) log + clear TTS,
-      5) hand off to chat_manager.new_request (full pipeline).
+      4) log + clear any pending TTS,
+      5) hand off to chat_manager.new_request (live playback mode).
     """
-    import time, json, numpy as np
-    from datetime import datetime
 
     log_message("Voice-to-LLM loop started. Waiting for speech…", "INFO")
 
@@ -7987,78 +8263,62 @@ def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
         user_text = transcription.strip()
         log_message(f"Transcribed prompt: {user_text!r}", "INFO")
 
-        # 4) log & clear TTS
+        # 4) log & clear any pending TTS
         session_log.write(json.dumps({
-            "role":      "user",
-            "content":   user_text,
+            "role":    "user",
+            "content": user_text,
             "timestamp": datetime.now().isoformat()
         }) + "\n")
         session_log.flush()
         flush_current_tts()
 
-        # 5) run through the full ChatManager pipeline
-        #    (this will stream tokens, do TTS, RL, self‐repair, etc.)
+        # 5) run through the full ChatManager pipeline in live‐mode
+        chat_manager.new_request(
+            user_text,
+            sender_role="user",
+            skip_tts=False    # live playback enabled
+        )
+
+        # 6) loop back for next speech
+        log_message("Ready for next voice input…", "INFO")
+
+# ------------------------------
+# text‐override loop
+# ------------------------------
+def text_input_loop(chat_manager: ChatManager):
+    import json
+    from datetime import datetime
+
+    log_message("Text input override mode is active.", "INFO")
+    print("\nText override mode is active. Type your message and press Enter…")
+
+    while True:
+        user_text = input().strip()
+        if not user_text:
+            continue
+
+        chat_manager.tts_manager.set_mode("live")
+        log_message(f"Text input override: {user_text!r}", "INFO")
+        session_log.write(json.dumps({
+            "role":    "user",
+            "content": user_text,
+            "timestamp": datetime.now().isoformat()
+        }) + "\n")
+        session_log.flush()
+        flush_current_tts()
+
         chat_manager.new_request(
             user_text,
             sender_role="user",
             skip_tts=False
         )
 
-        # 6) loop back for next speech
-        log_message("Ready for next voice input…", "INFO")
 
-
-# This is the main loop for text input override mode.
-# It allows users to type messages directly into the console,
-def text_input_loop(chat_manager: ChatManager):
-    """
-    Main loop for text‐override mode:
-      • read lines,
-      • log + clear TTS,
-      • dispatch into chat_manager.new_request (full pipeline).
-    """
-    import json
-    from datetime import datetime
-
-    log_message("Text input override mode is active.", "INFO")
-    print("\nText override mode is active. Type your message and press Enter to send it to the LLM.")
-
-    while True:
-        try:
-            user_text = input().strip()
-            if not user_text:
-                continue
-
-            log_message(f"Text input override: Received text: {user_text!r}", "INFO")
-            session_log.write(json.dumps({
-                "role":      "user",
-                "content":   user_text,
-                "timestamp": datetime.now().isoformat()
-            }) + "\n")
-            session_log.flush()
-            flush_current_tts()
-
-            # full pipeline + streaming + TTS happens inside new_request
-            chat_manager.new_request(
-                user_text,
-                sender_role="user",
-                skip_tts=False
-            )
-
-        except Exception as e:
-            log_message("Error in text input loop: " + str(e), "ERROR")
-
-def telegram_input(chat_manager):
-    """
-    Launch a Telegram bot that:
-      • Uses a single ChatManager instance
-      • Cancels any in-flight task for a user when they send a new message
-      • Resets the user’s context (by using chat_id as the context name)
-      • Edits one “processing…” message with each stage’s real output
-      • Replaces it with the final response
-    """
+# ---------------------------------------------------------------- #
+# telegram_input (full drop‐in) loop                               #
+# ---------------------------------------------------------------- #
+def telegram_input(chat_manager: ChatManager):
     import os
-    import asyncio
     from dotenv import load_dotenv
     from telegram import Update
     from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
@@ -8069,99 +8329,94 @@ def telegram_input(chat_manager):
     if not BOT_TOKEN:
         raise RuntimeError("Missing BOT_TOKEN in environment")
 
-    # 1️⃣ Create a dedicated event loop for Telegram I/O
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # 2️⃣ Build the Telegram app
     req = HTTPXRequest(connect_timeout=20, read_timeout=20)
     app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
-
-    # 3️⃣ Track the in-flight runner task per chat_id
     running_tasks: dict[int, asyncio.Task] = {}
 
     async def _handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        text    = (update.message and update.message.text or "").strip()
-        if not text:
+        chat_id   = update.effective_chat.id
+        user_text = (update.message.text or "").strip()
+        if not user_text:
             return
 
-        # ── Cancel any existing pipeline for this user ───────────────
+        # cancel prior
         prev = running_tasks.get(chat_id)
         if prev and not prev.done():
             prev.cancel()
 
-        # ── Send the “Processing…” placeholder message ───────────────
-        sent = await context.bot.send_message(
-            chat_id=chat_id,
-            text="🛠️ Processing your request…"
-        )
+        sent = await context.bot.send_message(chat_id=chat_id, text="🛠️ Processing…")
         msg_id = sent.message_id
 
-        # ── Activate (or switch to) this user’s context ───────────────
-        # We use the chat_id as a unique “topic” name.
         chat_manager._activate_context(str(chat_id))
 
-        # ── Define the live-stage callback that edits the same message ──
-        def stage_cb(output: str):
-            if not output:
+        def stage_cb(stage_out: str):
+            if not stage_out:
                 return
-            async def _edit():
+            async def do_edit():
                 try:
                     await context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=f"🔄 {output}"
+                        chat_id=chat_id, message_id=msg_id,
+                        text=f"🔄 {stage_out}"
                     )
-                except Exception:
-                    pass
-            asyncio.run_coroutine_threadsafe(_edit(), loop)
+                except: pass
+            asyncio.run_coroutine_threadsafe(do_edit(), loop)
 
-        # ── Runner wrapper to call new_request in background ──────────
         async def runner():
             try:
+                # 1) switch TTS → file, clear old files
+                chat_manager.tts_manager.set_mode("file")
+
+                # 2) full pipeline (this will enqueue .ogg via final_inference)
                 final = await asyncio.to_thread(
                     chat_manager.new_request,
-                    text,           # user message
-                    "user",         # sender_role
-                    True,           # skip intermediate TTS
-                    stage_cb        # live-update callback
+                    user_text,
+                    "user",
+                    False,     # **must** be False so final_inference enqueues
+                    stage_cb
                 )
-                # replace placeholder with final answer
+
+                # 3) send text edit
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=msg_id,
                     text=final or "(no response)"
                 )
+
+                # 4) drain & send .ogg files
+                while True:
+                    try:
+                        ogg = chat_manager.tts_manager.wait_for_latest_ogg(timeout=5.0)
+                    except TimeoutError:
+                        break
+                    with open(ogg, "rb") as vf:
+                        await context.bot.send_voice(
+                            chat_id=chat_id,
+                            voice=vf,
+                            reply_to_message_id=msg_id
+                        )
+
             except asyncio.CancelledError:
-                # user sent a new msg → cancel prior run
                 try:
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
                         message_id=msg_id,
                         text="⚠️ Previous request cancelled."
                     )
-                except Exception:
-                    pass
+                except: pass
+
             except Exception as e:
-                # any other failure → send a fresh message
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"❌ Processing error: {e}"
-                )
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Error: {e}")
+
             finally:
                 running_tasks.pop(chat_id, None)
 
-        # ── Launch and record the task ───────────────────────────────
         task = loop.create_task(runner())
         running_tasks[chat_id] = task
 
-    # 4️⃣ Register the text‐message handler (ignoring commands)
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_update)
-    )
-
-    # 5️⃣ Start polling loop
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_update))
     loop.run_until_complete(app.initialize())
     loop.run_until_complete(app.start())
     loop.run_until_complete(app.updater.start_polling())
