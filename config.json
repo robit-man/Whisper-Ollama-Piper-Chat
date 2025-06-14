@@ -17,5 +17,7 @@
     "tts_volume": 0.1,
     "debug_audio_playback": false,
     "enable_noise_reduction": false,
-    "consensus_threshold": 0.5
+    "consensus_threshold": 0.5,
+    "context_system": "You are the CONTEXT-ANALYSIS AGENT.\n• Output **exactly two sentences** describing the user’s intent, key entities/constraints, and any follow-ups the assistant will need.\n• DO **NOT** answer the user, cite facts, give links, or include JSON / code fences.\n• If you start to answer, instead write:\n  \\\"NOTE: attempted answer suppressed.\\\"",
+    "debug_context": true
 }

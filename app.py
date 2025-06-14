@@ -246,6 +246,8 @@ def load_config():
         "enable_noise_reduction": False,
         "consensus_threshold": 0.5,       # Similarity ratio required for consensus between models
         "speak_chain_of_thought": False,
+        "context_system": "You are the CONTEXT-ANALYSIS AGENT.\n• Output **exactly two sentences** describing the user’s intent, key entities/constraints, and any follow-ups the assistant will need.\n• DO **NOT** answer the user, cite facts, give links, or include JSON / code fences.\n• If you start to answer, instead write:\n  \"NOTE: attempted answer suppressed.\"",
+        "debug_context": True,
     }
     if not os.path.isfile(config_path):
         with open(config_path, "w") as f:
@@ -291,6 +293,7 @@ from scipy.io.wavfile import write
 from scipy.signal import butter, lfilter       # EQ enhancement
 import numpy as np
 
+import traceback
 import re, ast, logging
 
 from collections import deque
@@ -316,7 +319,7 @@ from telegram.request import HTTPXRequest
 
 # ── Selenium stack
 from selenium import webdriver
-from selenium.common.exceptions import WebDriverException, TimeoutException
+from selenium.common.exceptions import WebDriverException, TimeoutException, NoSuchElementException
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -372,15 +375,6 @@ from werkzeug.serving import make_server
 
 
 load_dotenv()
-
-# Check if brave API key is set in the environment variables
-brave_api_key = os.environ.get("BRAVE_API_KEY")
-if brave_api_key:
-    print(f"brave key loaded from .env: {brave_api_key}")
-else:
-    log_message("BRAVE_API_KEY not set; falling back to DuckDuckGo search", "WARNING")
-log_message("Environment variables loaded using dotenv", "INFO")
-
 
 log_message("Loading Whisper models...", "PROCESS")
 try:
@@ -1016,9 +1010,21 @@ class TTSManager:
         else:
             raise TimeoutError("No TTS texts to synthesize within timeout")
 
+        # ── settle for a short quiet-period so we don’t miss lines enqueued
+        #    milliseconds after the first batch was captured ↓↓↓
+        settle_until = time.time() + 0.25          # 250 ms “quiet” window
+        while time.time() < settle_until:
+            time.sleep(0.05)
+            with self._lock:
+                if self._pending_texts:
+                    batch.extend(self._pending_texts)
+                    self._pending_texts.clear()
+                    self._last_text = None
+                    settle_until = time.time() + 0.25  # restart timer
+
         combined = "\n".join(batch)
-        fname   = f"{datetime.utcnow():%Y%m%dT%H%M%S}_{uuid.uuid4().hex}.ogg"
-        outpath = os.path.join(TTS_OUTPUT_DIR, fname)
+        fname    = f"{datetime.utcnow():%Y%m%dT%H%M%S}_{uuid.uuid4().hex}.ogg"
+        outpath  = os.path.join(TTS_OUTPUT_DIR, fname)
 
         try:
             log_message(f"[TTS file] Synthesizing combined text to: {outpath}", "INFO")
@@ -2930,7 +2936,7 @@ class Tools:
 
     # This static method performs a quick DuckDuckGo search for a given topic. It opens the DuckDuckGo homepage, inputs the search query, waits for results, and optionally deep-scrapes the first few results in new tabs. It returns a list of dictionaries containing the title, URL, snippet, summary, and full page HTML content.
     @staticmethod
-    def duckduckgo_search(        # ← new canonical name
+    def search_internet(        # ← new canonical name
         topic: str,
         num_results: int = 5,
         wait_sec: int = 1,
@@ -2942,14 +2948,8 @@ class Tools:
         • Returns: title, url, snippet, summary, and full page HTML (`content`).
         • Never blocks more than 5 s on any wait—everything is aggressively polled.
         """
-        import html, traceback, time
-        from bs4 import BeautifulSoup
-        from selenium.common.exceptions import TimeoutException, NoSuchElementException
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
 
-        log_message(f"[duckduckgo_search] ▶ {topic!r}", "INFO")
+        log_message(f"[search_internet] ▶ {topic!r}", "INFO")
 
         # clamp waits to max 5 s
         wait_sec = min(wait_sec, 5)
@@ -2965,7 +2965,7 @@ class Tools:
             # 1️⃣ Home page
             drv.get("https://duckduckgo.com/")
             wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-            log_message("[duckduckgo_search] Home page ready.", "DEBUG")
+            log_message("[search_internet] Home page ready.", "DEBUG")
 
             # 2️⃣ Cookie banner
             try:
@@ -2973,7 +2973,7 @@ class Tools:
                     (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler")
                 ))
                 btn.click()
-                log_message("[duckduckgo_search] Cookie banner dismissed.", "DEBUG")
+                log_message("[search_internet] Cookie banner dismissed.", "DEBUG")
             except TimeoutException:
                 pass
 
@@ -2996,15 +2996,15 @@ class Tools:
                 "arguments[0].form.submit();",
                 box, topic
             )
-            log_message("[duckduckgo_search] Query submitted.", "DEBUG")
+            log_message("[search_internet] Query submitted.", "DEBUG")
 
             # 4️⃣ Wait for results
             try:
                 wait.until(lambda d: "?q=" in d.current_url)
                 wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, "#links .result, #links [data-nr]"))
-                log_message("[duckduckgo_search] Results detected.", "DEBUG")
+                log_message("[search_internet] Results detected.", "DEBUG")
             except TimeoutException:
-                log_message("[duckduckgo_search] Results timeout.", "WARNING")
+                log_message("[search_internet] Results timeout.", "WARNING")
 
             # 5️⃣ Gather top anchors
             anchors = drv.find_elements(
@@ -3057,7 +3057,7 @@ class Tools:
                             if now - last > stable_delta or now - start_ms > max_wait:
                                 if now - start_ms > max_wait:
                                     log_message(
-                                        f"[duckduckgo_search] dynamic-load hard timeout for {href!r}",
+                                        f"[search_internet] dynamic-load hard timeout for {href!r}",
                                         "WARNING"
                                     )
                                 break
@@ -3093,20 +3093,16 @@ class Tools:
                     })
 
                 except Exception as ex:
-                    log_message(f"[duckduckgo_search] result error: {ex}", "WARNING")
+                    log_message(f"[search_internet] result error: {ex}", "WARNING")
                     continue
 
         except Exception as e:
-            log_message(f"[duckduckgo_search] Fatal: {e}\n{traceback.format_exc()}", "ERROR")
+            log_message(f"[search_internet] Fatal: {e}\n{traceback.format_exc()}", "ERROR")
         finally:
             Tools.close_browser()
 
-        log_message(f"[duckduckgo_search] Collected {len(results)} results.", "SUCCESS")
+        log_message(f"[search_internet] Collected {len(results)} results.", "SUCCESS")
         return results
-
-
-    # This method assigns the duckduckgo_search method to a variable for compatibility with existing code that expects this name.
-    ddg_search = duckduckgo_search
 
     # This static method extracts a summary from a webpage using two stages:
     @staticmethod
@@ -3120,10 +3116,6 @@ class Tools:
            Uses same driver logic.
         3. Always cleans up the browser session.
         """
-        from bs4 import BeautifulSoup
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
 
         # 1) quick request-based scrape
         html_doc = Tools.bs4_scrape(url)
@@ -3157,15 +3149,15 @@ class Tools:
         finally:
             Tools.close_browser()
 
-    # This static method summarizes a local search by calling the ddg_search method to get the top_n results for a given topic. It formats the results into a bullet list with titles and summaries, returning the formatted string.
+    # This static method summarizes a local search by calling the search_internet method to get the top_n results for a given topic. It formats the results into a bullet list with titles and summaries, returning the formatted string.
     @staticmethod
     def summarize_local_search(topic: str, top_n: int = 3, deep: bool = False) -> str:
         """
-        1) Call ddg_search() to get top_n results (optionally deep-scraped)
+        1) Call search_internet() to get top_n results (optionally deep-scraped)
         2) Return bullet list “1. Title — summary”
         """
         try:
-            entries = Tools.ddg_search(topic, num_results=top_n, deep_scrape=deep)
+            entries = Tools.search_internet(topic, num_results=top_n, deep_scrape=deep)
         except Exception as e:
             return f"Search error: {e}"
         if not entries:
@@ -3616,65 +3608,18 @@ class Tools:
             log_message("Error reading battery voltage: " + str(e), "ERROR")
             raise RuntimeError(f"Error reading battery voltage: {e}")
     
-    # This static method searches the internet for a given topic using the Brave Search API if available, or falls back to DuckDuckGo search. It returns a JSON string containing the search engine used and the raw results.
-    @staticmethod
-    def search_internet(topic: str) -> str:
-        """
-        Search the web.
-
-        1. If BRAVE_API_KEY is set → use Brave Search API.
-        2. Otherwise *or* upon any error → fall back to Tools.ddg_search().
-        3. Always return **JSON text** shaped as:
-           { "engine": "brave" | "duckduckgo",
-             "data":   <raw-Brave-JSON or list-of-DDG-dicts> }
-        """
-        import json, os, requests, traceback
-
-        api_key = os.environ.get("BRAVE_API_KEY", "")
-        endpoint = "https://api.search.brave.com/res/v1/web/search"
-        headers  = {
-            "Accept": "application/json",
-            "Accept-Encoding": "gzip",
-            "x-subscription-token": api_key
-        }
-        params   = {"q": topic, "count": 10}
-
-        # ── 1️⃣  Brave Search if possible ───────────────────────────────────
-        if api_key:
-            try:
-                log_message(f"Performing Brave search for topic: {topic}", "PROCESS")
-                resp = requests.get(endpoint, headers=headers, params=params, timeout=5)
-                if resp.status_code == 200:
-                    log_message("Brave search successful.", "SUCCESS")
-                    return json.dumps({"engine": "brave", "data": resp.json()})
-                else:
-                    log_message(f"Brave search error {resp.status_code}", "ERROR")
-            except Exception as e:
-                log_message(f"Brave search exception: {e}\n{traceback.format_exc()}", "ERROR")
-
-        # ── 2️⃣  Fallback → DuckDuckGo via Selenium helper ───────────────────
-        log_message("Falling back to DuckDuckGo search.", "WARNING")
-        try:
-            ddg_results = Tools.ddg_search(topic, num_results=10, deep_scrape=False)
-            return json.dumps({"engine": "duckduckgo", "data": ddg_results})
-        except Exception as e:
-            log_message(f"DuckDuckGo fallback failed: {e}", "ERROR")
-            return json.dumps({"engine": "error", "data": str(e)})
 
     # This static method summarizes a web search by calling the search_internet method to get the top_n results for a given topic. It scrapes each URL for content, asks a secondary agent tool for a summary, and returns a formatted bullet list of the results.
     @staticmethod
     def summarize_search(topic: str, top_n: int = 3) -> str:
         """
-        1) Call our duckduckgo_search() to open each result in a tab and deep-scrape.
+        1) Call our search_internet() to open each result in a tab and deep-scrape.
         2) For each page, feed the full-text snippet into the secondary_agent_tool().
         3) Return a neat bullet-list of 2–3 sentence summaries.
         """
-        import traceback
-        from selenium.common.exceptions import TimeoutException
-
         try:
             # open tabs and scrape each page’s content
-            pages = Tools.duckduckgo_search(topic, num_results=top_n, deep_scrape=True)
+            pages = Tools.search_internet(topic, num_results=top_n, deep_scrape=True)
         except Exception as e:
             return f"Error retrieving search pages: {e}"
 
@@ -4520,11 +4465,18 @@ class ChatManager:
     
 
     def _prompt_context_analysis(self, ctx: Context, hist_tail: str) -> list[dict]:
+        """
+        Build the message list fed to the context-analysis micro-agent.
+        Pulls its system prompt from   config['context_system']   so you
+        can tweak that prompt in one place (see defaults).
+        """
+        sys_prompt = self.config_manager.config.get("context_system", "")
         return [
-            {"role": "system", "content": CONTEXT_SYS_PROMPT},
+            {"role": "system",    "content": sys_prompt},
             {"role": "assistant", "content": hist_tail[-800:]},
-            {"role": "user", "content": ctx.user_message}
+            {"role": "user",      "content": ctx.user_message},
         ]
+    
 
     class _Stage:
         """Wrapper so we can queue stages as objects (needed for branching)."""
@@ -4534,46 +4486,50 @@ class ChatManager:
             return f"<Stage {self.name}>"
     
     def _expand(self, stage: str, ctx: Context) -> list[str]:
-        import re
+        """
+        Decide which stage(s) should run next after *stage*.
+        This version patches the “lost context / I don’t have tools” bug
+        by ensuring the post-action audit chain always executes.
+        """
+        import re  # (local import keeps top-of-file tidy)
 
         # ➡️ One-time dynamic pipeline adaptation, immediately after context_analysis
         if stage == "context_analysis" and not getattr(ctx, "_pipeline_adapted", False):
-            base = [name for name, _, _ in self.STAGES]
-            adapted = self._assemble_stage_list(ctx.user_message, base)
+            base     = [name for name, _, _ in self.STAGES]
+            adapted  = self._assemble_stage_list(ctx.user_message, base)
             ctx.overridden_stages   = adapted
             ctx.pipeline_overridden = True
             ctx._pipeline_adapted   = True
             ctx.ctx_txt += f"\n[Pipeline adapted to: {adapted}]\n"
 
-        # 0️⃣ If any stage just failed, run self-repair first
+        # 0️⃣  If any stage failed in the previous tick → self-repair first
         if getattr(ctx, "last_failure", None):
             return ["self_repair"]
 
-        # 1️⃣ Forced injections
+        # 1️⃣  Forced injections (set elsewhere via ctx._forced_next)
         forced = getattr(ctx, "_forced_next", [])
         if forced:
-            next_stage = forced.pop(0)
-            ctx._active_stage = next_stage           # ← NEW: expose to handlers
-            return [next_stage]
+            nxt = forced.pop(0)
+            ctx._active_stage = nxt
+            return [nxt]
 
-        # ────────────────────────────────────────────────────────
-        # 2️⃣ Tool-loop entry point: once we pick a tool, mark the loop
+        # ────────────────────────────────────────────────────────────────
+        # 2️⃣  Tool-loop entry: once tool_decision fires we mark the loop
         if stage == "tool_decision":
             ctx._in_tool_loop = True
-            # If the decision was literally NO_TOOL → skip straight to final_inference
             if not getattr(ctx, "next_tool_call", None) or ctx.next_tool_call.upper() == "NO_TOOL":
                 return ["final_inference"]
 
-        # 3️⃣ If there’s a pending tool call, execute it next
+        # 3️⃣  Pending tool call?
         if getattr(ctx, "next_tool_call", None) and stage != "execute_selected_tool":
             return ["execute_selected_tool"]
 
-        # 4️⃣ After executing a tool, go back into chaining
+        # 4️⃣  After *selected* tool executes → back into chaining
         if stage == "execute_selected_tool":
             return ["tool_chaining"]
 
-        # ────────────────────────────────────────────────────────
-        # 5️⃣ Core linear flow up through planning (only if not yet in the tool loop)
+        # ────────────────────────────────────────────────────────────────
+        # 5️⃣  Linear flow up to planning (only until tool loop begins)
         if not getattr(ctx, "_in_tool_loop", False):
             if stage == "context_analysis":
                 return ["intent_clarification"]
@@ -4589,7 +4545,6 @@ class ChatManager:
             if stage == "memory_summarization":
                 return ["planning_summary"]
 
-            # right after planning_summary, normally build a plan
             if stage == "planning_summary":
                 return ["define_criteria"]
 
@@ -4599,25 +4554,31 @@ class ChatManager:
             if stage == "task_decomposition":
                 return ["plan_validation"]
 
-        # ────────────────────────────────────────────────────────
-        # 6️⃣ Immediately after plan_validation, inject fallback or review
+        # ────────────────────────────────────────────────────────────────
+        # 6️⃣  plan_validation outcome branch
         if stage == "plan_validation":
-            # if there is a valid plan, proceed to review
             if getattr(ctx, "plan", None):
                 return ["review_tool_plan"]
-            # NO plan → fallback to final_inference
-            return ["final_inference"]
+            return ["final_inference"]                      # no plan → fallback
 
-        # 7️⃣ If execute_actions failed tools, bounce back to review
-        if stage == "execute_actions" and getattr(ctx, "tool_failures", None):
-            return ["review_tool_plan"]
+        # 7️⃣  execute_actions results
+        if stage == "execute_actions":
+            if getattr(ctx, "tool_failures", None):
+                return ["review_tool_plan"]                 # failed → fix plan
+            return ["verify_results"]                       # success → audit
 
-        # 8️⃣ After review_tool_plan, run the actions
-        if stage == "review_tool_plan":
-            return ["execute_actions"]
+        # 8️⃣  Post-execution audit chain
+        if stage == "verify_results":
+            return ["plan_completion_check"]
 
-        # ────────────────────────────────────────────────────────
-        # 9️⃣ Tool-chaining loop and onward
+        if stage == "plan_completion_check":
+            return ["checkpoint"]
+
+        if stage == "checkpoint":
+            return ["tool_chaining"]
+
+        # ────────────────────────────────────────────────────────────────
+        # 9️⃣  Tool-chaining loop and remainder of reply pipeline
         if stage == "tool_chaining":
             return ["assemble_prompt"]
 
@@ -4629,8 +4590,8 @@ class ChatManager:
                 return ["intent_clarification"]
             return ["final_inference"]
 
-        # ────────────────────────────────────────────────────────
-        # 🔟 Wrap-up diagnostics
+        # ────────────────────────────────────────────────────────────────
+        # 🔟  Wrap-up & diagnostics
         if stage == "final_inference":
             return ["output_review"]
 
@@ -4638,6 +4599,9 @@ class ChatManager:
             if ctx.get("review_status") == "needs_clarification":
                 return ["intent_clarification"]
             return ["chain_of_thought"]
+
+        if stage == "chain_of_thought":
+            return ["adversarial_loop"]
 
         if stage == "adversarial_loop":
             return ["notification_audit"]
@@ -4648,7 +4612,7 @@ class ChatManager:
         if stage == "flow_health_check":
             return []
 
-        # Catch-all: stop
+        # Default: nothing more to do
         return []
 
 
@@ -5424,7 +5388,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         – Instructs the model to pick *only* the tools strictly needed.  
         – Returns a JSON array of calls, one per item, stored on ctx.plan.
         """
-        import json, ast, re, inspect, textwrap
+        Tools.load_external_tools()        # ← guarantees an up-to-date registry
 
         # 1️⃣ Gather metadata for every public tool
         tool_infos = []
@@ -5666,7 +5630,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         Pulls calls from ctx.plan based on ctx.plan_idx, records results,
         and stops on first error (unless best_effort is set).
         """
-        import traceback
 
         # ── 0️⃣  Pre-flight checks ────────────────────────────────────────
         if not getattr(ctx, "plan_validated", False):
@@ -6554,35 +6517,62 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         log_message(f"[EVENT] {event}: {payload}", "DEBUG")
         # e.g. requests.post("https://my.monitor/api", json={...})
 
-    # ---------------------------------------------------------------- #
-    #                    ORIGINAL (UNCHANGED) METHODS                  #
-    # ---------------------------------------------------------------- #
-    def build_payload(self, override_messages=None, model_key="primary_model"):
+    # ------------------------------------------------------------------ #
+    #  Central payload builder  (now exposes every context window)       #
+    # ------------------------------------------------------------------ #
+    def build_payload(
+        self,
+        override_messages: list[dict] | None = None,
+        *,
+        model_key: str = "primary_model"
+    ) -> dict:
+        """
+        Assemble the dict finally sent to the LLM.
+
+        If   config["debug_context"]   is truthy we also copy the exact
+        `messages` into   ctx.frame['debug'][stage]   for one-turn inspection.
+        """
         cfg = self.config_manager.config
+        ctx = getattr(self, "current_ctx", None)        # ctx can be None during boot
+
+        # ────────────────────────── build `messages` ──────────────────────────
         if override_messages is not None:
             messages = override_messages
+
         elif model_key == "primary_model":
-            system_prompt = cfg.get("system","")
-            sys_msg = {"role":"system","content":system_prompt}
+            # ① system prompt
+            sys_msg = {"role": "system", "content": cfg.get("system", "")}
+
+            # ② embed the most-recent **20 turns** (max 1 200 chars) for memory
             if self.history_manager.history:
-                last = next((m["content"] for m in reversed(self.history_manager.history)
-                             if m["role"]=="user"), "")
-                mem = Utils.embed_text(last)
+                tail_txt = "\n".join(
+                    m["content"] for m in self.history_manager.history[-20:]
+                )[-1200:]
+                mem_vec = Utils.embed_text(tail_txt)
             else:
-                mem = ""
-            mem_msg = {"role":"system",
-                       "content":f"Memory Context:\n{mem}\n\nSummary Narrative:\n\n"}
+                mem_vec = ""
+
+            mem_msg = {
+                "role":  "system",
+                "content": f"Memory Context:\n{mem_vec}\n\nSummary Narrative:\n\n",
+            }
+
             messages = [sys_msg, mem_msg] + self.history_manager.history
+
         else:
+            # secondary / tertiary models normally come with their own prompts
             messages = override_messages or []
-            
+
+        # ───────────────────────── temperature scaling ───────────────────────
         base_temp = cfg[f"{model_key.split('_')[0]}_temperature"]
-        temp      = max(0.1, base_temp - 0.4 * self.observer.recent_failure_ratio())
-        payload = {
+        temp      = max(0.1, base_temp -
+                        0.4 * self.observer.recent_failure_ratio())
+
+        payload: dict = {
             "model":       cfg[model_key],
-            "temperature": min(temp, 1.5),  # cap it
+            "temperature": min(temp, 1.5),          # hard cap
             "messages":    messages,
-            "stream":      cfg["stream"]
+            "stream":      cfg["stream"],
         }
         if self.format_schema:
             payload["format"] = self.format_schema
@@ -6590,7 +6580,16 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             payload["raw"] = True
         if cfg.get("options"):
             payload["options"] = cfg["options"]
+
+        # ─────────────────────── debug-context snapshot ──────────────────────
+        if cfg.get("debug_context") and ctx is not None:
+            stage = getattr(ctx, "_active_stage", "<unknown>")
+            ctx.frame.setdefault("debug", {})[stage] = [m.copy() for m in messages]
+
         return payload
+
+    
+
     def chat_completion_stream(self, processed_text):
         """
         Stream the primary‐model’s response to `processed_text` as a new user message,
@@ -7395,25 +7394,27 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         return []
     
     # ------------------------------------------------------------------ #
-    #  Entry-point for every user turn with stage‐by‐stage callbacks    #
+    #  Entry-point for every user turn (with live callbacks & debug)     #
     # ------------------------------------------------------------------ #
     def new_request(
             self,
             user_message: str,
             sender_role: str = "user",
             skip_tts: bool  = False,
-            stage_callback: Callable[[str], None] = None,
+            stage_callback: Callable[[str], None] | None = None,
+            *,
+            debug_context: bool = False,      # ← NEW flag
         ) -> str:
         """
         • Optional `/ctx <name>` context switch
         • Records history + telemetry
-        • Chooses system‐prompt via RL and runs the fractal pipeline
-        • Records a simple reward afterwards
+        • Runs the fractal pipeline
+        • Emits a reward + optionally prints the per-stage debug context
         """
         import re, random
         from datetime import datetime
 
-        # 0) quick context switch
+        # 0) quick /ctx switch ------------------------------------------------
         m = re.match(r"^/(topic|ctx)\s+(.+)$", user_message.strip(), re.I)
         if m:
             topic = m.group(2).strip()
@@ -7422,50 +7423,49 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             self.tts_manager.enqueue(resp)
             return resp
 
-        # 1) ensure an active Context
+        # 1) ensure an active Context ---------------------------------------
         if not getattr(self, "current_ctx", None):
             self._activate_context("global")
         ctx = self.current_ctx
 
-        # Attach the stage‐callback for live updates
+        # attach live-update callback
         ctx.stage_callback = stage_callback
 
-        # re-bind managers
+        # re-bind managers for convenience
         self.history_manager   = ctx.history_manager
         self.tts_manager       = ctx.tts_manager
         Tools._history_manager = ctx.history_manager
 
-        # 2) per-turn init (don’t wipe long-term fields)
+        # 2) per-turn initialisation ----------------------------------------
         ctx.user_message = user_message
         ctx.sender_role  = sender_role
-        # suppress ALL intermediate TTS; final voice only from _stage_final_inference
-        ctx.skip_tts     = skip_tts
+        ctx.skip_tts     = skip_tts      # silence intermediate stages
 
-        # turn counter + narrative
         turn_no = getattr(ctx, "_turn_counter", 0) + 1
         ctx._turn_counter = turn_no
         ctx.ctx_txt += (
-            f"\n\n── Turn {turn_no} │ "
-            f"{datetime.now().isoformat(timespec='seconds')} ──\n"
+            f"\n\n── Turn {turn_no} │ {datetime.now().isoformat(timespec='seconds')} ──\n"
         )
 
-        # fresh bookkeeping
-        ctx.stage_counts  = {}
-        ctx.stage_outputs = {}
-        if not hasattr(ctx, "tool_summaries"):
-            ctx.tool_summaries = []
+        # bookkeeping resets
+        ctx.stage_counts   = {}
+        ctx.stage_outputs  = {}
+        ctx.tool_summaries = getattr(ctx, "tool_summaries", [])
         ctx.assembled      = ""
         ctx.final_response = None
 
-        # record history
+        # fresh debug bucket
+        ctx.frame["debug"] = {}          # ← NEW: stage ↦ list[{"role","content"}]
+
+        # record the incoming message
         ctx.history_manager.add_entry(sender_role, user_message)
 
-        # 3) telemetry start
+        # 3) telemetry start -------------------------------------------------
         run_id              = self.observer.start_run(user_message)
         self.current_run_id = run_id
         ctx.run_id          = run_id
 
-        # 4) RL‐driven system‐prompt selection (ε-greedy)
+        # 4) RL-driven system-prompt selection ------------------------------
         base_prompt = self.config_manager.config.get("system", "")
         if random.random() < 0.2:
             prompt, _ = self.rl_manager.propose(
@@ -7477,19 +7477,68 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             prompt = self.rl_manager.best_prompt(base_prompt)
         self.config_manager.config["system"] = prompt
 
-        # 5) run the fractal pipeline (uses _expand for dynamic routing)
+        # 5) run the fractal pipeline ---------------------------------------
         resp = self._run_fractal_pipeline(ctx)
 
-        # 6) compute & record a simple reward (1 − recent_failure_ratio)
+        # 6) simple reward ---------------------------------------------------
         reward = 1.0 - self.observer.recent_failure_ratio(n=10)
         self.rl_manager.record(prompt, [], reward)
 
-        # 7) wrap-up: persist memory and complete telemetry
+        # 7) persist memory & close telemetry --------------------------------
         self._save_workspace_memory(ctx.workspace_memory)
         self.observer.complete_run(run_id)
 
-        # (TTS of the final response is done only in _stage_final_inference)
+        # 8) optional debug dump ---------------------------------------------
+        if debug_context:
+            self.dump_debug_context(ctx)
+
+        # (TTS for the final response happens inside _stage_final_inference)
         return resp
+
+    def _record_stage_debug(self,
+                            ctx: Context,
+                            stage: str,
+                            prompt: str | list | dict | None,
+                            output: str | dict | None):
+        """
+        Collect the prompt/messages handed to the model (or tool) **and**
+        the resulting output so we can inspect exactly what each stage saw.
+
+        • Stored under  ctx.frame["debug"][stage]  as a list of dicts.
+        • Harmless if debug not enabled – zero-cost when unused.
+        """
+
+        # enable/disable with config["debug"], env var, or ad-hoc flag
+        if not getattr(self, "debug_mode", False):
+            return
+
+        bucket = ctx.frame.setdefault("debug", {}).setdefault(stage, [])
+        bucket.append({
+            "prompt" : prompt,
+            "output" : output
+        })
+
+    # ------------------------------------------------------------------ #
+    #  Helper : dump per-stage prompt / response snippets                #
+    # ------------------------------------------------------------------ #
+    def dump_debug_context(self, ctx: Context) -> None:
+        """
+        Pretty-print whatever each stage stashed in  ctx.frame["debug"].
+        Call from new_request(debug_context=True) or manually.
+        """
+        dbg = ctx.frame.get("debug", {})
+        if not dbg:
+            print("\n[Debug] (no context captured)")
+            return
+
+        for stage, msgs in dbg.items():
+            print(f"\n── {stage} ──")
+            for m in msgs:
+                role     = m.get("role", "?")
+                content  = (m.get("content") or "").replace("\n", " ")
+                preview  = (content[:200] + " …") if len(content) > 200 else content
+                print(f"{role}: {preview}")
+
     
     def _run_fractal_pipeline(self, ctx: Context) -> str:
         """
@@ -7956,7 +8005,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         entities = ", ".join(analysis.get("entities", []))
         prompt = (
             f"INTENT: {intent}\nENTITIES: {entities}\n\n"
-            + self._slice_ctx(ctx, 60)
+            + self._slice_ctx(ctx, lines=60)
             + "\nPhase 2 – pick one helper in ```tool_code```."
         )
         try:
@@ -7997,7 +8046,8 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             call_str = str(parsed)
 
         ctx.next_tool_call = call_str
-
+        if not call_str:
+            ctx._forced_next = ["tool_decision"] + ctx.get("_forced_next", [])
         # 4️⃣ Detect if this tool is unknown
         known_funcs = {
             name for name, fn in inspect.getmembers(Tools, inspect.isfunction)
@@ -8117,7 +8167,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             summary = None
             try:
                 data = json.loads(out)
-                if fn in ("search_internet", "brave_search"):
+                if fn in ("search_internet"):
                     lines = [f"- {r.get('title','')} ({r.get('url','')})"
                              for r in data["web"]["results"][:3]]
                     summary = "Top results:\n" + "\n".join(lines)
