@@ -198,6 +198,7 @@ if not os.path.exists(SETUP_MARKER):
         "webdriver-manager",# For managing web drivers
         "flask_cors",       # For CORS support in Flask
         "flask",            # For web server
+        "tiktoken",         # For tokenization
     ])
 
     # 3) Stamp and restart
@@ -281,6 +282,8 @@ from scipy.io.wavfile import write
 from scipy.signal import butter, lfilter       # EQ enhancement
 import numpy as np
 
+import re, ast, logging
+
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -312,6 +315,7 @@ import inspect
 import sqlite3
 import networkx as nx
 import pandas as pd
+import tiktoken
 
 # ── Wi-Fi control
 import pywifi
@@ -536,6 +540,8 @@ def process_tts_request(text: str):
 
 # This function starts the TTS worker thread that processes text-to-speech requests from the queue.
 def tts_worker(q):
+    import re
+
     log_message("TTS worker thread started.", "DEBUG")
     while True:
         text = q.get()
@@ -543,8 +549,13 @@ def tts_worker(q):
             log_message("TTS worker received shutdown signal.", "DEBUG")
             q.task_done()
             break
-        process_tts_request(text)
+
+        # Sanitize out unwanted symbols (asterisks, hashtags, tildes, etc.)
+        removeSymbols = re.sub(r'[\*#~]', '', text)
+        cleaned = clean_text(removeSymbols)
+        process_tts_request(cleaned)
         q.task_done()
+
 
 # This function is an audio callback that processes audio input from the microphone.
 def audio_callback(indata, frames, time_info, status):
@@ -1045,7 +1056,6 @@ class Tools:
         and normalizes key: value → key=value for basic literals.
         Returns the raw "func(...)" string, or None if nothing valid is found.
         """
-        import re, ast, logging
 
         t = text.strip()
 
@@ -2710,10 +2720,41 @@ class Tools:
                     if deep_scrape and href:
                         drv.switch_to.new_window("tab")          # Selenium-4 native tab
                         drv.get(href)
-                        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+
+                        # install a MutationObserver to detect when dynamic JS stops mutating the DOM
+                        drv.execute_script("""
+                            window._lastMut = Date.now();
+                            new MutationObserver(function() {
+                                window._lastMut = Date.now();
+                            }).observe(document, {
+                                childList: true,
+                                subtree:   true,
+                                attributes:true
+                            });
+                        """)
+
+                        # wait until either:
+                        #  • no DOM mutations for 500 ms, or
+                        #  • total time > wait_sec
+                        start_ms     = time.time() * 1000
+                        stable_delta = 500  # ms of no mutations needed
+                        while True:
+                            last_mut = drv.execute_script("return window._lastMut;")
+                            now_ms   = time.time() * 1000
+                            if now_ms - last_mut > stable_delta:
+                                # DOM has been quiet
+                                break
+                            if now_ms - start_ms > wait_sec * 1000:
+                                log_message(
+                                    f"[duckduckgo_search] dynamic-load timeout for {href!r}, scraping anyway",
+                                    "WARNING"
+                                )
+                                break
+                            time.sleep(0.1)
 
                         # First try our lightweight requests helper
                         page_content = Tools.bs4_scrape(href)
+
                         if page_content.startswith("Error"):
                             # fallback to Selenium DOM if remote site blocks requests
                             page_content = drv.page_source
@@ -2799,7 +2840,10 @@ class Tools:
             drv = Tools._driver
             wait = WebDriverWait(drv, wait_sec)
             drv.get(url)
-            wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            try:
+                wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            except TimeoutException:
+                log_message(f"[selenium_extract_summary] body never appeared for {url!r}, using page_source anyway", "WARNING")
             pg2 = BeautifulSoup(drv.page_source, "html5lib")
             m2 = pg2.find("meta", attrs={"name": "description"})
             if m2 and m2.get("content"):
@@ -3319,53 +3363,46 @@ class Tools:
     @staticmethod
     def summarize_search(topic: str, top_n: int = 3) -> str:
         """
-        1) Call search_internet() – Brave when available, DDG otherwise.
-        2) Take the first `top_n` results.
-        3) Scrape each URL with bs4_scrape().
-        4) Ask secondary_agent_tool() for a 2-3 sentence summary.
-        5) Return a neat bullet-list.
+        1) Call our duckduckgo_search() to open each result in a tab and deep-scrape.
+        2) For each page, feed the full-text snippet into the secondary_agent_tool().
+        3) Return a neat bullet-list of 2–3 sentence summaries.
         """
-        import json, traceback
+        import traceback
+        from selenium.common.exceptions import TimeoutException
 
         try:
-            raw = Tools.search_internet(topic)
-            payload = json.loads(raw or "{}")
-            engine  = payload.get("engine")
-            data    = payload.get("data", {})
+            # open tabs and scrape each page’s content
+            pages = Tools.duckduckgo_search(topic, num_results=top_n, deep_scrape=True)
         except Exception as e:
-            return f"Error parsing search results: {e}"
+            return f"Error retrieving search pages: {e}"
 
-        # ── normalise to a list of results with .url / .title ──────────────
-        if engine == "brave":
-            web_results = data.get("web", {}).get("results", [])[:top_n]
-        elif engine == "duckduckgo":
-            web_results = data[:top_n] if isinstance(data, list) else []
-        else:  # some error earlier
-            return f"No results – engine reported '{engine}'."
+        if not pages:
+            return "No results found."
 
         summaries = []
-        for idx, r in enumerate(web_results, start=1):
-            url   = r.get("url") or r.get("url", "")
-            title = r.get("title") or r.get("title", url)
-            if not url:
-                continue
+        for idx, p in enumerate(pages, start=1):
+            url     = p.get("url", "")
+            title   = p.get("title", url)
+            content = p.get("content", "")
+            # limit how much we send to the LLM
+            snippet = content[:2000].replace("\n", " ")
+
+            prompt = (
+                f"Here is the content of {url}:\n\n"
+                f"{snippet}\n\n"
+                "Please give me a 2-3 sentence summary of the key points."
+            )
+
             try:
-                html_doc = Tools.bs4_scrape(url)
-                snippet  = html_doc[:2000].replace("\n", " ") if isinstance(html_doc, str) else ""
-                prompt   = (
-                    f"Here is the beginning of the page at {url}:\n\n"
-                    f"{snippet}\n\n"
-                    "Please give me a 2-3 sentence summary of the key points."
-                )
                 summary = Tools.secondary_agent_tool(prompt, temperature=0.3)
             except Exception as ex:
-                log_message(f"Summarisation failed for {url}: {ex}", "ERROR")
-                summary = "Failed to scrape or summarise that page."
+                log_message(f"[summarize_search] summarisation failed for {url}: {ex}", "ERROR")
+                summary = "Failed to summarise that page."
+
             summaries.append(f"{idx}. {title} — {summary.strip()}")
 
-        if not summaries:
-            return "No web results found."
         return "\n".join(summaries)
+
 
     # This static method scrapes a webpage using BeautifulSoup and requests. It fetches the content of the URL, parses it with BeautifulSoup, and returns the prettified HTML. If an error occurs during scraping, it logs the error and returns an error message.
     @staticmethod
@@ -3512,9 +3549,8 @@ class StopStreamException(Exception):
     """Raised to abort a runaway or hallucinating stream."""
     pass
 
-# This class manages the Watchdog functionality, which monitors the quality of LLM runs and detects potential hallucinations in the output. It evaluates the overall run quality and monitors streaming outputs for hallucinations.
+# This class manages the Watchdog functionality, which monitors the quality of LLM runs and detects potential hallucinations in the output.
 class WatchdogManager:
-    # This class monitors the quality of LLM runs and detects potential hallucinations in the output.
     def __init__(self, quality_model: str, halluc_model: str = None,
                  quality_threshold: float = 7.5, halluc_threshold: float = 0.5,
                  max_retries: int = 1):
@@ -3531,29 +3567,27 @@ class WatchdogManager:
         self.halluc_threshold  = halluc_threshold
         self.max_retries       = max_retries
 
-        # New controls to avoid flagging tiny or too‐frequent snippets:
-        self.min_snippet_tokens     = 3    # ignore snippets shorter than this
-        self.snippet_check_frequency = 2   # only check every Nth snippet
+        # controls for snippet checks
+        self.min_snippet_tokens      = 3    # ignore snippets shorter than this (in tokens)
+        self.snippet_check_frequency = 2    # only check every Nth snippet
 
-    # This method evaluates the run quality after the full pipeline execution. It returns a tuple containing the score (0–10) and a list of suggestions for improvement.
+        # tokenizer for token-based slicing
+        self._tokenizer = tiktoken.get_encoding("cl100k_base")
+
     def evaluate_run(self, ctx) -> tuple[float, list[str]]:
-        """
-        After the full pipeline, returns (score, suggestions).
-        """
         report = {
             "stages":         ctx.stage_counts,
             "ctx_txt":        ctx.ctx_txt[:2000],
             "final_response": ctx.final_response
         }
         system = (
-            "You are a Pipeline Watchdog.  Given a JSON report of a pipeline run "
-            "(which stages ran, their counts, the accumulated ctx_txt, and the "
-            "final_response),\n"
-            " 1) rate overall run quality 0–10 (higher is better)\n"
-            " 2) if below threshold, propose 1–3 concrete adjustments to the stage list\n"
-            "Output a JSON object: {\"score\": <float>, \"suggestions\": [<string>,…]}."
+            "You are a Pipeline Watchdog. Given a JSON report of a pipeline run "
+            "(stages, counts, accumulated ctx_txt, final_response),\n"
+            "1) rate overall run quality 0–10\n"
+            "2) if below threshold, propose 1–3 concrete adjustments\n"
+            "Output JSON: {\"score\": float, \"suggestions\": [strings]}."
         )
-        user = f"Here is the run report:\n\n```json\n{json.dumps(report, indent=2)}\n```"
+        user = f"Run report:\n```json\n{json.dumps(report, indent=2)}\n```"
         resp = chat(
             model=self.quality_model,
             messages=[{"role":"system","content":system},
@@ -3563,75 +3597,73 @@ class WatchdogManager:
         try:
             out = json.loads(resp)
             return float(out.get("score", 0.0)), out.get("suggestions", [])
-        except Exception:
+        except:
             return 0.0, []
 
-    # This method monitors a streaming output for potential hallucinations. It yields each chunk of the stream while checking every Nth snippet for hallucinations, based on the configured thresholds.
     def monitor_stream(self, stream_generator, ctx):
+        """
+        Yields (chunk, done) while periodically tokenizing each snippet
+        and logging its token length. Uses token-based thresholds for brevity.
+        """
         executor       = ThreadPoolExecutor(max_workers=2)
         pending_checks = []
         snippet_count  = 0
 
-        def schedule_check(snippet):
-            return executor.submit(self._detect_hallucination, snippet, ctx)
+        def schedule_check(snip):
+            return executor.submit(self._detect_hallucination, snip, ctx)
 
         try:
             for chunk, done in stream_generator:
-                # 1) Always pass tokens through immediately
+                # pass tokens through
                 yield chunk, done
 
                 snippet = chunk.strip()
                 if not snippet:
                     continue
 
-                # 2) Throttle: only check every Nth non-empty snippet
                 snippet_count += 1
                 if snippet_count % self.snippet_check_frequency != 0:
                     continue
 
-                # 3) Ignore very short snippets (e.g. “My”, “Sorry”)
-                if len(snippet.split()) < self.min_snippet_tokens:
+                # count tokens
+                toks = self._tokenizer.encode(snippet)
+                if len(toks) < self.min_snippet_tokens:
                     continue
 
-                # 4) Schedule the hallucination check
+                # report snippet token count
+                log_message(f"[Watchdog] snippet tokens={len(toks)}", "DEBUG")
+
                 pending_checks.append(schedule_check(snippet))
 
-                # 5) Process any completed checks
+                # handle completed checks
                 for f in pending_checks[:]:
                     if f.done():
                         score = f.result()
                         pending_checks.remove(f)
                         if score >= self.halluc_threshold:
                             log_message(
-                                f"[Watchdog] Hallucination flagged "
-                                f"(score={score:.2f}) on snippet {snippet!r}; continuing without abort.",
+                                f"[Watchdog] Hallucination flagged (score={score:.2f})",
                                 "WARNING"
                             )
-                            # note: no StopStreamException here
         finally:
             executor.shutdown(wait=False)
 
-    # This method detects hallucinations in a given snippet using the configured hallucination model. It returns a score between 0 and 1, where higher scores indicate more likely hallucinations.
-    # It skips very short or trivial snippets entirely.
     def _detect_hallucination(self, snippet: str, ctx) -> float:
-        """
-        Returns a hallucination score 0–1 for this snippet, using self.halluc_model.
-        We skip very short or trivial snippets entirely.
-        """
-        # 1) Skip trivial snippets
-        if len(snippet.split()) < self.min_snippet_tokens:
+        if len(self._tokenizer.encode(snippet)) < self.min_snippet_tokens:
             return 0.0
 
+        # token-slice last 1000 tokens of context
+        all_ctx_toks = self._tokenizer.encode(ctx.ctx_txt)
+        ctx_snip = self._tokenizer.decode(all_ctx_toks[-1000:])
+
         system = (
-            "You are a Hallucination Detector.  Given a short snippet of output and "
-            "the conversation context, rate how likely it is that this snippet is "
-            "fabricated or unsupported by the context, on a scale from 0.0 to 1.0."
+            "You are a Hallucination Detector. Given a snippet and context, "
+            "rate likelihood of fabrication (0.0–1.0)."
         )
         user = (
-            f"Context so far:\n{ctx.ctx_txt[-1000:]}\n\n"
-            f"Snippet to evaluate:\n\"\"\"\n{snippet}\n\"\"\"\n\n"
-            "Respond with a single float between 0.0 (no hallucination) and 1.0 "
-            "(definite hallucination)."
+            f"Context (last 1000 tokens):\n{ctx_snip}\n\n"
+            f"Snippet:\n\"\"\"\n{snippet}\n\"\"\"\n\n"
+            "Respond with a single float."
         )
         resp = chat(
             model=self.halluc_model,
@@ -3642,7 +3674,6 @@ class WatchdogManager:
         try:
             return float(resp)
         except:
-            # on parse failure, assume no hallucination
             return 0.0
 
 # This class tracks the performance of each stage in the pipeline, recording timing and success rates. It adjusts the system prompt for stages that consistently underperform, aiming to improve reliability.
@@ -3689,68 +3720,124 @@ class PromptEvaluator:
 # This class manages a rolling history of prompts and their observed rewards, allowing for the suggestion of variations and selection of the best-performing prompts.
 class RLManager:
     """
-    Keeps a rolling history of prompts/stage-lists and their
-    observed 'rewards' (here: success vs. error + optional metrics).
-    Provides simple APIs to suggest variations and pick the best.
+    Keeps a rolling history of (prompt, stages, reward) and
+    does ε-greedy selection of new vs. best configurations.
+    Also can persist the best configuration back to agent_stack.json.
     """
-    WINDOW = 25        # how many recent runs to keep
+    WINDOW = 25
+    EPSILON = 0.2
 
-    # Initializes the RLManager with an empty history list that will store tuples of (prompt, stages, reward).
     def __init__(self):
-        self.history = []   # list[(prompt,str), stages,list[str], reward,float]
+        self.history = []             # list[ (prompt: str, stages: list[str], reward: float) ]
+        self.last_selected = None     # last (prompt, stages) returned by select()
 
-    # This method records a new prompt, its stages, and the observed reward. If the history exceeds the WINDOW size, it removes the oldest record to maintain a rolling history.
     def record(self, prompt: str, stages: list[str], reward: float):
+        """
+        Record the triplet and evict the oldest if over WINDOW.
+        """
         self.history.append((prompt, stages, reward))
         if len(self.history) > self.WINDOW:
             self.history.pop(0)
 
-    # This method proposes a new prompt and stage list by mutating the base prompt and stages. It randomly shuffles instructions in the prompt and may drop, add, or swap stages in the stage list.
+    def best_prompt(self, default: str) -> str:
+        """
+        Return the prompt with the highest recorded reward, or default.
+        """
+        if not self.history:
+            return default
+        return max(self.history, key=lambda rec: rec[2])[0]
+
+    def best_stages(self, default: list[str]) -> list[str]:
+        """
+        Return the stage-list with the highest recorded reward, or default.
+        """
+        if not self.history:
+            return default
+        return max(self.history, key=lambda rec: rec[2])[1]
+
     def propose(self, base_prompt: str, base_stages: list[str]) -> tuple[str, list[str]]:
-        # 1) mutate the prompt (simple example: shuffle two instructions)
+        """
+        Mutate the base_prompt and base_stages to explore new configurations.
+        """
+        import random
+
+        # — Mutate the prompt by shuffling two lines —
         parts = base_prompt.split("\n")
         if len(parts) > 1 and random.random() < 0.5:
             i, j = random.sample(range(len(parts)), 2)
             parts[i], parts[j] = parts[j], parts[i]
         new_prompt = "\n".join(parts)
 
-        # 2) mutate the stage list: maybe drop or add
+        # — Mutate the stage list —
         stages = base_stages.copy()
-        ops = ["drop", "add", "swap"]
-        op = random.choice(ops)
+        op = random.choice(["drop", "add", "swap"])
         if op == "drop" and len(stages) > 5:
             stages.pop(random.randrange(len(stages)))
         elif op == "add":
-            extras = ["html_filtering", "chunk_and_summarize",
-                      "rl_experimentation", "prompt_optimization"]
-            stages.insert(random.randrange(len(stages)+1),
-                          random.choice(extras))
+            extras = [
+                "html_filtering",
+                "chunk_and_summarize",
+                "rl_experimentation",
+                "prompt_optimization"
+            ]
+            stages.insert(random.randrange(len(stages) + 1), random.choice(extras))
         elif op == "swap" and len(stages) > 2:
             i, j = random.sample(range(len(stages)), 2)
             stages[i], stages[j] = stages[j], stages[i]
+
         return new_prompt, stages
 
-    # This method suggests a new prompt based on the best-performing prompt in the history. If no history exists, it returns the default prompt.
-    def best_prompt(self, default: str) -> str:
+    def select(self, base_prompt: str, base_stages: list[str]) -> tuple[str, list[str]]:
+        """
+        ε-greedy selection: with probability EPSILON explore a new variant,
+        otherwise exploit the best recorded so far.
+        """
+        import random
+
+        if not self.history or random.random() < self.EPSILON:
+            choice = self.propose(base_prompt, base_stages)
+        else:
+            choice = (
+                self.best_prompt(base_prompt),
+                self.best_stages(base_stages)
+            )
+        self.last_selected = choice
+        return choice
+
+    def update_agent_stack(self, justification: str = ""):
+        """
+        Persist the best-known prompt and stages back to agent_stack.json
+        (via Tools.update_agent_stack), if they differ from current.
+        """
         if not self.history:
-            return default
-        best = max(self.history, key=lambda rec: rec[2])
-        return best[0]
+            return
+
+        # pick the best
+        best_prompt, best_stages, _ = max(self.history, key=lambda rec: rec[2])
+        current = Tools.load_agent_stack()
+        patched: dict = {}
+
+        if current.get("system") != best_prompt:
+            patched["system"] = best_prompt
+        if current.get("stages") != best_stages:
+            patched["stages"] = best_stages
+
+        if patched:
+            Tools.update_agent_stack(patched, justification=justification)
 
 # This class provides a lightweight run-time telemetry system that tracks each pipeline run, every stage's status and timing, and exposes simple signals (e.g., recent failure rate) that the ChatManager can use to adjust its behavior.
 class Observer:
     """
     Lightweight run-time telemetry: tracks each pipeline run, every stage’s
-    status and timing, and exposes simple signals (e.g. recent failure rate)
-    that ChatManager can use to adjust its behaviour.
+    status and timing, and reports context token counts at key points.
     """
     _ids = count(1)
 
-    # Initializes the Observer with an empty runs dictionary that will hold run data indexed by run IDs.
     def __init__(self):
         self.runs: dict[int, dict] = {}
+        # tokenizer for measuring context size
+        self._tokenizer = tiktoken.get_encoding("cl100k_base")
 
-    # This method starts a new run, assigning it a unique run ID and storing the user message, start time, and initial status. It returns the run ID.
     def start_run(self, user_msg: str) -> int:
         run_id = next(self._ids)
         self.runs[run_id] = {
@@ -3759,28 +3846,49 @@ class Observer:
             "stages":   defaultdict(dict),
             "status":   "running"
         }
+        # report initial context size
+        cm = globals().get("chat_manager")
+        if cm and getattr(cm, "current_ctx", None):
+            txt = cm.current_ctx.ctx_txt
+            tok_count = len(self._tokenizer.encode(txt))
+            print(f"[Observer] run #{run_id} start — context tokens={tok_count}")
         return run_id
 
-    # This method logs the start and end times of a stage, along with its status. It initializes the stage entry if it does not exist.
     def log_stage_start(self, run_id: int, stage: str):
         self.runs[run_id]["stages"][stage]["start"] = datetime.now()
+        cm = globals().get("chat_manager")
+        if cm and getattr(cm, "current_ctx", None):
+            txt = cm.current_ctx.ctx_txt
+            tok_count = len(self._tokenizer.encode(txt))
+            print(f"[Observer] run #{run_id} stage_start '{stage}' — context tokens={tok_count}")
 
-    # This method logs a token emitted during a stage, allowing for per-token streaming. It initializes the stage entry if it does not exist.
     def log_stage_end(self, run_id: int, stage: str):
         self.runs[run_id]["stages"][stage]["end"]   = datetime.now()
         self.runs[run_id]["stages"][stage]["status"] = "done"
+        cm = globals().get("chat_manager")
+        if cm and getattr(cm, "current_ctx", None):
+            txt = cm.current_ctx.ctx_txt
+            tok_count = len(self._tokenizer.encode(txt))
+            print(f"[Observer] run #{run_id} stage_end   '{stage}' — context tokens={tok_count}")
 
-    # This method logs a token emitted during a stage, allowing for per-token streaming. It initializes the stage entry if it does not exist.
     def log_error(self, run_id: int, stage: str, err: Exception):
         self.runs[run_id]["stages"][stage]["error"]  = str(err)
         self.runs[run_id]["stages"][stage]["status"] = "error"
+        cm = globals().get("chat_manager")
+        if cm and getattr(cm, "current_ctx", None):
+            txt = cm.current_ctx.ctx_txt
+            tok_count = len(self._tokenizer.encode(txt))
+            print(f"[Observer] run #{run_id} stage_error '{stage}' — error={err!r} — context tokens={tok_count}")
 
-    # This method logs a token emitted during a stage, allowing for per-token streaming. It initializes the stage entry if it does not exist.
     def complete_run(self, run_id: int):
         self.runs[run_id]["end"]   = datetime.now()
         self.runs[run_id]["status"] = "done"
+        cm = globals().get("chat_manager")
+        if cm and getattr(cm, "current_ctx", None):
+            txt = cm.current_ctx.ctx_txt
+            tok_count = len(self._tokenizer.encode(txt))
+            print(f"[Observer] run #{run_id} complete — context tokens={tok_count}")
 
-    # Here is a method to retrieve the run data for a specific run ID. It returns the run details or None if the run ID does not exist.
     def recent_failure_ratio(self, n: int = 10) -> float:
         """Return fraction of the last *n* runs that had any stage error."""
         last = list(self.runs.values())[-n:]
@@ -3792,26 +3900,24 @@ class Observer:
         )
         return fails / len(last)
 
+
 # This class wraps the Observer to emit every event as JSON over Server-Sent Events (SSE), proxies other calls, and adds per-token streaming capabilities. It allows subscribers to receive real-time updates about the run lifecycle and tool usage.
 class ObservabilityManager:
     """
     Wraps Observer to emit every event as JSON over SSE,
     proxies other calls, and adds per-token streaming.
     """
-    # Initializes the ObservabilityManager with a real Observer instance and an empty list of subscribers.
     def __init__(self, real_observer):
         self.real = real_observer
         self._subscribers = []
+        self._tokenizer = tiktoken.get_encoding("cl100k_base")
 
-    # This method allows dynamic attribute access to the underlying Observer instance, enabling the ObservabilityManager to proxy calls to the real Observer.
     def __getattr__(self, name):
         return getattr(self.real, name)
 
-    # This method allows subscribers to register callback functions that will be called when an event is emitted. Subscribers can be any callable that accepts a single argument (the JSON payload).
     def subscribe(self, fn):
         self._subscribers.append(fn)
 
-    # This method emits an event to all registered subscribers by converting the event dictionary to a JSON string and calling each subscriber function with the payload. If a subscriber raises an exception, it is removed from the list of subscribers.
     def _emit(self, event: dict):
         payload = json.dumps(event)
         for fn in list(self._subscribers):
@@ -3820,69 +3926,90 @@ class ObservabilityManager:
             except:
                 self._subscribers.remove(fn)
 
-    # This method starts a new run, emits a "run_start" event with the run ID and user message, and returns the run ID. It also records the start time of the run.
     def start_run(self, user_msg):
         rid = self.real.start_run(user_msg)
         self._emit({
-            "runId": rid, "type":"run_start", "user_msg":user_msg,
+            "runId":     rid,
+            "type":      "run_start",
+            "user_msg":  user_msg,
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
         return rid
 
-    # This method logs the start of a stage, emits a "stage_start" event with the run ID and stage name, and records the start time of the stage.
     def log_stage_start(self, runId, stage):
         self.real.log_stage_start(runId, stage)
-        self._emit({
-            "runId": runId, "type":"stage_start", "stage":stage,
+        cm = globals().get("chat_manager")
+        event = {
+            "runId":     runId,
+            "type":      "stage_start",
+            "stage":     stage,
             "timestamp": datetime.now(timezone.utc).isoformat()
-        })
+        }
+        if cm and getattr(cm, "current_ctx", None):
+            txt = cm.current_ctx.ctx_txt
+            event["context_tokens"] = len(self._tokenizer.encode(txt))
+        self._emit(event)
 
-    # This method logs a token emitted during a stage, emits a "stage_stream" event with the run ID, stage name, and token, and records the timestamp of the token emission.
     def log_stage_token(self, runId, stage, token):
-        # new: per‐token streaming
         self._emit({
-            "runId": runId, "type":"stage_stream",
-            "stage":stage, "token": token,
+            "runId":     runId,
+            "type":      "stage_stream",
+            "stage":     stage,
+            "token":     token,
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
-    # This method logs the end of a stage, emits a "stage_end" event with the run ID and stage name, and records the end time of the stage.
     def log_stage_end(self, runId, stage):
         self.real.log_stage_end(runId, stage)
-        self._emit({
-            "runId": runId, "type":"stage_end", "stage":stage,
+        cm = globals().get("chat_manager")
+        event = {
+            "runId":     runId,
+            "type":      "stage_end",
+            "stage":     stage,
             "timestamp": datetime.now(timezone.utc).isoformat()
-        })
+        }
+        if cm and getattr(cm, "current_ctx", None):
+            txt = cm.current_ctx.ctx_txt
+            event["context_tokens"] = len(self._tokenizer.encode(txt))
+        self._emit(event)
 
-    # This method logs an error that occurred during a stage, emits a "stage_error" event with the run ID, stage name, and error message, and records the timestamp of the error.
     def log_error(self, runId, stage, err):
         self.real.log_error(runId, stage, err)
-        self._emit({
-            "runId": runId, "type":"stage_error", "stage":stage,
-            "error": str(err),
+        cm = globals().get("chat_manager")
+        event = {
+            "runId":     runId,
+            "type":      "stage_error",
+            "stage":     stage,
+            "error":     str(err),
             "timestamp": datetime.now(timezone.utc).isoformat()
-        })
+        }
+        if cm and getattr(cm, "current_ctx", None):
+            txt = cm.current_ctx.ctx_txt
+            event["context_tokens"] = len(self._tokenizer.encode(txt))
+        self._emit(event)
 
-    # This method completes a run, emits a "run_end" event with the run ID, and records the end time of the run.
     def complete_run(self, runId):
         self.real.complete_run(runId)
         self._emit({
-            "runId": runId, "type":"run_end",
+            "runId":     runId,
+            "type":      "run_end",
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
-    # This method logs the start of a tool, emits a "tool_start" event with the run ID and tool name, and records the timestamp of the tool start.
     def log_tool_start(self, runId, tool):
         self._emit({
-            "runId": runId, "type":"tool_start", "tool":tool,
+            "runId":     runId,
+            "type":      "tool_start",
+            "tool":      tool,
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
-    # This method logs the end of a tool, emits a "tool_end" event with the run ID, tool name, and output, and records the timestamp of the tool end.
     def log_tool_end(self, runId, tool, output):
         self._emit({
-            "runId": runId, "type":"tool_end", "tool":tool,
-            "output": output,
+            "runId":     runId,
+            "type":      "tool_end",
+            "tool":      tool,
+            "output":    output,
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
@@ -4006,48 +4133,56 @@ class ChatManager:
     #                         PIPELINE STAGE LIST                      #
     # ---------------------------------------------------------------- #
     STAGES: list[tuple[str, str, str]] = [
-        # ── core understanding ───────────────────────────────────────────
-        ("context_analysis",             "_stage_context_analysis",             None),
+        # Self‐repair / first-error-patch / reflection / RL tweaks
+        ("self_repair",            "_stage_self_repair",           None),
+        ("first_error_patch",      "_stage_first_error_patch",     "self_repair"),
+        ("state_reflection",       "_stage_state_reflection",      "first_error_patch"),
+        ("prompt_optimization",    "_stage_prompt_optimization",   "state_reflection"),
+        ("rl_experimentation",     "_stage_rl_experimentation",    "prompt_optimization"),
+
+        # Core user-turn analysis
+        ("context_analysis",             "_stage_context_analysis",             "rl_experimentation"),
         ("intent_clarification",         "_stage_intent_clarification",         "context_analysis"),
         ("external_knowledge_retrieval", "_stage_external_knowledge_retrieval", "intent_clarification"),
         ("planning_summary",             "_stage_planning_summary",             "external_knowledge_retrieval"),
 
-        # ── personality & self-starter drives ───────────────────────────
-        ("drive_generation",             "_stage_drive_generation",             "planning_summary"),
-        ("internal_adversarial",         "_stage_internal_adversarial",         "drive_generation"),
-        ("creative_promotion",           "_stage_creative_promotion",           "internal_adversarial"),
+        # Personality & self-starter drives
+        ("drive_generation",        "_stage_drive_generation",        "planning_summary"),
+        ("internal_adversarial",    "_stage_internal_adversarial",    "drive_generation"),
+        ("creative_promotion",      "_stage_creative_promotion",      "internal_adversarial"),
 
-        # ── autonomous tool editing ─────────────────────────────────────
-        ("tool_self_improvement",        "_stage_tool_self_improvement",        "creative_promotion"),
+        # Autonomous tool editing
+        ("tool_self_improvement",   "_stage_tool_self_improvement",   "creative_promotion"),
 
-        # ── complex-task fulfilment ────────────────────────────────────
-        ("define_criteria",              "_stage_define_criteria",              "tool_self_improvement"),
-        ("task_decomposition",           "_stage_task_decomposition",           "define_criteria"),
-        ("plan_validation",              "_stage_plan_validation",              "task_decomposition"),
-        ("execute_actions",              "_stage_execute_actions",              "plan_validation"),
-        ("verify_results",               "_stage_verify_results",               "execute_actions"),
-        ("plan_completion_check",        "_stage_plan_completion_check",        "verify_results"),
-        ("checkpoint",                   "_stage_checkpoint",                   "plan_completion_check"),
+        # Complex-task fulfilment
+        ("define_criteria",         "_stage_define_criteria",         "tool_self_improvement"),
+        ("task_decomposition",      "_stage_task_decomposition",      "define_criteria"),
+        ("plan_validation",         "_stage_plan_validation",         "task_decomposition"),
+        ("execute_actions",         "_stage_execute_actions",         "plan_validation"),
+        ("verify_results",          "_stage_verify_results",          "execute_actions"),
+        ("plan_completion_check",   "_stage_plan_completion_check",   "verify_results"),
+        ("checkpoint",              "_stage_checkpoint",              "plan_completion_check"),
 
-        # optional task-list branch (inserted dynamically)  
-        ("task_management",              "_stage_task_management",              "verify_results"),
-        ("subtask_management",           "_stage_subtask_management",           "task_management"),
-        ("execute_tasks",                "_stage_execute_tasks",                "subtask_management"),
+        # Optional task-list branch
+        ("task_management",         "_stage_task_management",         "verify_results"),
+        ("subtask_management",      "_stage_subtask_management",      "task_management"),
+        ("execute_tasks",           "_stage_execute_tasks",           "subtask_management"),
 
-        # normal reply pipeline  
-        ("tool_chaining",                "_stage_tool_chaining",                "checkpoint"),
-        ("assemble_prompt",              "_stage_assemble_prompt",              "tool_chaining"),
-        ("self_review",                  "_stage_self_review",                  "assemble_prompt"),
-        ("final_inference",              "_stage_final_inference",              "self_review"),
+        # Normal reply pipeline
+        ("tool_chaining",           "_stage_tool_chaining",           "checkpoint"),
+        ("assemble_prompt",         "_stage_assemble_prompt",         "tool_chaining"),
+        ("self_review",             "_stage_self_review",             "assemble_prompt"),
+        ("final_inference",         "_stage_final_inference",         "self_review"),
+        ("output_review",           "_stage_output_review",           "final_inference"),
+        ("chain_of_thought",        "_stage_chain_of_thought",        "output_review"),
+        ("adversarial_loop",        "_stage_adversarial_loop",        "chain_of_thought"),
 
-        # ← NEW review stage goes here
-        ("output_review",                "_stage_output_review",                "final_inference"),
-
-        # then our adversarial/audit wrap-up  
-        ("adversarial_loop",             "_stage_adversarial_loop",             "output_review"),
-        ("notification_audit",           "_stage_notification_audit",           "adversarial_loop"),
-        ("flow_health_check",            "_stage_flow_health_check",            "notification_audit"),
+        # Notifications & health check
+        ("notification_audit",      "_stage_notification_audit",      "adversarial_loop"),
+        ("flow_health_check",       "_stage_flow_health_check",       "notification_audit"),
     ]
+
+
 
     class _Stage:
         """Wrapper so we can queue stages as objects (needed for branching)."""
@@ -4060,12 +4195,26 @@ class ChatManager:
     def _expand(self, stage: str, ctx: Context) -> list[str]:
         import re
 
-        # 0️⃣ Forced injections
+        # ➡️ One-time dynamic pipeline adaptation, immediately after context_analysis
+        if stage == "context_analysis" and not getattr(ctx, "_pipeline_adapted", False):
+            base = [name for name,_,_ in self.STAGES]
+            adapted = self._assemble_stage_list(ctx.user_message, base)
+            ctx.overridden_stages   = adapted
+            ctx.pipeline_overridden = True
+            ctx._pipeline_adapted   = True
+            ctx.ctx_txt += f"\n[Pipeline adapted to: {adapted}]\n"
+
+        # 0️⃣ If any stage just failed, run self-repair first
+        if getattr(ctx, "last_failure", None):
+            return ["self_repair"]
+
+        # 1️⃣ Forced injections
         forced = getattr(ctx, "_forced_next", [])
         if forced:
             return [forced.pop(0)]
 
-        # 1️⃣ If there’s a pending tool call, execute it next
+
+        # 2️⃣ If there’s a pending tool call, execute it next
         if getattr(ctx, "next_tool_call", None) and stage != "execute_selected_tool":
             return ["execute_selected_tool"]
 
@@ -4136,7 +4285,7 @@ class ChatManager:
             # if audit finds missing info, ask the user
             if ctx.get("review_status") == "needs_clarification":
                 return ["intent_clarification"]
-            return ["adversarial_loop"]
+            return ["chain_of_thought"]
 
         if stage == "adversarial_loop":
             return ["notification_audit"]
@@ -4418,6 +4567,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         Execute the next tool call from ctx.plan (if any) exactly once, snapshot
         the last reasoning, sanitize & retry on syntax/value errors, then splice
         a compact input-context snippet + tool output back into ctx.ctx_txt.
+        If the tool errors, force a jump back to review_tool_plan.
         """
         import ast, re
 
@@ -4436,20 +4586,17 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 call_node = tree.body
                 if not isinstance(call_node, ast.Call):
                     return code
-                # function name
                 func_name = (
                     call_node.func.id
                     if isinstance(call_node.func, ast.Name)
                     else ast.unparse(call_node.func)
                 )
                 parts = []
-                # positional args
                 for arg in call_node.args:
                     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                         parts.append(repr(arg.value))
                     else:
                         parts.append(ast.unparse(arg))
-                # keyword args
                 for kw in call_node.keywords:
                     v = kw.value
                     if isinstance(v, ast.Constant) and isinstance(v.value, str):
@@ -4488,14 +4635,12 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                         sanitized = cleaned
                         tried_sanitize = True
                         continue
-                # give up after one sanitize attempt
                 output = f"ERROR: {e}"
                 summary = f"[✗ {sanitized} failed → {e}]"
                 log_message(summary, "ERROR")
                 break
 
             except Exception as e:
-                # any unexpected exception
                 output = f"ERROR: {e}"
                 summary = f"[✗ {sanitized} failed → {e}]"
                 log_message(summary, "ERROR")
@@ -4506,6 +4651,17 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ctx.ctx_txt += summary + "\n"
         ctx.stage_outputs["execute_selected_tool"] = output
         ctx.next_tool_call = None
+
+        # ── 4️⃣  On error, force a plan-review instead of exiting
+        if summary.startswith("[✗") or str(output).lower().startswith("error"):
+            ctx.last_failure = {
+                "type":    "tool_error",
+                "payload": str(output),
+                "stage":   "execute_selected_tool"
+            }
+            ctx._forced_next = ["review_tool_plan"]
+            return None
+
 
     def _stage_drive_generation(self, ctx: Context) -> str:
         """
@@ -5382,71 +5538,49 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         return None
 
 
-    def _stage_flow_health_check(self, ctx):
+    def _stage_flow_health_check(self, ctx: Context):
         """
-        After notification_audit, compute a simple health-score (1 − recent_failure_ratio),
-        log it, and—if it’s below 0.8—ask the secondary LLM for a recommended new stage list
-        (as a Python list).  If valid, persist via Tools.update_agent_stack (with justification).
+        After notification_audit:
+        - compute health = 1 - recent_failure_ratio
+        - use RLManager.select to pick next (prompt, stage order)
+        - persist new stack if changed
+        - record reward in RLManager
         """
-        import ast
         from datetime import datetime
 
-        # 1) Measure recent failures
-        failure_ratio = self.observer.recent_failure_ratio(n=10)
-        score = 1.0 - failure_ratio
-        log_message(f"[Watchdog] run score={score:.2f}", "INFO")
+        # 1) measure health
+        score = 1.0 - self.observer.recent_failure_ratio(n=10)
+        log_message(f"[Watchdog] pipeline health={score:.2f}", "INFO")
 
-        suggestions = []
-        # 2) If health poor, solicit LLM advice
-        if score < 0.8:
-            prompt = (
-                f"Our last pipeline run scored {score:.2f}/1.00 (lower is worse).\n"
-                f"Here’s the context-analysis + tool outputs + critique:\n{ctx.ctx_txt}\n\n"
-                "Which ordering of our full stage list (by exact stage names) would you "
-                "recommend to improve reliability?  Reply *exactly* with a Python list "
-                "of stage names, in the new desired order."
-            )
-            resp = chat(
-                model=self.config_manager.config["secondary_model"],
-                messages=[
-                    {"role": "system", "content": "You are a pipeline-health adviser."},
-                    {"role": "user",   "content": prompt}
-                ],
-                stream=False
-            )["message"]["content"].strip()
+        # 2) base config
+        base_prompt = self.config_manager.config.get("system", "")
+        base_stages = [name for name, _, _ in self.STAGES]
 
-            # 3) Parse the LLM’s proposed list
+        # 3) ε-greedy select
+        new_prompt, new_stages = self.rl_manager.select(base_prompt, base_stages)
+
+        # 4) if the ordering changed, persist it
+        if new_stages != base_stages:
+            justification = f"auto-reorder at {datetime.now().isoformat()} health={score:.2f}"
             try:
-                cand = ast.literal_eval(resp)
-                if isinstance(cand, list) and all(isinstance(n, str) for n in cand):
-                    suggestions = cand
-                else:
-                    log_message("[Watchdog] ignored non-list suggestion", "WARNING")
-            except Exception as e:
-                log_message(f"[Watchdog] suggestion parse failed: {e}", "WARNING")
-
-        # 4) If we got a non-empty valid suggestion, persist it
-        if suggestions:
-            current = Tools.load_agent_stack().get("stages", [])
-            valid = [s for s in suggestions if s in current]
-            if valid:
-                just = f"health_check run at {datetime.now().isoformat()} score={score:.2f}"
-                try:
-                    Tools.update_agent_stack(
-                        {"stages": valid},
-                        justification=just
-                    )
-                    log_message(f"[Watchdog] agent_stack.json updated to: {valid}", "INFO")
-                    ctx.ctx_txt += f"\n[Watchdog] Updated pipeline stages to: {valid}"
-                except Exception as e:
-                    log_message(f"[Watchdog] failed to update agent stack: {e}", "ERROR")
-            else:
-                log_message(
-                    "[Watchdog] no overlap between suggestion and existing stages; skipping update",
-                    "WARNING"
+                Tools.update_agent_stack(
+                    {"stages": new_stages},
+                    justification=justification
                 )
+                log_message(f"[Watchdog] reordered stages → {new_stages}", "INFO")
+                ctx.ctx_txt += f"\n[Watchdog] reordered pipeline to: {new_stages}"
+            except Exception as e:
+                log_message(f"[Watchdog] failed to update agent stack: {e}", "ERROR")
+
+        # 5) always update the system prompt for next run
+        self.config_manager.config["system"] = new_prompt
+
+        # 6) record reward for this run
+        self.rl_manager.record(new_prompt, new_stages, score)
 
         return None
+
+
 
 
     def _history_timeframe_query(self, user_message: str) -> str | None:
@@ -5825,12 +5959,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
 
     def _tick_activity(self):                     # alias used in tight loops
         self.last_interaction = datetime.now()   
-    # ─── Replace your existing _idle_monitor with this ───
+
     def _idle_monitor(self):
         """
         Runs in the background. Every `self.idle_interval` seconds of silence,
-        fires a synthetic user request that kicks off the full ChatManager pipeline
-        (context-analysis through execute_tasks, etc.).
+        runs the self-test suite, updates RLManager, and triggers health-check.
         """
         from datetime import datetime
         import time
@@ -5839,55 +5972,31 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             start_ts = time.time()
             interval = self.idle_interval
 
-            # wait until it's time (printing a countdown)
+            # wait until it’s time
             while not self._idle_stop.is_set():
                 elapsed = time.time() - start_ts
-                remaining = interval - elapsed
-                if remaining <= 0:
+                if elapsed >= interval:
                     break
-                mins, secs = divmod(int(remaining), 60)
-                print(f"[Idle Monitor] Next idle check in {mins}m {secs}s…", flush=True)
-                time.sleep(min(remaining, 10))
+                time.sleep(min(interval - elapsed, 10))
 
             if self._idle_stop.is_set():
                 break
 
             idle_secs = (datetime.now() - self.last_interaction).total_seconds()
             if idle_secs >= interval:
-                # Build a real “user” prompt from recent context
-                ctx = self.current_ctx
-                recent = (ctx.ctx_txt or "").replace("\n", " ")
-                snip   = recent[-200:] + "…" if len(recent) > 200 else recent
-                prompt = (
-                    f"I've been idle for {int(idle_secs)} seconds. "
-                    f"Recent context: {snip} "
-                    "What would you like me to do next?"
-                )
-
-                log_message(f"No user input for {int(idle_secs)}s — auto-triggering pipeline", "INFO")
-                print(f"[Idle Monitor] Idle detected ({int(idle_secs)}s) — invoking new_request", flush=True)
-
-                # *** DROP-IN FIX: send this as a USER message, not ASSISTANT ***
-                # so that the pipeline runs exactly as if the user spoke.
-                self.new_request(
-                    prompt,
-                    sender_role="user",
-                    skip_tts=True
-                )
-
-            else:
-                log_message("Idle monitor: activity detected—resetting countdown", "DEBUG")
-                print(f"[Idle Monitor] Activity detected ({int(idle_secs)}s idle) — countdown reset", flush=True)
+                log_message(f"[Idle Monitor] {int(idle_secs)}s inactive — running self-tests", "INFO")
+                # 1) run our self-test suite and record rewards
+                self._run_self_tests()
+                # 2) invoke flow health check so RLManager can adjust prompts/stages
+                self._stage_flow_health_check(self.current_ctx)
 
         log_message("Idle monitor thread exiting.", "DEBUG")
-
 
 
     def _start_idle_mull(self):
         """
         Background thread: after a random idle interval between idle_min/idle_max,
-        if still silent, schedule a new_request(...) that pulls in latest context
-        similarly to _idle_monitor, but on a randomized cadence.
+        if still silent, run self-tests and trigger health-check.
         """
         import threading, random, time
         from datetime import datetime
@@ -5901,23 +6010,9 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 time.sleep(interval)
                 idle_time = (datetime.now() - self.last_interaction).total_seconds()
                 if idle_time >= interval:
-                    log_message("Random idle detected: scheduling background mull", "INFO")
-                    # build a dynamic prompt as above
-                    ctx = self.current_ctx
-                    recent = (ctx.ctx_txt or "").replace("\n", " ")
-                    snip = (recent[-200:] + "...") if len(recent) > 200 else recent
-                    prompt = (
-                        f"It's been {int(idle_time)}s since the last command. "
-                        f"Recent context: {snip} "
-                        "Anything you’d like me to pick up on?"
-                    )
-                    # skip TTS so it doesn’t speak to an empty room
-                    self._executor.submit(
-                        self.new_request,
-                        prompt,
-                        sender_role="assistant",
-                        skip_tts=True
-                    )
+                    log_message(f"[Idle-Mull] {int(idle_time)}s inactive — running self-tests", "INFO")
+                    self._run_self_tests()
+                    self._stage_flow_health_check(self.current_ctx)
 
         thread = threading.Thread(target=_mull_loop, daemon=True)
         thread.start()
@@ -5926,7 +6021,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
 
     def stop_idle_mull(self):
         """
-        Stop the background idle‐mull loop and idle monitor.
+        Stop the background idle-mull loop and idle monitor.
         """
         if hasattr(self, "_idle_stop_event"):
             self._idle_stop_event.set()
@@ -5934,6 +6029,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         if hasattr(self, "_idle_stop"):
             self._idle_stop.set()
             log_message("Idle monitor stopped.", "INFO")
+
 
     # ----------------------------------------
     # NEW: Chain-of-Thought Agent
@@ -6071,13 +6167,13 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         if cfg.get("options"):
             payload["options"] = cfg["options"]
         return payload
-
     def chat_completion_stream(self, processed_text):
         """
-        Stream the primary‐model’s response to `processed_text` as a new user message.
-        Ensures the model sees a fresh user turn rather than two assistant turns in a row,
-        and aborts if it detects runaway repetition.
+        Stream the primary‐model’s response to `processed_text` as a new user message,
+        emitting punctuation-delimited chunks to TTS rather than token-by-token.
         """
+        import re
+        from collections import deque
 
         log_message("Primary-model stream starting...", "DEBUG")
 
@@ -6085,15 +6181,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         cfg     = self.config_manager.config
         sys_msg = {"role": "system", "content": cfg.get("system", "")}
 
-        # Optional: include a memory/context message if you use that pattern
         mem_content = ""  # or pull from your memory manager
         override = [sys_msg]
         if mem_content:
             override.append({"role": "system", "content": f"Memory Context:\n{mem_content}\n\n"})
-
-        # add the full chat history so far
         override.extend(self.history_manager.history)
-        # finally, our new “user” turn
         override.append({"role": "user", "content": processed_text})
 
         # 2) Build the payload with our override_messages
@@ -6102,12 +6194,15 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             model_key="primary_model"
         )
 
-        # 3) Stream and watch for repetition
-        print("⟳ Reply: ", end="", flush=True)
+        # Prepare TTS buffering
+        sentence_pattern = re.compile(r'(?<=[\.!\?])\s+')
+        tts_buffer = ""
         recent_chunks = deque(maxlen=5)
 
+        print("⟳ Reply: ", end="", flush=True)
+
+        # 3) Stream and watch for repetition
         for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
-            # immediate abort if external stop requested
             if self.stop_flag:
                 log_message("Primary-model stream aborted by stop_flag.", "WARNING")
                 yield "", True
@@ -6116,6 +6211,19 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             tok = part["message"]["content"]
             self.observer.log_stage_token(self.current_ctx.run_id, "final_inference", tok)
             print(tok, end="", flush=True)
+
+            # Accumulate into tts_buffer and flush complete sentences
+            tts_buffer += tok
+            while True:
+                m = sentence_pattern.search(tts_buffer)
+                if not m:
+                    break
+                split_idx = m.end()
+                sentence = tts_buffer[:split_idx].strip()
+                if sentence:
+                    self.tts_manager.enqueue(sentence)
+                tts_buffer = tts_buffer[split_idx:]
+
             yield tok, part.get("done", False)
 
             # repetition guard
@@ -6128,8 +6236,13 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                     yield "", True
                     return
 
+        # flush any remaining buffer
+        if tts_buffer.strip():
+            self.tts_manager.enqueue(tts_buffer.strip())
+
         print()
         log_message("Primary-model stream finished.", "DEBUG")
+
 
     def chat_completion_nonstream(self, processed_text):
         log_message("Primary-model non-stream starting...", "DEBUG")
@@ -6665,6 +6778,62 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
 
         return None
 
+
+    def _stage_state_reflection(self, ctx: Context):
+        """
+        ReflAct-style mini-reflection: after each tool or LLM step,
+        detect any drift or hallucination vs. the user goal.
+        """
+        goal = ctx.user_message
+        trace = ctx.ctx_txt[-500:]
+        prompt = (
+            "You are a reflection agent. Given the user's goal:\n\n"
+            f"    {goal}\n\n"
+            "And the current reasoning trace (last 500 chars):\n\n"
+            f"{trace}\n\n"
+            "List any divergence or hallucination you detect as bullet points. "
+            "If none, output exactly: NO_ISSUES."
+        )
+        resp = chat(
+            model=self.config_manager.config["secondary_model"],
+            messages=[{"role":"system","content":prompt}],
+            stream=False
+        )["message"]["content"].strip()
+        if resp.upper() != "NO_ISSUES":
+            ctx.ctx_txt += "\n[Reflection issues]\n" + resp
+        return None
+
+    def _stage_first_error_patch(self, ctx: Context):
+        """
+        Agent-R: as soon as a stage/tool errors, ask the LLM for a patch,
+        re-inject that corrected call, and clear the failure.
+        """
+        fail = getattr(ctx, "last_failure", None)
+        if not fail:
+            return None
+
+        stage_name = fail.get("stage", "<unknown>")
+        payload    = fail.get("payload", "")
+        prompt = (
+            f"You are an error-repair agent. The stage '{stage_name}' "
+            f"failed with: {payload!r}.\n"
+            "Propose a single corrected helper invocation that would succeed. "
+            "Output ONLY the corrected call."
+        )
+        fixed = chat(
+            model=self.config_manager.config["secondary_model"],
+            messages=[{"role":"system","content":prompt}],
+            stream=False
+        )["message"]["content"].strip()
+
+        if fixed:
+            ctx.ctx_txt += f"\n[Patched] {fixed}"
+            ctx._forced_next = [fixed] + getattr(ctx, "_forced_next", [])
+            ctx.last_failure = None
+
+        return None
+
+
     
     def _stage_define_criteria(self, ctx, planning_summary: str) -> list[str]:
         """
@@ -6800,6 +6969,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         except:
             pass
         return []
+    
     # ------------------------------------------------------------------ #
     #  Entry-point for every user turn                                   #
     # ------------------------------------------------------------------ #
@@ -6812,10 +6982,13 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         """
         • Optional `/ctx <name>` context switch
         • Records history + telemetry
-        • Always runs the fractal pipeline (so _expand controls tool-chaining)
-        • Preserves running narrative (ctx.ctx_txt) and tool_summaries
+        • Chooses system-prompt via RL and then runs the fractal pipeline
+        • Records a simple reward afterwards
         """
-        # ── 0) quick context switch ────────────────────────────────────────
+        import re, random
+        from datetime import datetime
+
+        # 0) quick context switch
         m = re.match(r"^/(topic|ctx)\s+(.+)$", user_message.strip(), re.I)
         if m:
             topic = m.group(2).strip()
@@ -6824,22 +6997,22 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             self.tts_manager.enqueue(resp)
             return resp
 
-        # ── 1) ensure an active Context ────────────────────────────────────
+        # 1) ensure an active Context
         if not getattr(self, "current_ctx", None):
             self._activate_context("global")
         ctx: Context = self.current_ctx
 
-        # re-bind managers so every tool & TTS points at the active context
+        # re-bind managers
         self.history_manager   = ctx.history_manager
         self.tts_manager       = ctx.tts_manager
         Tools._history_manager = ctx.history_manager
 
-        # ── 2) per-turn initialisation (do NOT wipe long-term fields) ─────
+        # 2) per-turn init (don’t wipe long-term fields)
         ctx.user_message = user_message
         ctx.sender_role  = sender_role
         ctx.skip_tts     = skip_tts
 
-        # rolling turn counter
+        # turn counter + narrative
         turn_no = getattr(ctx, "_turn_counter", 0) + 1
         ctx._turn_counter = turn_no
         ctx.ctx_txt += (
@@ -6847,41 +7020,56 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             f"{datetime.now().isoformat(timespec='seconds')} ──\n"
         )
 
-        # stage bookkeeping structures – fresh each turn
+        # fresh bookkeeping
         ctx.stage_counts  = {}
         ctx.stage_outputs = {}
-
-        # ensure persistent tool_summaries exists
         if not hasattr(ctx, "tool_summaries"):
             ctx.tool_summaries = []
-
         ctx.assembled      = ""
         ctx.final_response = None
 
-        # ── 2a) record in-memory + on-disk chat history ───────────────────
+        # 2a) record history
         ctx.history_manager.add_entry(sender_role, user_message)
 
-        # ── 3) telemetry run-start ─────────────────────────────────────────
+        # 3) telemetry start
         run_id              = self.observer.start_run(user_message)
         self.current_run_id = run_id
         ctx.run_id          = run_id
 
-        # ── 4) always use fractal pipeline (ignore saved agent-stack) ──────
-        if getattr(ctx, "pipeline_overridden", False):
-            resp = self._run_linear_pipeline(ctx, ctx.overridden_stages)
+        # 4) RL-driven system prompt selection (ε-greedy)
+        base_prompt    = self.config_manager.config.get("system", "")
+        if random.random() < 0.2:
+            prompt, _ = self.rl_manager.propose(
+                base_prompt,
+                Tools.load_agent_stack().get("stages", [])
+            )
+            ctx.ctx_txt += "[RL Exploration Enabled]\n"
         else:
-            resp = self._run_fractal_pipeline(ctx)
+            prompt = self.rl_manager.best_prompt(base_prompt)
 
-        # ── 5) wrap-up: persist memory, finish telemetry, optional TTS ─────
+        self.config_manager.config["system"] = prompt
+
+        # 5) run the **fractal** pipeline (honouring ctx._forced_next for expansion)
+        resp = self._run_fractal_pipeline(ctx)
+
+        # 6) compute & record a simple reward (1 − recent_failure_ratio)
+        reward = 1.0 - self.observer.recent_failure_ratio(n=10)
+        self.rl_manager.record(prompt, [], reward)
+
+        # 7) wrap-up: persist memory and complete telemetry
         self._save_workspace_memory(ctx.workspace_memory)
         self.observer.complete_run(run_id)
 
-        self.tts_manager.enqueue(resp)
+        # (TTS is handled by the final_inference stage itself)
         return resp
+
+
+
+
 
     def _run_fractal_pipeline(self, ctx: Context) -> str:
         """
-        Fractal, queue-driven engine with tool‐plan critique & retry.
+        Fractal, queue-driven engine with tool-plan critique & retry.
 
         Stages flow as before, but:
         - After plan_validation → review_tool_plan
@@ -6890,7 +7078,13 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         - Any failure bounces back to review_tool_plan per _expand().
         """
         run_id = ctx.run_id
-        queue  = deque([ self._Stage("context_analysis") ])
+
+        # Determine starting stage: use overridden list if set
+        if getattr(ctx, "pipeline_overridden", False) and getattr(ctx, "overridden_stages", None):
+            first_stage = ctx.overridden_stages[0]
+        else:
+            first_stage = "context_analysis"
+        queue = deque([ self._Stage(first_stage) ])
 
         # ensure we have a place to collect tool results/failures
         ctx.tool_failures = {}
@@ -6901,13 +7095,13 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             stage_obj = queue.popleft()
             name      = stage_obj.name
 
-            # ── skip runaway repeats ─────────────────────────────────────
+            # skip runaway repeats
             cnt = ctx.stage_counts.get(name, 0) + 1
             ctx.stage_counts[name] = cnt
             if cnt > 3:
                 continue
 
-            # ── dispatch to handler ─────────────────────────────────────
+            # dispatch to handler
             handler = getattr(self, f"_stage_{name}", None)
             if not handler:
                 continue
@@ -6919,8 +7113,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             try:
                 result = handler(ctx, *args) if args else handler(ctx)
             except Exception as e:
-                log_message(f"[{ctx.name}] '{name}' error: {e}", "ERROR")
-                result = None
+                # record failure metadata and schedule self-repair
+                ctx.last_failure = {"type":"exception","payload":str(e),"stage":name}
+                log_message(f"[{ctx.name}] '{name}' exception: {e}", "ERROR")
+                queue.appendleft(self._Stage("self_repair"))
+                continue
             finally:
                 self.observer.log_stage_end(run_id, name)
 
@@ -6928,34 +7125,30 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             if isinstance(result, str) and result:
                 ctx.stage_outputs[name] = result
 
-            # ── special‐case: execute_actions runs & monitors every tool ────
+            # special-case: execute_actions
             if name == "execute_actions":
-                # reset failures for this run
                 ctx.tool_failures = {}
-                # run each planned call in order
                 for call in getattr(ctx, "plan", []):
                     try:
                         res = Tools.run_tool_once(call)
                         ctx.tool_summaries.append({"call": call, "result": res})
                     except Exception as e:
-                        # capture the first exception, abort the loop
                         ctx.tool_failures[call] = str(e)
                         log_message(f"[{ctx.name}] tool execution failed for {call}: {e}", "ERROR")
                         break
-
-                # enqueue whatever comes next (review_tool_plan if failures exist)
                 for nxt in self._expand(name, ctx):
                     queue.append(self._Stage(nxt))
                 continue
 
-            # ── otherwise, regular expansion for all other stages ─────────
+            # regular expansion for all other stages
             for nxt in self._expand(name, ctx):
                 queue.append(self._Stage(nxt))
 
-        # ── wrap up ─────────────────────────────────────────────────────
+        # wrap up
         self._save_workspace_memory(ctx.workspace_memory)
         self.observer.complete_run(run_id)
         return ctx.final_response or ""
+
 
 
 
@@ -7297,83 +7490,84 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
     def _stage_planning_summary(self, ctx) -> str:
         """
         • Streams the tool-decision.
+        • Logs the incoming context token count.
         • Registers ctx.next_tool_call and forces the criteria → decomposition
           → validation branch so ctx.plan is always set.
         """
-        import re, inspect
 
-        # 1) Stream the tool decision and collect tokens as STRINGS
-        gathered = []
+        # 0️⃣ Compute and report incoming context size in tokens
+        ctx_text   = ctx.ctx_txt or ""
+        ctx_tokens = len(ctx_text.split())
+        log_message(f"[Planning summary] context size: {ctx_tokens} tokens", "DEBUG")
+        ctx.stage_outputs["planning_summary_ctx_tokens"] = ctx_tokens
+
+        # 1️⃣ Stream the tool decision, collecting tokens as strings
+        gathered: list[str] = []
         for chunk, done in self._stream_tool(ctx):
             if isinstance(chunk, str):
                 token_str = chunk
             elif isinstance(chunk, dict):
-                raw_val = (
+                token_str = (
                     chunk.get("content")
                     or chunk.get("message", {}).get("content")
                     or ""
                 )
-                token_str = raw_val if isinstance(raw_val, str) else str(raw_val)
             else:
                 token_str = str(chunk)
             gathered.append(token_str)
             if done:
                 break
 
-        # 2) Strip any fences and join
+        # 2️⃣ Combine and strip any code fences
+        combined = "".join(gathered)
         raw = re.sub(
             r"^```(?:tool_code|python|py)\s*|\s*```$",
             "",
-            "".join(gathered),
+            combined,
             flags=re.DOTALL
         ).strip().strip("`")
 
-        # 3) Parse & register the tool call
+        # 3️⃣ Parse & register the tool call
         call = Tools.parse_tool_call(raw)
         ctx.next_tool_call = call
 
-        # 4) Check if this tool exists already
-        known = {
+        # 4️⃣ Detect if we need to improve the tool set
+        sig_funcs = {
             name for name, fn in inspect.getmembers(Tools, inspect.isfunction)
             if not name.startswith("_")
         }
         if isinstance(call, str):
-            name = call.split("(", 1)[0]
-            ctx.needs_tool_work = name not in known
+            fn_name = call.split("(", 1)[0]
+            ctx.needs_tool_work = fn_name not in sig_funcs
         else:
             ctx.needs_tool_work = False
 
-        # 5) Optionally generate a one-sentence “what I’m about to do”
+        # 5️⃣ One-line explanation from secondary model (no TTS)
         plan_msg = ""
         if call:
-            resp = chat(
+            system = "Explain one casual sentence what this upcoming tool call will do."
+            user   = f"We are about to run {call} for: {ctx.user_message}"
+            resp   = chat(
                 model=self.config_manager.config["secondary_model"],
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Speak one casual sentence explaining what the "
-                            "upcoming tool call will do."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"We are about to run {call} for the user request: "
-                            f"{ctx.user_message}"
-                        )
-                    }
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user}
                 ],
                 stream=False
             )
-            plan_msg = resp.get("message", {}).get("content", "").strip()
-            if plan_msg and not getattr(ctx, "skip_tts", False):
-                self.tts_manager.enqueue(plan_msg)
+            if isinstance(resp, dict) and isinstance(resp.get("message"), dict):
+                plan_msg = resp["message"].get("content", "").strip()
+            else:
+                plan_msg = str(resp).strip()
 
-        # 6) Record and force next stages
+        # 6️⃣ Record and force next stages
         ctx.ctx_txt += f"\n[Planning summary] {plan_msg or '(no tool)'}"
         ctx.stage_outputs["planning_summary"] = plan_msg
-        ctx._forced_next = ["define_criteria", "task_decomposition", "plan_validation"]
+        ctx._forced_next = [
+            "define_criteria",
+            "task_decomposition",
+            "plan_validation"
+        ]
 
         return plan_msg
 
@@ -7384,41 +7578,52 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
     # ------------------------------
     def _stage_tool_chaining(self, ctx):
         """
-        1) Detect and run any “Next Action: Call `func()`” suggestion.
-        2) Otherwise do the normal streaming tool-chaining.
+        1) Log incoming context token count.
+        2) Auto‐invoke any “Next Action: Call `func()`” suggestion.
+        3) Otherwise perform up to 5 rounds of streaming tool-chaining,
+           logging context size each iteration.
         """
-        
 
-        run_id = ctx["run_id"]
+        # 0️⃣ Compute and report incoming context size in tokens
+        ctx_text = ctx.ctx_txt or ""
+        initial_tokens = len(ctx_text.split())
+        log_message(f"[Tool chaining] initial context size: {initial_tokens} tokens", "DEBUG")
+        ctx.stage_outputs["tool_chaining_ctx_tokens"] = initial_tokens
 
-        # 1) Auto‐invoke any Next Action suggestion
-        m = re.search(r'Next Action:\s*Call\s*`([^`]+)`', ctx["ctx_txt"])
+        run_id = ctx.get("run_id")
+
+        # 1️⃣ Auto‐invoke any Next Action suggestion
+        m = re.search(r'Next Action:\s*Call\s*`([^`]+)`', ctx.ctx_txt)
         if m:
             code = m.group(1)
             log_message(f"Auto-invoking suggested tool: {code}", "INFO")
             try:
                 out = self.run_tool(code)
-                ctx["ctx_txt"] += f"\n[Auto-run {code} → {out}]"
+                ctx.ctx_txt += f"\n[Auto-run {code} → {out}]"
             except Exception as e:
-                ctx["ctx_txt"] += f"\n[Suggestion {code} failed: {e}]"
+                ctx.ctx_txt += f"\n[Suggestion {code} failed: {e}]"
                 log_message(f"Suggestion {code} failed: {e}", "ERROR")
-            # skip further chaining this turn
             return None
 
-        # 2) Existing streaming‐based tool chaining
-        summaries = []
-        invoked   = set()
-        tc        = ctx["ctx_txt"]
+        # 2️⃣ Streaming‐based tool chaining loop
+        summaries: list[str] = []
+        invoked: set[str] = set()
+        tc = ctx.ctx_txt
 
         for i in range(5):
-            buf = []
+            # Report token count at each iteration
+            iter_tokens = len(tc.split())
+            log_message(f"[Tool chaining] iteration {i+1}, context size: {iter_tokens} tokens", "DEBUG")
+            ctx.stage_outputs.setdefault("tool_chaining_iter_tokens", []).append(iter_tokens)
+
+            buf: list[str] = []
             try:
                 for tok, done in self._stream_tool(tc):
-                    buf.append(tok)
+                    buf.append(str(tok))
                     if done:
                         break
             except Exception as e:
-                log_message(f"Tool‐streaming failed: {e}", "ERROR")
+                log_message(f"Tool-streaming failed: {e}", "ERROR")
                 break
 
             raw = re.sub(r"^```tool_code\s*|\s*```$", "", "".join(buf), flags=re.DOTALL).strip()
@@ -7426,7 +7631,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             if not code or code.upper() == "NO_TOOL":
                 break
 
-            fn = code.split("(")[0]
+            fn = code.split("(", 1)[0]
             if fn in invoked:
                 break
             invoked.add(fn)
@@ -7438,13 +7643,13 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 log_message(f"run_tool error on {code}: {e}", "ERROR")
                 break
 
-            # summarize that output
+            # Summarize output
             summary = None
             try:
                 data = json.loads(out)
                 if fn in ("search_internet", "brave_search"):
                     lines = [f"- {r.get('title','')} ({r.get('url','')})"
-                            for r in data["web"]["results"][:3]]
+                             for r in data["web"]["results"][:3]]
                     summary = "Top results:\n" + "\n".join(lines)
                 elif fn == "get_current_location":
                     summary = f"Location: {data.get('city')}, {data.get('regionName')}"
@@ -7452,14 +7657,15 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 pass
             if summary is None:
                 summary = f"{fn} → {out}"
+
             summaries.append(summary)
             tc += "\n" + summary
 
         if summaries:
-            ctx["tool_summaries"] = summaries
-            ctx["ctx_txt"] += "\n" + "\n\n".join(summaries)
+            ctx.tool_summaries = summaries
+            ctx.ctx_txt += "\n" + "\n\n".join(summaries)
+
         return None
-    # ────────────────────────────────────────────────
 
 
     # ------------------------------
@@ -7646,10 +7852,14 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
     # ------------------------------
     # Stage 11: chain_of_thought
     # ------------------------------
-    def _stage_chain_of_thought(self, ctx):
+    def _stage_chain_of_thought(self, ctx: Context):
+        # silence TTS for reflection
+        ctx.skip_tts = True
+
         external_facts   = ctx.stage_outputs.get("external_knowledge_retrieval", "")
         memory_summary   = ctx.stage_outputs.get("memory_summarization", "")
         planning_summary = ctx.stage_outputs.get("planning_summary", "")
+
         cot = self._chain_of_thought(
             user_message=ctx.user_message,
             context_analysis=ctx.ctx_txt,
@@ -7659,15 +7869,21 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             tool_summaries=ctx.tool_summaries,
             final_response=ctx.final_response
         )
+
         try:
             path = os.path.join(session_folder, "thoughts.json")
             bag  = json.load(open(path)) if os.path.exists(path) else []
-            bag.append({"timestamp": datetime.now().isoformat(), "chain_of_thought": cot})
+            bag.append({
+                "timestamp": datetime.now().isoformat(),
+                "chain_of_thought": cot
+            })
             with open(path, "w") as f:
                 json.dump(bag, f, indent=2)
         except:
             pass
+
         return None
+
 
 
     # ------------------------------
@@ -7685,110 +7901,121 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
 # It captures audio, processes it, and sends it to the LLM for a response.
 # It also handles text input override mode.
 def voice_to_llm_loop(chat_manager: ChatManager, playback_lock, output_stream):
+    """
+    Main loop for voice→LLM:
+      1) listen until silence,
+      2) optional audio enhancement,
+      3) whisper‐transcribe,
+      4) log + clear TTS,
+      5) hand off to chat_manager.new_request (full pipeline).
+    """
+    import time, json, numpy as np
+    from datetime import datetime
 
-    log_message("Voice-to-LLM loop started. Waiting for speech...", "INFO")
-    last_response    = None
-    max_words        = config.get("max_response_words", 1000)
-    rms_threshold    = config.get("rms_threshold", 0.01)
-    silence_duration = 2.0  # seconds of sustained silence → end of speech
+    log_message("Voice-to-LLM loop started. Waiting for speech…", "INFO")
 
     while True:
-        # 1) Capture until silence
-        chunk = audio_queue.get(); audio_queue.task_done()
-        buffer = [chunk]; silence_start = None
-        #log_message("Recording audio until silence detected...", "DEBUG")
+        # 1) record until sustained silence
+        chunks = []
+        silence_start = None
+        rms_threshold = config.get("rms_threshold", 0.01)
+        silence_duration = config.get("silence_duration", 2.0)
+
         while True:
-            chunk = audio_queue.get(); audio_queue.task_done()
-            buffer.append(chunk)
-            rms = np.sqrt(np.mean(chunk.flatten()**2))
-            if rms >= rms_threshold:
-                silence_start = None
-            else:
+            audio_chunk = audio_queue.get()
+            audio_queue.task_done()
+            chunks.append(audio_chunk)
+            rms = np.sqrt(np.mean(audio_chunk.flatten()**2))
+
+            if rms < rms_threshold:
                 if silence_start is None:
                     silence_start = time.time()
                 elif time.time() - silence_start >= silence_duration:
                     break
+            else:
+                silence_start = None
 
-        #log_message(f"Silence for {silence_duration}s; processing audio...", "INFO")
-        audio_array = np.concatenate(buffer, axis=0).flatten().astype(np.float32)
-
-        # 2) Optional enhancement
+        # 2) assemble and optionally enhance
+        audio_array = np.concatenate(chunks, axis=0).astype(np.float32).flatten()
         if config.get("enable_noise_reduction", False):
-            log_message("Enhancing audio (denoise, EQ, compression)...", "PROCESS")
+            log_message("Enhancing audio (denoise/EQ)…", "PROCESS")
             audio_array = apply_eq_and_denoise(audio_array, SAMPLE_RATE)
             log_message("Audio enhancement complete.", "SUCCESS")
 
-        # 3) Transcribe via consensus helper
-        #log_message("Transcribing via consensus helper...", "PROCESS")
+        # 3) transcribe
         transcription = consensus_whisper_transcribe_helper(
             audio_array,
             language="en",
             rms_threshold=rms_threshold,
-            consensus_threshold=config.get("consensus_threshold", 0.8)
+            consensus_threshold=config.get("consensus_threshold", 0.8),
         )
         if not transcription or not validate_transcription(transcription):
-            #log_message("Invalid transcription; skipping.", "WARNING")
             continue
 
-        labeled = f"{transcription}"
-        log_message(f"Transcribed prompt: {labeled}", "INFO")
+        user_text = transcription.strip()
+        log_message(f"Transcribed prompt: {user_text!r}", "INFO")
 
-        # 4) Log user turn & clear pending TTS
+        # 4) log & clear TTS
         session_log.write(json.dumps({
-            "role":    "user",
-            "content": labeled,
+            "role":      "user",
+            "content":   user_text,
             "timestamp": datetime.now().isoformat()
         }) + "\n")
         session_log.flush()
         flush_current_tts()
 
-        # 5) Send through new_request (TTS happens inside)
-        response = chat_manager.new_request(labeled, skip_tts=False)
-        if response is None:
-            log_message("new_request returned None; skipping.", "WARNING")
-            continue
+        # 5) run through the full ChatManager pipeline
+        #    (this will stream tokens, do TTS, RL, self‐repair, etc.)
+        chat_manager.new_request(
+            user_text,
+            sender_role="user",
+            skip_tts=False
+        )
 
-        # 6) Clean up any fences/markup
-        clean_resp = re.sub(r"```(?:tool_output|tool_code|context_analysis).*?```", "",
-                            response, flags=re.DOTALL)
-        clean_resp = clean_resp.replace("`", "")
-        clean_resp = re.sub(r"[*_]", "", clean_resp).strip()
+        # 6) loop back for next speech
+        log_message("Ready for next voice input…", "INFO")
 
-        # 7) Dedupe & length check
-        if not clean_resp or clean_resp == last_response:
-            continue
-        if len(clean_resp.split()) > max_words:
-            log_message(f"Hallucination detected (> {max_words} words); discarding.", "WARNING")
-            last_response = None
-            continue
-
-        last_response = clean_resp
-        log_message(f"LLM response ready: {clean_resp}", "INFO")
-
-        # 8) No extra enqueue: new_request has already enqueued the final response
-        log_message("Ready for next voice input...", "INFO")
 
 # This is the main loop for text input override mode.
 # It allows users to type messages directly into the console,
 def text_input_loop(chat_manager: ChatManager):
+    """
+    Main loop for text‐override mode:
+      • read lines,
+      • log + clear TTS,
+      • dispatch into chat_manager.new_request (full pipeline).
+    """
+    import json
+    from datetime import datetime
+
     log_message("Text input override mode is active.", "INFO")
     print("\nText override mode is active. Type your message and press Enter to send it to the LLM.")
+
     while True:
         try:
-            user_text = input()  # Blocking call in its own thread.
-            if not user_text.strip():
+            user_text = input().strip()
+            if not user_text:
                 continue
-            log_message(f"Text input override: Received text: {user_text}", "INFO")
-            session_log.write(json.dumps({"role": "user", "content": user_text, "timestamp": datetime.now().isoformat()}) + "\n")
+
+            log_message(f"Text input override: Received text: {user_text!r}", "INFO")
+            session_log.write(json.dumps({
+                "role":      "user",
+                "content":   user_text,
+                "timestamp": datetime.now().isoformat()
+            }) + "\n")
             session_log.flush()
             flush_current_tts()
-            response = chat_manager.new_request(user_text)
-            log_message("Text input override: LLM response received.", "INFO")
-            print("LLM response:", response)
-            session_log.write(json.dumps({"role": "assistant", "content": response, "timestamp": datetime.now().isoformat()}) + "\n")
-            session_log.flush()
+
+            # full pipeline + streaming + TTS happens inside new_request
+            chat_manager.new_request(
+                user_text,
+                sender_role="user",
+                skip_tts=False
+            )
+
         except Exception as e:
             log_message("Error in text input loop: " + str(e), "ERROR")
+
 
 # This is the main entry point for the application.
 # It initializes the Flask app, starts the file watcher, and launches the main processing threads.

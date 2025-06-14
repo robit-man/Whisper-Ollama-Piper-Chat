@@ -1,0 +1,11 @@
+whisper_env
+piper
+external_tools
+workspace
+chat_sessions
+.setup_complete
+glados_piper_medium.onnx
+glados_piper_medium.onnx.json
+piper_linux_x86_64.tar.gz
+agent_stack.json
+.env
