@@ -199,6 +199,10 @@ if not os.path.exists(SETUP_MARKER):
         "flask_cors",       # For CORS support in Flask
         "flask",            # For web server
         "tiktoken",         # For tokenization
+        "telegram",         # For Telegram bot integration
+        "python-telegram-bot",  # For Telegram bot API
+        "asyncio",       # For asynchronous operations
+        "nest-asyncio",  # For asyncio compatibility with Telegram bot
     ])
 
     # 3) Stamp and restart
@@ -293,6 +297,18 @@ from ollama import chat, embed
 from dotenv import load_dotenv
 from ollama._types import ResponseError
 
+
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    MessageHandler,
+    CommandHandler,
+    filters,
+)
+from telegram.constants import ChatAction
+from telegram.request import HTTPXRequest
+
 # ── Selenium stack
 from selenium import webdriver
 from selenium.common.exceptions import WebDriverException, TimeoutException
@@ -310,6 +326,8 @@ from bs4 import BeautifulSoup
 import html, textwrap                          # (html imported only once)
 import os, shutil, random, platform, json
 import inspect
+import asyncio
+from typing import Callable
 
 # ── Database / Knowledge Graph
 import sqlite3
@@ -6969,13 +6987,14 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         return []
     
     # ------------------------------------------------------------------ #
-    #  Entry-point for every user turn                                   #
+    #  Entry-point for every user turn with stage‐by‐stage callbacks    #
     # ------------------------------------------------------------------ #
     def new_request(
             self,
             user_message: str,
             sender_role: str = "user",
-            skip_tts: bool  = False
+            skip_tts: bool  = False,
+            stage_callback: Callable[[str], None] = None,
         ) -> str:
         """
         • Optional `/ctx <name>` context switch
@@ -6998,7 +7017,10 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # 1) ensure an active Context
         if not getattr(self, "current_ctx", None):
             self._activate_context("global")
-        ctx: Context = self.current_ctx
+        ctx = self.current_ctx
+
+        # Attach the stage‐callback for live updates
+        ctx.stage_callback = stage_callback
 
         # re-bind managers
         self.history_manager   = ctx.history_manager
@@ -7008,8 +7030,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # 2) per-turn init (don’t wipe long-term fields)
         ctx.user_message = user_message
         ctx.sender_role  = sender_role
-        # suppress ALL intermediate TTS;
-        # final voice output comes only from _stage_final_inference
+        # suppress ALL intermediate TTS; final voice only from _stage_final_inference
         ctx.skip_tts     = skip_tts
 
         # turn counter + narrative
@@ -7063,7 +7084,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # (TTS of the final response is done only in _stage_final_inference)
         return resp
 
-
     def _run_fractal_pipeline(self, ctx: Context) -> str:
         """
         Fractal, queue-driven engine with tool-plan critique & retry.
@@ -7092,6 +7112,13 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             if not handler:
                 continue
 
+            # ── notify callback of stage start
+            if getattr(ctx, "stage_callback", None):
+                try:
+                    ctx.stage_callback(name)
+                except Exception as _:
+                    pass
+
             self.observer.log_stage_start(run_id, name)
             sig    = inspect.signature(handler)
             params = list(sig.parameters.keys())[1:]
@@ -7100,7 +7127,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 result = handler(ctx, *args) if args else handler(ctx)
             except Exception as e:
                 # record failure & schedule self-repair
-                ctx.last_failure = {"type":"exception","payload":str(e),"stage":name}
+                ctx.last_failure = {"type": "exception", "payload": str(e), "stage": name}
                 log_message(f"[{ctx.name}] '{name}' exception: {e}", "ERROR")
                 queue.appendleft(self._Stage("self_repair"))
                 continue
@@ -7135,7 +7162,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         self._save_workspace_memory(ctx.workspace_memory)
         self.observer.complete_run(run_id)
         return ctx.final_response or ""
-
 
 
     # ------------------------------------------------------------------ #
@@ -7488,77 +7514,79 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         log_message(f"[Planning summary] context size: {ctx_tokens} tokens", "DEBUG")
         ctx.stage_outputs["planning_summary_ctx_tokens"] = ctx_tokens
 
-        # 1️⃣ Stream the tool decision, collecting strings
+        # 1️⃣ Stream the tool decision, collecting **string** tokens
         gathered: list[str] = []
-        for part in self._stream_tool(ctx):
-            # handle (chunk, done) or single value
-            if isinstance(part, tuple) and len(part) == 2:
-                chunk, done = part
-            else:
-                chunk, done = part, False
-
-            if isinstance(chunk, str):
-                token = chunk
-            elif isinstance(chunk, dict):
-                token = (
+        for chunk, done in self._stream_tool(ctx):
+            # Always coerce to string
+            if isinstance(chunk, dict):
+                token_str = (
                     chunk.get("content")
                     or chunk.get("message", {}).get("content")
                     or ""
                 )
             else:
-                token = str(chunk)
-
-            gathered.append(token)
+                token_str = str(chunk)
+            gathered.append(token_str)
             if done:
                 break
 
-        # 2️⃣ Combine and strip code fences
+        # 2️⃣ Combine and strip any code fences
         combined = "".join(gathered)
-        raw = re.sub(r"^```(?:tool_code|python|py)\s*|\s*```$", "",
-                     combined, flags=re.DOTALL).strip("`\n ")
+        raw = re.sub(
+            r"^```(?:tool_code|python|py)\s*|\s*```$",
+            "",
+            combined,
+            flags=re.DOTALL
+        ).strip().strip("`")
 
-        # 3️⃣ Parse & register next tool call
+        # 3️⃣ Parse & register the tool call
         call = Tools.parse_tool_call(raw)
         ctx.next_tool_call = call
 
-        # 4️⃣ Flag if tool‐work is needed
-        available = {
+        # 4️⃣ Detect if we need to improve the tool set
+        sig_funcs = {
             name for name, fn in inspect.getmembers(Tools, inspect.isfunction)
             if not name.startswith("_")
         }
-        ctx.needs_tool_work = isinstance(call, str) and call.split("(",1)[0] not in available
+        if isinstance(call, str):
+            fn_name = call.split("(", 1)[0]
+            ctx.needs_tool_work = fn_name not in sig_funcs
+        else:
+            ctx.needs_tool_work = False
 
-        # 5️⃣ Get explanation and enqueue only the explanation
+        # 5️⃣ One-line explanation from secondary model (no automatic TTS here)
         plan_msg = ""
         if call:
-            sys_p = "Explain one casual sentence what this upcoming tool call will do."
-            usr_p = f"We are about to run {call} for: {ctx.user_message}"
-            response = chat(
+            system = "Explain one casual sentence what this upcoming tool call will do."
+            user   = f"We are about to run {call} for: {ctx.user_message}"
+            resp   = chat(
                 model=self.config_manager.config["secondary_model"],
-                messages=[{"role":"system","content":sys_p},
-                          {"role":"user","content":usr_p}],
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user}
+                ],
                 stream=False
             )
+            # unify response to string
+            if isinstance(resp, dict) and isinstance(resp.get("message"), dict):
+                plan_msg = resp["message"].get("content", "").strip()
+            else:
+                plan_msg = str(resp).strip()
 
-            # pull out just the assistant’s content
-            msg = None
-            if isinstance(response, dict):
-                msg = response.get("message")
-            if isinstance(msg, dict):
-                plan_msg = msg.get("content", "").strip()
-            elif hasattr(msg, "content"):
-                plan_msg = getattr(msg, "content", "").strip()
-
+            # enqueue TTS only if explicitly allowed
             if plan_msg and not getattr(ctx, "skip_tts", False):
                 self.tts_manager.enqueue(plan_msg)
 
-        # 6️⃣ Record narrative & schedule next stages
+        # 6️⃣ Record and force next stages
         ctx.ctx_txt += f"\n[Planning summary] {plan_msg or '(no tool)'}"
         ctx.stage_outputs["planning_summary"] = plan_msg
-        ctx._forced_next = ["define_criteria", "task_decomposition", "plan_validation"]
+        ctx._forced_next = [
+            "define_criteria",
+            "task_decomposition",
+            "plan_validation"
+        ]
 
         return plan_msg
-
 
 
     # ------------------------------
@@ -8003,6 +8031,94 @@ def text_input_loop(chat_manager: ChatManager):
         except Exception as e:
             log_message("Error in text input loop: " + str(e), "ERROR")
 
+def telegram_input(chat_manager):
+    import os
+    import asyncio
+    from dotenv import load_dotenv
+    from telegram import Update
+    from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+    from telegram.request import HTTPXRequest
+
+    # Load your bot token from .env or environment
+    load_dotenv()
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    if not BOT_TOKEN:
+        raise ValueError("Missing BOT_TOKEN in environment")
+
+    # Create and install a new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Build the Telegram Application
+    req = HTTPXRequest(connect_timeout=20, read_timeout=20)
+    app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
+
+    async def _handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_text = update.message.text.strip()
+        if not user_text:
+            return
+
+        # 1) Send an initial “processing” message
+        sent = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="🛠️ Processing your request..."
+        )
+        chat_id = sent.chat_id
+        msg_id  = sent.message_id
+
+        # 2) Define a stage callback that edits our “processing” message
+        def stage_callback(stage_name: str):
+            if not stage_name:
+                return
+            new_text = f"🔄 Stage: {stage_name}"
+            async def _edit():
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                        text=new_text
+                    )
+                except Exception as e:
+                    print("Telegram edit_message_text error:", e)
+            asyncio.run_coroutine_threadsafe(_edit(), loop)
+
+        # 3) Invoke the ChatManager’s new_request with our callback
+        final_response = await asyncio.to_thread(
+            chat_manager.new_request,
+            user_text,
+            "user",
+            True,            # skip intermediate TTS
+            stage_callback   # our editing callback
+        )
+
+        # 4) Finally replace the message with the full reply
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=final_response or "(no response)"
+            )
+        except Exception as e:
+            # fallback: send as new message
+            print("Final edit failed:", e)
+            await context.bot.send_message(chat_id=chat_id, text=final_response)
+
+    # Register the handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_update))
+
+    # Run the bot in this thread’s loop
+    loop.run_until_complete(app.initialize())
+    loop.run_until_complete(app.start())
+    loop.run_until_complete(app.updater.start_polling())
+    try:
+        loop.run_forever()
+    finally:
+        loop.run_until_complete(app.updater.stop_polling())
+        loop.run_until_complete(app.stop())
+        loop.run_until_complete(app.shutdown())
+        loop.close()
+
+
 
 # This is the main entry point for the application.
 # It initializes the Flask app, starts the file watcher, and launches the main processing threads.
@@ -8095,6 +8211,16 @@ def main():
     )
     text_thread.start()
     log_message("Main: Text input override thread started.", "DEBUG")
+
+    # Launch Telegram listener thread
+    telegram_thread = threading.Thread(
+        target=telegram_input,
+        args=(chat_manager,),
+        daemon=True
+    )
+    telegram_thread.start()
+    log_message("Main: Telegram listener thread started.", "DEBUG")
+
 
     print(f"\nVoice-activated LLM mode (primary model: {config['primary_model']}) is running.")
     print("Speak into the microphone or type your prompt. LLM responses are streamed and spoken via Piper. Press Ctrl+C to exit.")
