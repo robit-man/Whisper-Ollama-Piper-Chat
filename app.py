@@ -4190,99 +4190,104 @@ class ChatManager:
             self.name = name
         def __repr__(self):
             return f"<Stage {self.name}>"
-        
-        
+    
     def _expand(self, stage: str, ctx: Context) -> list[str]:
-        import re
-
+    
         # ➡️ One-time dynamic pipeline adaptation, immediately after context_analysis
         if stage == "context_analysis" and not getattr(ctx, "_pipeline_adapted", False):
-            base = [name for name,_,_ in self.STAGES]
+            base = [name for name, _, _ in self.STAGES]
             adapted = self._assemble_stage_list(ctx.user_message, base)
             ctx.overridden_stages   = adapted
             ctx.pipeline_overridden = True
             ctx._pipeline_adapted   = True
             ctx.ctx_txt += f"\n[Pipeline adapted to: {adapted}]\n"
-
-        # 0️⃣ If any stage just failed, run self-repair first
+        
+        # ────────────────────────────────────────────────────────
+        # 0️⃣  If any stage just failed, run self-repair first
         if getattr(ctx, "last_failure", None):
             return ["self_repair"]
 
-        # 1️⃣ Forced injections
+        # 1️⃣  Forced injections
         forced = getattr(ctx, "_forced_next", [])
         if forced:
             return [forced.pop(0)]
 
+        # ────────────────────────────────────────────────────────
+        # 2️⃣  Tool-loop entry point: once we pick a tool, mark the loop
+        if stage == "tool_decision":
+            ctx._in_tool_loop = True
 
-        # 2️⃣ If there’s a pending tool call, execute it next
+        # 3️⃣  If there’s a pending tool call, execute it next
         if getattr(ctx, "next_tool_call", None) and stage != "execute_selected_tool":
             return ["execute_selected_tool"]
 
-        # 1b️⃣ After executing a tool, go back into chaining
+        # 4️⃣  After executing a tool, go back into chaining
         if stage == "execute_selected_tool":
             return ["tool_chaining"]
 
-        # 2️⃣ Core linear flow up through planning
-        if stage == "context_analysis":
-            return ["intent_clarification"]
+        # ────────────────────────────────────────────────────────
+        # 5️⃣  Core linear flow up through planning
+        #    But once in tool_loop, never re-enter core stages before it
+        if not getattr(ctx, "_in_tool_loop", False):
+            if stage == "context_analysis":
+                return ["intent_clarification"]
 
-        if stage == "intent_clarification":
-            # if we just asked the user, wait for their reply
-            if ctx.get("review_status") == "waiting_for_user":
-                return []
-            return ["external_knowledge_retrieval"]
+            if stage == "intent_clarification":
+                if ctx.get("review_status") == "waiting_for_user":
+                    return []
+                return ["external_knowledge_retrieval"]
 
-        if stage == "external_knowledge_retrieval":
-            return ["memory_summarization"]
+            if stage == "external_knowledge_retrieval":
+                return ["memory_summarization"]
 
-        if stage == "memory_summarization":
-            return ["planning_summary"]
+            if stage == "memory_summarization":
+                return ["planning_summary"]
 
-        # once we have a planning summary, build out the concrete plan
-        if stage == "planning_summary":
-            return ["define_criteria"]
+            if stage == "planning_summary":
+                return ["define_criteria"]
 
-        if stage == "define_criteria":
-            return ["task_decomposition"]
+            if stage == "define_criteria":
+                return ["task_decomposition"]
 
-        if stage == "task_decomposition":
-            return ["plan_validation"]
+            if stage == "task_decomposition":
+                return ["plan_validation"]
 
-        # right after plan_validation, before execute_actions, inject review:
+        # ────────────────────────────────────────────────────────
+        # 6️⃣  Immediately after plan_validation, insert review→execute
         if stage == "plan_validation":
-            # if we have a non-empty plan, go to review_tool_plan first
             if getattr(ctx, "plan", None):
                 return ["review_tool_plan"]
             return []
 
-        # if a tool just failed, go back to review before retrying
+        # 7️⃣  If execute_actions failed tools, bounce back to review
         if stage == "execute_actions" and getattr(ctx, "tool_failures", None):
             return ["review_tool_plan"]
 
-        # once review is done, move on to execute_actions
+        # 8️⃣  After review_tool_plan, run the actions
         if stage == "review_tool_plan":
             return ["execute_actions"]
-        # 3️⃣ Tool‐chaining loop
+
+        # ────────────────────────────────────────────────────────
+        # 9️⃣  Tool-chaining loop and onward
         if stage == "tool_chaining":
-            # this will pick up execute_selected_tool if next_tool_call is set,
-            # or else fall through to preparing the prompt
+            # if next_tool_call is set, execute_selected_tool wins above;
+            # otherwise proceed to prompt assembly
             return ["assemble_prompt"]
 
         if stage == "assemble_prompt":
             return ["self_review"]
 
         if stage == "self_review":
-            # if we couldn’t auto-fill some placeholder, clarify intent
             if ctx.get("review_status") == "needs_clarification":
                 return ["intent_clarification"]
             return ["final_inference"]
 
-        # 4️⃣ Wrap-up diagnostics
+        # ────────────────────────────────────────────────────────
+        # 🔟  Wrap-up diagnostics
         if stage == "final_inference":
             return ["output_review"]
 
         if stage == "output_review":
-            # if audit finds missing info, ask the user
             if ctx.get("review_status") == "needs_clarification":
                 return ["intent_clarification"]
             return ["chain_of_thought"]
@@ -4296,7 +4301,8 @@ class ChatManager:
         if stage == "flow_health_check":
             return []
 
-        # 5️⃣ Catch-all: stop
+        # ────────────────────────────────────────────────────────
+        # Catch-all: nothing more to do
         return []
 
     # ------------------------------------------------------------------
@@ -7080,21 +7086,17 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # (TTS of the final response is done only in _stage_final_inference)
         return resp
 
-
     def _run_fractal_pipeline(self, ctx: Context) -> str:
         """
         Fractal, queue-driven engine with tool-plan critique & retry.
         Uses _expand() to choose next stages dynamically.
         """
-        import inspect
-        from collections import deque
-
         run_id = ctx.run_id
         queue  = deque([ self._Stage("context_analysis") ])
 
-        ctx.tool_failures = {}
-        if not hasattr(ctx, "tool_summaries"):
-            ctx.tool_summaries = []
+        # ensure we have a place to collect results/failures
+        ctx.tool_failures  = {}
+        ctx.tool_summaries = getattr(ctx, "tool_summaries", [])
 
         while queue:
             stage_obj = queue.popleft()
@@ -7106,11 +7108,15 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             if cnt > 3:
                 continue
 
+            # ── ENTERING TOOL LOOP FLAG ───────────────────────────
+            if name == "tool_decision":
+                ctx._in_tool_loop = True
+
             handler = getattr(self, f"_stage_{name}", None)
             if not handler:
                 continue
 
-            # callback: announce stage name if no prior output this stage
+            # ── FIRE STAGE START CALLBACK ────────────────────────
             if ctx.stage_callback:
                 try:
                     ctx.stage_callback(f"[Stage] {name} …")
@@ -7121,9 +7127,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             sig    = inspect.signature(handler)
             params = list(sig.parameters.keys())[1:]
             args   = [ctx.stage_outputs.get(p) for p in params]
+
             try:
                 result = handler(ctx, *args) if args else handler(ctx)
             except Exception as e:
+                # record failure & schedule self-repair
                 ctx.last_failure = {"type": "exception", "payload": str(e), "stage": name}
                 log_message(f"[{ctx.name}] '{name}' exception: {e}", "ERROR")
                 queue.appendleft(self._Stage("self_repair"))
@@ -7132,7 +7140,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             finally:
                 self.observer.log_stage_end(run_id, name)
 
-            # if the handler returned a non-empty string, fire callback with it
+            # ── CAPTURE & CALLBACK ON STRING OUTPUT ──────────────
             if isinstance(result, str) and result:
                 ctx.stage_outputs[name] = result
                 if ctx.stage_callback:
@@ -7140,11 +7148,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                         ctx.stage_callback(result)
                     except Exception:
                         pass
-                # if this stage is final_inference, capture it
+                # record final_response when we hit final_inference
                 if name == "final_inference":
                     ctx.final_response = result
 
-            # special-case: execute_actions must run plan items
+            # ── SPECIAL CASE: EXECUTE_ACTIONS ────────────────────
             if name == "execute_actions":
                 ctx.tool_failures = {}
                 for call in getattr(ctx, "plan", []):
@@ -7155,19 +7163,19 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                         ctx.tool_failures[call] = str(e)
                         log_message(f"[{ctx.name}] tool execution failed for {call}: {e}", "ERROR")
                         break
+                # enqueue whatever expand() says next
                 for nxt in self._expand(name, ctx):
                     queue.append(self._Stage(nxt))
-                continue
+                continue  # skip the normal enqueue below
 
-            # enqueue next stages
+            # ── NORMAL ENQUEUE NEXT STAGES ────────────────────────
             for nxt in self._expand(name, ctx):
                 queue.append(self._Stage(nxt))
 
-        # wrap-up
+        # ── WRAP-UP ─────────────────────────────────────────────
         self._save_workspace_memory(ctx.workspace_memory)
         self.observer.complete_run(run_id)
         return ctx.final_response or ""
-
 
     # ------------------------------------------------------------------ #
     #  Linear pipeline engine                                            #
@@ -8041,6 +8049,14 @@ def text_input_loop(chat_manager: ChatManager):
             log_message("Error in text input loop: " + str(e), "ERROR")
 
 def telegram_input(chat_manager):
+    """
+    Launch a Telegram bot that:
+      • Uses a single ChatManager instance
+      • Cancels any in-flight task for a user when they send a new message
+      • Resets the user’s context (by using chat_id as the context name)
+      • Edits one “processing…” message with each stage’s real output
+      • Replaces it with the final response
+    """
     import os
     import asyncio
     from dotenv import load_dotenv
@@ -8048,74 +8064,104 @@ def telegram_input(chat_manager):
     from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
     from telegram.request import HTTPXRequest
 
-    # Load your bot token from .env or environment
     load_dotenv()
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     if not BOT_TOKEN:
-        raise ValueError("Missing BOT_TOKEN in environment")
+        raise RuntimeError("Missing BOT_TOKEN in environment")
 
-    # Create and install a new event loop for this thread
+    # 1️⃣ Create a dedicated event loop for Telegram I/O
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # Build the Telegram Application
+    # 2️⃣ Build the Telegram app
     req = HTTPXRequest(connect_timeout=20, read_timeout=20)
     app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
 
+    # 3️⃣ Track the in-flight runner task per chat_id
+    running_tasks: dict[int, asyncio.Task] = {}
+
     async def _handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_text = update.message.text.strip()
-        if not user_text:
+        chat_id = update.effective_chat.id
+        text    = (update.message and update.message.text or "").strip()
+        if not text:
             return
 
-        # 1) Send an initial “processing” message
-        sent = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="🛠️ Processing your request..."
-        )
-        chat_id = sent.chat_id
-        msg_id  = sent.message_id
+        # ── Cancel any existing pipeline for this user ───────────────
+        prev = running_tasks.get(chat_id)
+        if prev and not prev.done():
+            prev.cancel()
 
-        # 2) Define a stage callback that edits our “processing” message
-        def stage_callback(stage_name: str):
-            if not stage_name:
+        # ── Send the “Processing…” placeholder message ───────────────
+        sent = await context.bot.send_message(
+            chat_id=chat_id,
+            text="🛠️ Processing your request…"
+        )
+        msg_id = sent.message_id
+
+        # ── Activate (or switch to) this user’s context ───────────────
+        # We use the chat_id as a unique “topic” name.
+        chat_manager._activate_context(str(chat_id))
+
+        # ── Define the live-stage callback that edits the same message ──
+        def stage_cb(output: str):
+            if not output:
                 return
-            new_text = f"🔄 Stage: {stage_name}"
             async def _edit():
                 try:
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
                         message_id=msg_id,
-                        text=new_text
+                        text=f"🔄 {output}"
                     )
-                except Exception as e:
-                    print("Telegram edit_message_text error:", e)
+                except Exception:
+                    pass
             asyncio.run_coroutine_threadsafe(_edit(), loop)
 
-        # 3) Invoke the ChatManager’s new_request with our callback
-        final_response = await asyncio.to_thread(
-            chat_manager.new_request,
-            user_text,
-            "user",
-            True,            # skip intermediate TTS
-            stage_callback   # our editing callback
-        )
+        # ── Runner wrapper to call new_request in background ──────────
+        async def runner():
+            try:
+                final = await asyncio.to_thread(
+                    chat_manager.new_request,
+                    text,           # user message
+                    "user",         # sender_role
+                    True,           # skip intermediate TTS
+                    stage_cb        # live-update callback
+                )
+                # replace placeholder with final answer
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=final or "(no response)"
+                )
+            except asyncio.CancelledError:
+                # user sent a new msg → cancel prior run
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                        text="⚠️ Previous request cancelled."
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                # any other failure → send a fresh message
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Processing error: {e}"
+                )
+            finally:
+                running_tasks.pop(chat_id, None)
 
-        # 4) Finally replace the message with the full reply
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=final_response or "(no response)"
-            )
-        except Exception as e:
-            # fallback: send as new message
-            print("Final edit failed:", e)
-            await context.bot.send_message(chat_id=chat_id, text=final_response)
+        # ── Launch and record the task ───────────────────────────────
+        task = loop.create_task(runner())
+        running_tasks[chat_id] = task
 
-    # Register the handler
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_update))
+    # 4️⃣ Register the text‐message handler (ignoring commands)
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_update)
+    )
 
-    # Run the bot in this thread’s loop
+    # 5️⃣ Start polling loop
     loop.run_until_complete(app.initialize())
     loop.run_until_complete(app.start())
     loop.run_until_complete(app.updater.start_polling())
@@ -8126,7 +8172,6 @@ def telegram_input(chat_manager):
         loop.run_until_complete(app.stop())
         loop.run_until_complete(app.shutdown())
         loop.close()
-
 
 
 # This is the main entry point for the application.
