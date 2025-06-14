@@ -332,7 +332,7 @@ import html, textwrap                          # (html imported only once)
 import os, shutil, random, platform, json
 import inspect
 import asyncio
-from typing import Callable
+from typing import Callable, Optional, Any, Dict, List, Union, Tuple
 from queue import Queue, Empty
 import uuid
 from pathlib import Path
@@ -362,6 +362,7 @@ from denoiser import pretrained
 from PIL import ImageGrab
 import cv2
 import mss
+
 
 from dataclasses import dataclass, field
 from typing import List, Any, Optional, Dict, Tuple
@@ -1162,6 +1163,46 @@ display_state = DisplayState()
 
 # Here in this class, we define various utility functions for text processing, embedding, and other operations. We also include methods for removing emojis, converting numbers to words, and calculating cosine similarity.
 class Utils:
+    @staticmethod
+    def parse_context_analysis(text: str) -> Dict[str, object]:
+        """
+        Expected input (from _stage_context_analysis):
+            • Exactly two sentences.
+              ① “The user wants …”                → intent
+              ② “Key entities are X, Y …”         → entities / follow-ups
+
+        Returns
+        -------
+        {
+            "intent":      <str>,        # first sentence (trimmed ‘.’)
+            "entities":    [<str>, …],   # capitalised or quoted tokens
+            "follow_ups":  [<str>, …]    # questions ending with '?'
+        }
+
+        The function is defensive: if the format isn’t as expected it will
+        still return a dict with at least the raw text under "intent".
+        """
+        # split on period, question-mark or exclamation (keep max 2 parts)
+        parts = re.split(r"[.!?]\s+", text.strip(), maxsplit=2)
+        if not parts:
+            return {"intent": text.strip(), "entities": [], "follow_ups": []}
+
+        intent = parts[0].rstrip(".!?").strip()
+
+        # naive entity grab: capitalised words or words in back-ticks / quotes
+        entity_pat = re.compile(r"(?:`([^`]+)`|\"([^\"]+)\"|'([^']+)'|\\b([A-Z][a-zA-Z0-9_-]+)\\b)")
+        entities = [m.group(1) or m.group(2) or m.group(3) or m.group(4)
+                    for m in entity_pat.finditer(text)]
+
+        # any follow-up questions?
+        follow_ups = [s.strip() for s in re.findall(r"([^.!?]*\?)", text)]
+
+        return {
+            "intent": intent,
+            "entities": list(dict.fromkeys(entities)),   # de-dupe, keep order
+            "follow_ups": follow_ups
+        }
+    
     @staticmethod
     def remove_emojis(text):
         emoji_pattern = re.compile(
@@ -4279,58 +4320,80 @@ ALL_TOOLS  = Tools.load_agent_stack().get("tools", [])
 ALL_AGENTS = Tools.load_agent_stack().get("stages", [])
 
 Tools.load_external_tools()
-
-# This class represents the context for a single chat session, including user messages, tool summaries, and various per-turn fields. It is used to manage the state of the conversation and the tools used during the session.
+# ════════════════════════════════════════════════════════════════════
+#  Chat-session Context
+# ════════════════════════════════════════════════════════════════════
 @dataclass
 class Context:
-    # Below we define the Context class, which holds the state of a chat session.
-    # This class holds the context for a chat session, including user messages, tool summaries, and various per-turn fields.
-    # It is used to manage the state of a specific chat session within the ChatManager.
-    # It includes fields for the session name, history manager, TTS manager, and workspace memory.
+    # Persistent identity
     name: str
     history_manager: HistoryManager
     tts_manager: TTSManager
-    workspace_memory: dict
+    workspace_memory: Dict[str, Any]
 
-    # per-turn fields (seeded by new_request)
+    # ─── Per-turn mutable state (seeded in ChatManager.new_request) ───
     user_message: str = ""
     sender_role: str  = "user"
     skip_tts: bool    = False
 
     ctx_txt: str = ""
-    tool_summaries: list[str] = field(default_factory=list)
+    tool_summaries: List[Any] = field(default_factory=list)
     assembled: str = ""
     final_response: Optional[str] = None
 
-    # Stages and their outputs are tracked here
-    stage_counts: dict[str,int] = field(default_factory=dict)
-    stage_outputs: dict[str, Any] = field(default_factory=dict)
+    # Stage bookkeeping
+    stage_counts: Dict[str, int] = field(default_factory=dict)
+    stage_outputs: Dict[str, Any] = field(default_factory=dict)
 
-    # values that some stages expect to find on ctx
-    run_id: Optional[int]     = None
-    global_tasks: list[Any]   = field(default_factory=list)
-    ALL_TOOLS: list[str]      = field(default_factory=list)
-    ALL_AGENTS: list[str]     = field(default_factory=list)
+    # IDs / refs used by many stages
+    run_id: Optional[int]   = None
+    global_tasks: List[Any] = field(default_factory=list)
+    ALL_TOOLS:  List[str]   = field(default_factory=list)
+    ALL_AGENTS: List[str]   = field(default_factory=list)
 
-    # This method allows dynamic attribute access to the context, enabling the Context to behave like a dictionary.
+    # ────────────────────────────────────────────────────────────────
+    #  Ephemeral per-turn overlay: **NOT** persisted to ctx.ctx_txt
+    #  or saved to disk.  Stages can freely stash scratch data here.
+    # ────────────────────────────────────────────────────────────────
+    frame: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    # ----------------------------------------------------------------
+    # Dict-style sugar so stages can use ctx["foo"] interchangeably
+    # ----------------------------------------------------------------
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
 
-    # This method allows dynamic attribute setting, enabling the Context to behave like a dictionary. It sets the attribute with the given key to the specified value.
     def __setitem__(self, key: str, value: Any) -> None:
         setattr(self, key, value)
 
-    # This method retrieves the value of an attribute by its key, returning a default value if the attribute does not exist. It allows for safe access to context fields without raising an AttributeError.
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
 
-# This class represents the context for a single run, including the run ID, user message, and various context fields. It is used to manage the state of a specific run within the chat manager.
+
+# ════════════════════════════════════════════════════════════════════
+#  Transient RunContext (used by streaming tool-decision helper)
+# ════════════════════════════════════════════════════════════════════
 @dataclass
 class RunContext:
-    run_id:      str
-    user_msg:    str
+    """
+    Lightweight scratch container used by streaming helper logic.
+    It is **not** persisted between turns.
+    """
+    run_id: int
+    user_msg: str
+
+    # Rolling state while the stream is active
     context_text: str = ""
-    tool_choice: str = ""
+    tool_choice: str  = ""
+
+    # Stage outputs can be parked here just like on the main Context
+    stage_outputs: Dict[str, Any] = field(default_factory=dict)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key, None)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        setattr(self, key, value)
 
 # This class manages the chat session, including context management, pipeline stages, and observability. It initializes various managers and handles the lifecycle of a chat session, including idle monitoring and context activation.
 class ChatManager:
@@ -4443,7 +4506,25 @@ class ChatManager:
         ("flow_health_check",       "_stage_flow_health_check",       "notification_audit"),
     ]
 
+    def _slice_ctx(self, ctx: Context, *, lines: int = 40) -> str:
+        """
+        Return the last <lines> lines of ctx.ctx_txt – used by all
+        stage prompts so we don't leak the entire history each time.
+        """
+        return "\n".join(ctx.ctx_txt.strip().splitlines()[-lines:])
+    
+    def _summarise_tool_result(self, name: str, raw: str | dict) -> dict:
+        """Return a compact structured summary for later ranking."""
+        summary = Tools.quick_summarise(raw, max_chars=120)
+        return {"tool": name, "summary": summary, "raw": raw}
+    
 
+    def _prompt_context_analysis(self, ctx: Context, hist_tail: str) -> list[dict]:
+        return [
+            {"role": "system", "content": CONTEXT_SYS_PROMPT},
+            {"role": "assistant", "content": hist_tail[-800:]},
+            {"role": "user", "content": ctx.user_message}
+        ]
 
     class _Stage:
         """Wrapper so we can queue stages as objects (needed for branching)."""
@@ -4471,7 +4552,9 @@ class ChatManager:
         # 1️⃣ Forced injections
         forced = getattr(ctx, "_forced_next", [])
         if forced:
-            return [forced.pop(0)]
+            next_stage = forced.pop(0)
+            ctx._active_stage = next_stage           # ← NEW: expose to handlers
+            return [next_stage]
 
         # ────────────────────────────────────────────────────────
         # 2️⃣ Tool-loop entry point: once we pick a tool, mark the loop
@@ -4901,6 +4984,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # ── 2️⃣  Try running — on SyntaxError/ValueError retry once with sanitizer
         sanitized = call
         tried_sanitize = False
+        fn_name = sanitized.split("(", 1)[0]
         while True:
             try:
                 output = self.run_tool(sanitized)
@@ -4930,7 +5014,9 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 break
 
         # ── 3️⃣  Record & clean up
-        ctx.tool_summaries.append(summary)
+        ctx.tool_summaries.append(
+            self._summarise_tool_result(fn_name, output)
+        )
         ctx.ctx_txt += summary + "\n"
         ctx.stage_outputs["execute_selected_tool"] = output
         ctx.next_tool_call = None
@@ -4942,7 +5028,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 "payload": str(output),
                 "stage":   "execute_selected_tool"
             }
-            ctx._forced_next = ["review_tool_plan"]
+            ctx.tool_failures[call] = ctx.tool_failures.get(call, 0) + 1
+            if ctx.tool_failures[call] < 2:
+                ctx._forced_next = ["execute_selected_tool"]   # retry once
+            else:
+                ctx._forced_next = ["review_tool_plan"]
             return None
 
 
@@ -5103,7 +5193,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             )
         except Exception:
             sim = ""
-
+        
         ctx_block = ""
         if sim:
             ctx_block += f"SIMILAR PAST:\n{sim}\n\n"
@@ -6487,7 +6577,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             messages = override_messages or []
             
         base_temp = cfg[f"{model_key.split('_')[0]}_temperature"]
-        temp      = base_temp + 0.5 * self.observer.recent_failure_ratio() + self._temp_bump
+        temp      = max(0.1, base_temp - 0.4 * self.observer.recent_failure_ratio())
         payload = {
             "model":       cfg[model_key],
             "temperature": min(temp, 1.5),  # cap it
@@ -7419,6 +7509,8 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             stage_obj = queue.popleft()
             name      = stage_obj.name
 
+            ctx._active_stage = name
+
             # skip runaway repeats
             cnt = ctx.stage_counts.get(name, 0) + 1
             ctx.stage_counts[name] = cnt
@@ -7523,7 +7615,12 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 result = None
             finally:
                 self.observer.log_stage_end(run_id, name)
-
+            # ── Continuous evaluation feedback loop ─────────────────────
+            try:
+                score = self.prompt_evaluator.score_stage(name, result)
+                self.prompt_evaluator.learn(name, score)
+            except Exception:
+                pass
             # record any string output
             if isinstance(result, str) and result:
                 ctx.stage_outputs[name] = result
@@ -7635,7 +7732,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         _ = Utils.embed_text(um)
         return None
 
-    # ─── Replacement ───
     def _stage_context_analysis(self, ctx: Context,
                                 prev_output: str | None = None) -> str:
         """
@@ -7714,9 +7810,10 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 raw = "NOTE: context analysis unavailable due to repeated policy violation."
 
         # ——— Record & return ———
+        analysis = Utils.parse_context_analysis(raw)          # tiny helper you own
+        ctx.stage_outputs["context_analysis"] = analysis
         ctx.ctx_txt += raw + "\n"
-        log_message(f"Context analysis (clean): {raw!r}", "DEBUG")
-        return raw
+        return analysis        # still fulfils downstream needs
 
 
 
@@ -7854,9 +7951,13 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
 
         # 1️⃣ Perform a single non-streaming tool-decision call
         # (this replaces the old streaming loop)
+        analysis = ctx.stage_outputs.get("context_analysis", {})
+        intent   = analysis.get("intent", "")
+        entities = ", ".join(analysis.get("entities", []))
         prompt = (
-            ctx.ctx_txt
-            + "\n\nPhase 2: Decide which tool to run.  Reply inside ```tool_code``` with exactly one call."
+            f"INTENT: {intent}\nENTITIES: {entities}\n\n"
+            + self._slice_ctx(ctx, 60)
+            + "\nPhase 2 – pick one helper in ```tool_code```."
         )
         try:
             resp = chat(
@@ -8267,6 +8368,16 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 json.dump(bag, f, indent=2)
         except:
             pass
+
+        MAX_CTX_LINES = 1200
+        if len(ctx.ctx_txt.splitlines()) > MAX_CTX_LINES:
+            keep = ctx.ctx_txt.splitlines()[-MAX_CTX_LINES:]
+            marker = "[▶️ EXECUTING"
+            for i, line in enumerate(reversed(keep)):
+                if marker in line:
+                    keep = keep[-(i + 50):]          # keep provenance
+                    break
+            ctx.ctx_txt = "\n".join(keep)
 
         return None
 
