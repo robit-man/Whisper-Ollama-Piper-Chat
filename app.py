@@ -2628,7 +2628,7 @@ class Tools:
 
     # This static method performs a quick DuckDuckGo search for a given topic. It opens the DuckDuckGo homepage, inputs the search query, waits for results, and optionally deep-scrapes the first few results in new tabs. It returns a list of dictionaries containing the title, URL, snippet, summary, and full page HTML content.
     @staticmethod
-    def duckduckgo_search(        # ← new canonical name
+    def duckduckgo_search(        # ‚Üê new canonical name
         topic: str,
         num_results: int = 5,
         wait_sec: int = 1,
@@ -2636,33 +2636,30 @@ class Tools:
     ) -> list:
         """
         Ultra-quick DuckDuckGo search (event-driven, JS injection).
-        • Opens the first *num_results* links in separate tabs and deep-scrapes each.
-        • Returns: title, url, snippet, summary, and full page HTML (`content`).
-        • Never blocks on long sleeps – every wait is event-based and aggressively-polled.
+        ‚Ä¢ Opens the first *num_results* links in separate tabs and deep-scrapes each.
+        ‚Ä¢ Returns: title, url, snippet, summary, and full page HTML (`content`).
+        ‚Ä¢ Never blocks more than 5 s on any wait‚Äîeverything is aggressively polled.
         """
-        import html, traceback
-        from bs4 import BeautifulSoup
-        from selenium.common.exceptions import TimeoutException, NoSuchElementException
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
 
-        log_message(f"[duckduckgo_search] ▶ {topic!r}", "INFO")
+        log_message(f"[duckduckgo_search] ‚ñ∂ {topic!r}", "INFO")
 
-        # fresh browser session ─────────────────────────────────────────────
+        # clamp waits to max 5 s
+        wait_sec = min(wait_sec, 5)
+
+        # fresh browser session
         Tools.close_browser()
         Tools.open_browser(headless=False, force_new=True)
-        drv   = Tools._driver
-        wait  = WebDriverWait(drv, wait_sec, poll_frequency=0.10)   # very snappy polling
+        drv = Tools._driver
+        wait = WebDriverWait(drv, wait_sec, poll_frequency=0.1)
         results = []
 
         try:
-            # 1️⃣  Home page ------------------------------------------------------------------
+            # 1Ô∏è‚É£ Home page
             drv.get("https://duckduckgo.com/")
             wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
             log_message("[duckduckgo_search] Home page ready.", "DEBUG")
 
-            # Cookie banner (if any) ----------------------------------------------------------
+            # 2Ô∏è‚É£ Cookie banner
             try:
                 btn = wait.until(EC.element_to_be_clickable(
                     (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler")
@@ -2672,7 +2669,7 @@ class Tools:
             except TimeoutException:
                 pass
 
-            # 2️⃣  Search box -----------------------------------------------------------------
+            # 3Ô∏è‚É£ Locate search box
             selectors = (
                 "input#search_form_input_homepage",
                 "input#searchbox_input",
@@ -2680,123 +2677,104 @@ class Tools:
             )
             box = next((drv.find_element(By.CSS_SELECTOR, sel)
                         for sel in selectors if drv.find_elements(By.CSS_SELECTOR, sel)),
-                    None)
+                       None)
             if not box:
-                raise RuntimeError("Search box not found on DuckDuckGo!")
+                raise RuntimeError("Search box not found!")
 
-            # 3️⃣  Inject query & submit (instant) --------------------------------------------
+            # submit query
             drv.execute_script(
                 "arguments[0].value = arguments[1];"
                 "arguments[0].dispatchEvent(new Event('input'));"
                 "arguments[0].form.submit();",
                 box, topic
             )
-            log_message("[duckduckgo_search] Query submitted via JS.", "DEBUG")
+            log_message("[duckduckgo_search] Query submitted.", "DEBUG")
 
-            # 4️⃣  Wait until results appear --------------------------------------------------
+            # 4Ô∏è‚É£ Wait for results
             try:
                 wait.until(lambda d: "?q=" in d.current_url)
-                wait.until(lambda d:
-                    d.find_elements(By.CSS_SELECTOR,
-                                    "#links .result, #links [data-nr]")
-                )
+                wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, "#links .result, #links [data-nr]"))
                 log_message("[duckduckgo_search] Results detected.", "DEBUG")
             except TimeoutException:
-                log_message("[duckduckgo_search] Timeout waiting for results.", "WARNING")
+                log_message("[duckduckgo_search] Results timeout.", "WARNING")
 
-            # 5️⃣  Collect anchors for the first N results ------------------------------------
+            # 5Ô∏è‚É£ Gather top anchors
             anchors = drv.find_elements(
                 By.CSS_SELECTOR,
                 "a.result__a, a[data-testid='result-title-a']"
             )[:num_results]
-
-            if not anchors:
-                log_message("[duckduckgo_search] No anchors found — layout change?", "ERROR")
 
             main_handle = drv.current_window_handle
 
             for a in anchors:
                 try:
                     href  = a.get_attribute("href")
-                    title = a.text.strip() or html.unescape(
-                        drv.execute_script("return arguments[0].innerText;", a)
-                    )
+                    title = a.text.strip() or html.unescape(drv.execute_script(
+                        "return arguments[0].innerText;", a
+                    ))
 
-                    # locate snippet in the same result container
+                    # snippet
                     try:
-                        parent   = a.find_element(By.XPATH, "./ancestor::*[contains(@class,'result')][1]")
-                        sn_el    = parent.find_element(By.CSS_SELECTOR,
-                                ".result__snippet, span[data-testid='result-snippet']")
-                        snippet  = sn_el.text.strip()
+                        parent = a.find_element(By.XPATH, "./ancestor::*[contains(@class,'result')][1]")
+                        sn = parent.find_element(By.CSS_SELECTOR,
+                            ".result__snippet, span[data-testid='result-snippet']")
+                        snippet = sn.text.strip()
                     except NoSuchElementException:
                         snippet = ""
 
-                    summary       = snippet
-                    page_content  = ""
+                    summary = snippet
+                    page_content = ""
 
-                    # 6️⃣  Deep-scrape in **new tab** ----------------------------------------
+                    # 6Ô∏è‚É£ Deep scrape in new tab
                     if deep_scrape and href:
-                        drv.switch_to.new_window("tab")          # Selenium-4 native tab
+                        drv.switch_to.new_window("tab")
                         drv.get(href)
 
-                        # install a MutationObserver to detect when dynamic JS stops mutating the DOM
+                        # track mutations
                         drv.execute_script("""
                             window._lastMut = Date.now();
                             new MutationObserver(function() {
                                 window._lastMut = Date.now();
                             }).observe(document, {
-                                childList: true,
-                                subtree:   true,
-                                attributes:true
+                                childList: true, subtree: true, attributes: true
                             });
                         """)
 
-                        # wait until either:
-                        #  • no DOM mutations for 500 ms, or
-                        #  • total time > wait_sec
-                        start_ms     = time.time() * 1000
-                        stable_delta = 500  # ms of no mutations needed
+                        start_ms = time.time() * 1000
+                        stable_delta = 500
+                        max_wait = 5000
                         while True:
-                            last_mut = drv.execute_script("return window._lastMut;")
-                            now_ms   = time.time() * 1000
-                            if now_ms - last_mut > stable_delta:
-                                # DOM has been quiet
-                                break
-                            if now_ms - start_ms > wait_sec * 1000:
-                                log_message(
-                                    f"[duckduckgo_search] dynamic-load timeout for {href!r}, scraping anyway",
-                                    "WARNING"
-                                )
+                            last = drv.execute_script("return window._lastMut;")
+                            now = time.time() * 1000
+                            if now - last > stable_delta or now - start_ms > max_wait:
+                                if now - start_ms > max_wait:
+                                    log_message(
+                                        f"[duckduckgo_search] dynamic-load hard timeout for {href!r}",
+                                        "WARNING"
+                                    )
                                 break
                             time.sleep(0.1)
 
-                        # First try our lightweight requests helper
                         page_content = Tools.bs4_scrape(href)
-
                         if page_content.startswith("Error"):
-                            # fallback to Selenium DOM if remote site blocks requests
                             page_content = drv.page_source
 
-                        pg    = BeautifulSoup(page_content, "html5lib")
-                        meta  = pg.find("meta", attrs={"name": "description"})
+                        pg = BeautifulSoup(page_content, "html5lib")
+                        meta = pg.find("meta", attrs={"name": "description"})
                         p_tag = pg.find("p")
-
                         if meta and meta.get("content"):
                             summary = meta["content"].strip()
                         elif p_tag:
                             summary = p_tag.get_text(strip=True)
 
-                        drv.close()                 # close the tab
+                        drv.close()
                         drv.switch_to.window(main_handle)
 
-                    # record ---------------------------------------------------------------
-                    if page_content:
-                        clean_content = BeautifulSoup(
-                            page_content,
-                            "html.parser"
-                        ).get_text(separator=" ", strip=True)
-                    else:
-                        clean_content = ""
+                    clean_content = (
+                        BeautifulSoup(page_content, "html.parser")
+                        .get_text(separator=" ", strip=True)
+                        if page_content else ""
+                    )
 
                     results.append({
                         "title":   title,
@@ -2806,21 +2784,17 @@ class Tools:
                         "content": clean_content,
                     })
 
-                    if len(results) >= num_results:
-                        break
-
                 except Exception as ex:
-                    log_message(f"[duckduckgo_search] Error processing a result: {ex}", "WARNING")
+                    log_message(f"[duckduckgo_search] result error: {ex}", "WARNING")
                     continue
 
         except Exception as e:
-            log_message(f"[duckduckgo_search] Fatal error: {e}\n{traceback.format_exc()}", "ERROR")
+            log_message(f"[duckduckgo_search] Fatal: {e}\n{traceback.format_exc()}", "ERROR")
         finally:
             Tools.close_browser()
 
         log_message(f"[duckduckgo_search] Collected {len(results)} results.", "SUCCESS")
         return results
-
     # This method assigns the duckduckgo_search method to a variable for compatibility with existing code that expects this name.
     ddg_search = duckduckgo_search
 
