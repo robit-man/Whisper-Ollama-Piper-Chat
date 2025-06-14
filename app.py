@@ -335,6 +335,7 @@ import asyncio
 from typing import Callable
 from queue import Queue, Empty
 import uuid
+from pathlib import Path
 
 # ── Database / Knowledge Graph
 import sqlite3
@@ -950,8 +951,8 @@ class TTSManager:
     """
     def __init__(self):
         self._mode          = "live"       # or "file"
-        self._live_queue    = Queue()      # only for live-mode items
-        self._pending_texts = []           # buffer for file-mode
+        self._live_queue    = Queue()      # only for live‐mode items
+        self._pending_texts = []           # buffer for file‐mode
         self._last_text     = None         # to dedupe repeats
         self._lock          = threading.Lock()
         self._running       = True
@@ -963,12 +964,14 @@ class TTSManager:
         if mode not in ("live", "file"):
             raise ValueError("TTS mode must be 'live' or 'file'")
         log_message(f"TTS mode switching to: {mode}", "INFO")
-        # clear out any old state
+        # clear any buffered state
         with self._lock:
             self._pending_texts.clear()
             self._last_text = None
+        # clear live queue
         while True:
-            try:    self._live_queue.get_nowait()
+            try:
+                self._live_queue.get_nowait()
             except Empty:
                 break
         self._mode = mode
@@ -1043,7 +1046,7 @@ class TTSManager:
         """Shutdown the live-playback worker and clear everything."""
         log_message("Stopping TTS worker.", "PROCESS")
         self._running = False
-        # wake up worker
+        # wake up live worker
         self._live_queue.put((None, None))
         with self._lock:
             self._pending_texts.clear()
@@ -1055,7 +1058,7 @@ class TTSManager:
         self._running = True
 
     def _live_worker(self):
-        """Background thread: drain live-queue and play immediately."""
+        """Background thread: drain live‐queue and play immediately."""
         log_message("TTS live-worker thread started.", "DEBUG")
         while self._running:
             item = self._live_queue.get()
@@ -6273,6 +6276,42 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         log_message("Idle monitor thread exiting.", "DEBUG")
 
 
+    def _run_self_tests(self):
+        """
+        Health-check hook.  1) ping the primary LLM with a simple math query,
+        2) feed a known bad statement through the RLManager’s repair routine
+           and verify it corrects it.
+        """
+        # 1️⃣ Primary LLM sanity check
+        try:
+            prompt = "What is 2 + 2?"
+            resp = chat(
+                model=self.config_manager.config["primary_model"],
+                messages=[{"role": "user", "content": prompt}],
+                stream=False
+            )["message"]["content"].strip()
+            if "4" not in resp:
+                log_message(f"[Self-tests] Unexpected LLM reply to '{prompt}': {resp!r}", "ERROR")
+            else:
+                log_message("[Self-tests] Primary LLM inference OK.", "INFO")
+        except Exception as e:
+            log_message(f"[Self-tests] Primary LLM failed: {e}", "ERROR")
+
+        # 2️⃣ RLManager self-repair check
+        if self.rl_manager:
+            try:
+                flawed   = "The capital of France is Berlin."
+                # assume your RLManager exposes a 'self_repair' or similar method
+                repaired = self.rl_manager.self_repair(flawed)
+                if "Paris" not in repaired:
+                    log_message(f"[Self-tests] RLManager did not correct: {repaired!r}", "ERROR")
+                else:
+                    log_message("[Self-tests] RLManager self-repair OK.", "INFO")
+            except Exception as e:
+                log_message(f"[Self-tests] RLManager test failed: {e}", "ERROR")
+        else:
+            log_message("[Self-tests] No RLManager configured; skipping RL tests.", "DEBUG")
+            
     def _start_idle_mull(self):
         """
         Background thread: after a random idle interval between idle_min/idle_max,
@@ -8353,78 +8392,190 @@ def text_input_loop(chat_manager: ChatManager):
         )
 
 
-# ---------------------------------------------------------------- #
-# telegram_input (full drop‐in) loop                               #
-# ---------------------------------------------------------------- #
 def telegram_input(chat_manager: ChatManager):
-    import os
-    from dotenv import load_dotenv
-    from telegram import Update
-    from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
-    from telegram.request import HTTPXRequest
+    """
+    Launch a Telegram bot that:
+      • Stores per-chat JSON histories (DM & group) under cfg["history"].
+      • In groups, only responds when @BOT_USERNAME is mentioned.
+      • Supports /reset and /history commands.
+      • Shows one “🛠️ Processing…” placeholder, live‐edited by stage callbacks.
+      • Sends final text (editing the placeholder) and then all synthesized .ogg files.
+    """
 
+    class _Cfg:
+        DEFAULT = {"history": "history"}
+        def __init__(self, path="config.json"):
+            if not os.path.exists(path):
+                Path(path).write_text(json.dumps(self.DEFAULT, indent=2))
+                self.cfg = dict(self.DEFAULT)
+            else:
+                try:
+                    self.cfg = json.load(open(path, "r", encoding="utf-8"))
+                except:
+                    self.cfg = dict(self.DEFAULT)
+            if "history" not in self.cfg:
+                self.cfg["history"] = self.DEFAULT["history"]
+
+    cfg = _Cfg().cfg
+    hdir = Path(cfg["history"]).expanduser()
+    hdir.mkdir(parents=True, exist_ok=True)
+    MAX_HIST = 100
+
+    def _hfile(key: str) -> Path:
+        return hdir / f"{key}.json"
+
+    def _load(key: str) -> list:
+        try:
+            return json.loads(_hfile(key).read_text(encoding="utf-8"))
+        except:
+            return []
+
+    def _save(key: str, hist: list):
+        _hfile(key).write_text(json.dumps(hist, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _update(key: str, role: str, content: str, sender: str = None) -> list:
+        hist = _load(key)
+        entry = {
+            "role":      role,
+            "content":   content,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        if sender:
+            entry["sender"] = sender
+        hist.append(entry)
+        if len(hist) > MAX_HIST:
+            hist = hist[-MAX_HIST:]
+        _save(key, hist)
+        return hist
+
+    def _reset(key: str):
+        _save(key, [])
+
+    def _split(text: str, n: int = 4096) -> list[str]:
+        if len(text) <= n:
+            return [text]
+        parts, cur = [], ""
+        for sent in re.split(r"(?<=[.!?])\s+", text):
+            if len(cur) + len(sent) + 1 > n:
+                parts.append(cur.strip())
+                cur = sent + " "
+            else:
+                cur += sent + " "
+        if cur:
+            parts.append(cur.strip())
+        return parts
+
+    # ── 2. Telegram setup ───────────────────────────────────────────
     load_dotenv()
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
-    if not BOT_TOKEN:
-        raise RuntimeError("Missing BOT_TOKEN in environment")
-
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("Missing BOT_TOKEN")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    app  = ApplicationBuilder().token(token).request(HTTPXRequest()).build()
+    me   = loop.run_until_complete(app.bot.get_me())
+    bot_username = (os.getenv("BOT_USERNAME") or me.username or "").lower()
+    mention_re   = re.compile(rf"@{re.escape(bot_username)}\b", re.IGNORECASE) if bot_username else None
+    running: dict[int, asyncio.Task] = {}
 
-    req = HTTPXRequest(connect_timeout=20, read_timeout=20)
-    app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
-    running_tasks: dict[int, asyncio.Task] = {}
+    # ── 3. commands ─────────────────────────────────────────────────
+    async def _cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        key = str(update.effective_chat.id)
+        _reset(key)
+        await update.message.reply_text("🔄 Conversation history reset.")
 
-    async def _handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id   = update.effective_chat.id
-        user_text = (update.message.text or "").strip()
-        if not user_text:
+    async def _cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        key = str(update.effective_chat.id)
+        hist = _load(key)
+        if not hist:
+            await update.message.reply_text("📭 No history yet.")
+            return
+        lines = [f"{e['timestamp']} • {e.get('sender', e['role'])}: {e['content']}" for e in hist]
+        for chunk in _split("\n".join(lines)):
+            await update.message.reply_text(chunk)
+
+    # ── 4. message handler ─────────────────────────────────────────
+    async def _on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        m = update.message
+        if not m or not m.text:
             return
 
-        # cancel prior
-        prev = running_tasks.get(chat_id)
+        chat = update.effective_chat
+        text = m.text.strip()
+
+        # in group, require mention
+        if chat.type != "private":
+            if not mention_re or not mention_re.search(text):
+                return
+            text = mention_re.sub("", text).strip()
+            if not text:
+                return
+
+        cid = str(chat.id)
+        sender = m.from_user.username or m.from_user.full_name
+
+        # cancel prior task
+        prev = running.get(chat.id)
         if prev and not prev.done():
             prev.cancel()
 
-        sent = await context.bot.send_message(chat_id=chat_id, text="🛠️ Processing…")
-        msg_id = sent.message_id
+        _update(cid, "user", text, sender)
 
-        chat_manager._activate_context(str(chat_id))
+        # send placeholder
+        sent = await context.bot.send_message(chat_id=chat.id, text="🛠️ Processing…")
+        ph_id = sent.message_id
 
-        def stage_cb(stage_out: str):
+        # activate ChatManager context
+        chat_manager._activate_context(cid)
+
+        # typing indicator
+        stop_typing = asyncio.Event()
+        async def _typist():
+            while not stop_typing.is_set():
+                try:
+                    await context.bot.send_chat_action(chat.id, ChatAction.TYPING)
+                except:
+                    pass
+                await asyncio.sleep(3)
+        typetask = asyncio.create_task(_typist())
+
+        # stage callback
+        def _stage_cb(stage_out: str):
             if not stage_out:
                 return
-            async def do_edit():
+            async def _edit():
                 try:
                     await context.bot.edit_message_text(
-                        chat_id=chat_id, message_id=msg_id,
+                        chat_id=chat.id,
+                        message_id=ph_id,
                         text=f"🔄 {stage_out}"
                     )
-                except: pass
-            asyncio.run_coroutine_threadsafe(do_edit(), loop)
+                except:
+                    pass
+            asyncio.run_coroutine_threadsafe(_edit(), loop)
 
-        async def runner():
+        # runner
+        async def _runner():
             try:
-                # 1) switch TTS → file, clear old files
                 chat_manager.tts_manager.set_mode("file")
-
-                # 2) full pipeline (this will enqueue .ogg via final_inference)
                 final = await asyncio.to_thread(
                     chat_manager.new_request,
-                    user_text,
-                    "user",
-                    False,     # **must** be False so final_inference enqueues
-                    stage_cb
+                    text, "user", False, _stage_cb
                 )
 
-                # 3) send text edit
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=final or "(no response)"
-                )
+                # edit to final text
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat.id,
+                        message_id=ph_id,
+                        text=final or "(no response)"
+                    )
+                except:
+                    pass
 
-                # 4) drain & send .ogg files
+                _update(cid, "assistant", final or "", sender="assistant")
+
+                # drain & send .ogg
                 while True:
                     try:
                         ogg = chat_manager.tts_manager.wait_for_latest_ogg(timeout=5.0)
@@ -8432,30 +8583,40 @@ def telegram_input(chat_manager: ChatManager):
                         break
                     with open(ogg, "rb") as vf:
                         await context.bot.send_voice(
-                            chat_id=chat_id,
+                            chat_id=chat.id,
                             voice=vf,
-                            reply_to_message_id=msg_id
+                            reply_to_message_id=ph_id
                         )
 
             except asyncio.CancelledError:
                 try:
                     await context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
+                        chat_id=chat.id,
+                        message_id=ph_id,
                         text="⚠️ Previous request cancelled."
                     )
-                except: pass
+                except:
+                    pass
 
             except Exception as e:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Error: {e}")
+                await context.bot.send_message(chat_id=chat.id, text=f"❌ Error: {e}")
 
             finally:
-                running_tasks.pop(chat_id, None)
+                chat_manager.tts_manager.set_mode("live")
+                stop_typing.set()
+                try:
+                    await typetask
+                except:
+                    pass
+                running.pop(chat.id, None)
 
-        task = loop.create_task(runner())
-        running_tasks[chat_id] = task
+        running[chat.id] = loop.create_task(_runner())
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_update))
+    # ── 5. register handlers & run ──────────────────────────────────
+    app.add_handler(CommandHandler("reset",   _cmd_reset))
+    app.add_handler(CommandHandler("history", _cmd_history))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_message))
+
     loop.run_until_complete(app.initialize())
     loop.run_until_complete(app.start())
     loop.run_until_complete(app.updater.start_polling())
@@ -8466,6 +8627,7 @@ def telegram_input(chat_manager: ChatManager):
         loop.run_until_complete(app.stop())
         loop.run_until_complete(app.shutdown())
         loop.close()
+
 
 
 # This is the main entry point for the application.

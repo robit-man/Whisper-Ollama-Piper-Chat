@@ -3,6 +3,7 @@ piper
 external_tools
 tts_output
 workspace
+history
 chat_sessions
 .setup_complete
 glados_piper_medium.onnx
