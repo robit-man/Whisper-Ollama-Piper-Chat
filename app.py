@@ -7506,33 +7506,35 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ‚Ä¢ Registers ctx.next_tool_call and forces the criteria ‚Üí decomposition
           ‚Üí validation branch so ctx.plan is always set.
         """
-        import re, inspect
+        import re, inspect, json
 
         # 0Ô∏è‚É£ Compute and report incoming context size in tokens
         ctx_text = ctx.ctx_txt or ""
-        # ensure it's a string
         ctx_text = ctx_text if isinstance(ctx_text, str) else str(ctx_text)
         ctx_tokens = len(ctx_text.split())
         log_message(f"[Planning summary] context size: {ctx_tokens} tokens", "DEBUG")
         ctx.stage_outputs["planning_summary_ctx_tokens"] = ctx_tokens
 
-        # 1Ô∏è‚É£ Stream the tool decision, collecting **string** tokens
+        # 1Ô∏è‚É£ Stream the tool decision, coercing everything to a string
         gathered: list[str] = []
         for chunk, done in self._stream_tool(ctx):
+            # extract raw payload
             if isinstance(chunk, dict):
-                token_str = (
-                    chunk.get("content")
-                    or chunk.get("message", {}).get("content")
-                    or ""
-                )
+                raw = chunk.get("content") or chunk.get("message", {}).get("content") or ""
             else:
-                token_str = chunk if isinstance(chunk, str) else str(chunk)
+                raw = chunk
+            # ensure it's a string
+            if isinstance(raw, str):
+                token_str = raw
+            else:
+                # for lists, dicts, numbers, etc.
+                token_str = json.dumps(raw, ensure_ascii=False)
             gathered.append(token_str)
             if done:
                 break
 
         # 2Ô∏è‚É£ Combine and strip any code fences
-        combined = "".join(str(t) for t in gathered)
+        combined = "".join(gathered)
         raw = re.sub(
             r"^```(?:tool_code|python|py)\s*|\s*```$",
             "",
@@ -7540,12 +7542,12 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             flags=re.DOTALL
         ).strip().strip("`")
 
-        # 3Ô∏è‚É£ Parse & register the tool call (always store a string)
+        # 3Ô∏è‚É£ Parse & register the tool call
         parsed = Tools.parse_tool_call(raw)
         call_str = parsed if isinstance(parsed, str) else (str(parsed) if parsed is not None else "")
         ctx.next_tool_call = call_str
 
-        # 4Ô∏è‚É£ Detect if we need to improve the tool set
+        # 4Ô∏è‚É£ Detect if we need to self-improve tools
         known_funcs = {
             name for name, fn in inspect.getmembers(Tools, inspect.isfunction)
             if not name.startswith("_")
@@ -7553,31 +7555,29 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         fn_name = call_str.split("(", 1)[0] if "(" in call_str else call_str
         ctx.needs_tool_work = fn_name not in known_funcs
 
-        # 5Ô∏è‚É£ One-line explanation from secondary model (no automatic TTS)
+        # 5Ô∏è‚É£ One-sentence explanation from secondary model
         plan_msg = ""
         if call_str:
             system = "Explain one casual sentence what this upcoming tool call will do."
             user   = f"We are about to run {call_str} for: {ctx.user_message}"
             resp   = chat(
                 model=self.config_manager.config["secondary_model"],
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user}
-                ],
+                messages=[{"role": "system", "content": system},
+                          {"role": "user",   "content": user}],
                 stream=False
             )
-            # unify to string
+            # coerce to string
             if isinstance(resp, dict):
-                plan_msg = resp.get("message", {}).get("content") or ""
+                plan_msg = (resp.get("message", {}) or {}).get("content", "")
             else:
                 plan_msg = str(resp)
+            plan_msg = plan_msg or ""
             plan_msg = plan_msg.strip()
 
-            # enqueue TTS only if allowed
             if plan_msg and not getattr(ctx, "skip_tts", False):
                 self.tts_manager.enqueue(plan_msg)
 
-        # 6Ô∏è‚É£ Record and force next stages
+        # 6Ô∏è‚É£ Record & force next stages
         summary_line = plan_msg or "(no tool)"
         ctx.ctx_txt += f"\n[Planning summary] {summary_line}"
         ctx.stage_outputs["planning_summary"] = plan_msg
@@ -7588,7 +7588,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ]
 
         return plan_msg
-    
+
     # ------------------------------
     # Stage 8: tool_chaining
     # ------------------------------
