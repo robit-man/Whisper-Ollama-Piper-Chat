@@ -4460,20 +4460,16 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         """
         Examine ctx.last_failure (a dict injected by run_tool or any stage
         that throws) and try one automated fix **without user interaction**.
-
-        Supported failure types out-of-the-box:
-        • missing_argument      → ask the LLM to supply a literal value
-        • unknown_tool          → call create_tool(…) stub generator
-        • runtime_error         → retry once with sanitized args
         """
-
-        fail = ctx.pop("last_failure", None)
+        # fetch and clear the failure flag from the Context object
+        fail = getattr(ctx, "last_failure", None)
         if not fail:
             return  # nothing to do
+        delattr(ctx, "last_failure")
 
-        ftype   = fail["type"]
-        payload = fail["payload"]
-        stage   = fail["stage"]
+        ftype   = fail.get("type")
+        payload = fail.get("payload")
+        stage   = fail.get("stage")
         note    = f"[Self-repair] Detected {ftype} in {stage}: {payload}"
         ctx.ctx_txt += "\n" + note
         log_message(note, "WARNING")
@@ -4517,8 +4513,10 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ctx.ctx_txt += f"\n[Self-repair] {call} → {out}"
 
         # 3️⃣ Re-queue the stage that failed so it gets a second chance ----
-        ctx._forced_next = [stage] + (getattr(ctx, "_forced_next", []))
+        existing = getattr(ctx, "_forced_next", [])
+        ctx._forced_next = [stage] + existing
         return
+
 
 
     def _stage_checkpoint(self, ctx: Context):
@@ -6982,7 +6980,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         """
         • Optional `/ctx <name>` context switch
         • Records history + telemetry
-        • Chooses system-prompt via RL and then runs the fractal pipeline
+        • Chooses system‐prompt via RL and runs the fractal pipeline
         • Records a simple reward afterwards
         """
         import re, random
@@ -7010,6 +7008,8 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # 2) per-turn init (don’t wipe long-term fields)
         ctx.user_message = user_message
         ctx.sender_role  = sender_role
+        # suppress ALL intermediate TTS;
+        # final voice output comes only from _stage_final_inference
         ctx.skip_tts     = skip_tts
 
         # turn counter + narrative
@@ -7028,7 +7028,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ctx.assembled      = ""
         ctx.final_response = None
 
-        # 2a) record history
+        # record history
         ctx.history_manager.add_entry(sender_role, user_message)
 
         # 3) telemetry start
@@ -7036,8 +7036,8 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         self.current_run_id = run_id
         ctx.run_id          = run_id
 
-        # 4) RL-driven system prompt selection (ε-greedy)
-        base_prompt    = self.config_manager.config.get("system", "")
+        # 4) RL‐driven system‐prompt selection (ε-greedy)
+        base_prompt = self.config_manager.config.get("system", "")
         if random.random() < 0.2:
             prompt, _ = self.rl_manager.propose(
                 base_prompt,
@@ -7049,7 +7049,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
 
         self.config_manager.config["system"] = prompt
 
-        # 5) run the **fractal** pipeline (honouring ctx._forced_next for expansion)
+        # 5) run the fractal pipeline (uses _expand for dynamic routing)
         resp = self._run_fractal_pipeline(ctx)
 
         # 6) compute & record a simple reward (1 − recent_failure_ratio)
@@ -7060,33 +7060,19 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         self._save_workspace_memory(ctx.workspace_memory)
         self.observer.complete_run(run_id)
 
-        # (TTS is handled by the final_inference stage itself)
+        # (TTS of the final response is done only in _stage_final_inference)
         return resp
-
-
-
 
 
     def _run_fractal_pipeline(self, ctx: Context) -> str:
         """
         Fractal, queue-driven engine with tool-plan critique & retry.
-
-        Stages flow as before, but:
-        - After plan_validation → review_tool_plan
-        - In execute_actions, run each tool call with run_tool_once()
-            capturing failures in ctx.tool_failures and summaries in ctx.tool_summaries.
-        - Any failure bounces back to review_tool_plan per _expand().
+        Uses _expand() to choose next stages dynamically.
         """
         run_id = ctx.run_id
+        queue  = deque([ self._Stage("context_analysis") ])
 
-        # Determine starting stage: use overridden list if set
-        if getattr(ctx, "pipeline_overridden", False) and getattr(ctx, "overridden_stages", None):
-            first_stage = ctx.overridden_stages[0]
-        else:
-            first_stage = "context_analysis"
-        queue = deque([ self._Stage(first_stage) ])
-
-        # ensure we have a place to collect tool results/failures
+        # ensure we have a place to collect results/failures
         ctx.tool_failures = {}
         if not hasattr(ctx, "tool_summaries"):
             ctx.tool_summaries = []
@@ -7113,7 +7099,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             try:
                 result = handler(ctx, *args) if args else handler(ctx)
             except Exception as e:
-                # record failure metadata and schedule self-repair
+                # record failure & schedule self-repair
                 ctx.last_failure = {"type":"exception","payload":str(e),"stage":name}
                 log_message(f"[{ctx.name}] '{name}' exception: {e}", "ERROR")
                 queue.appendleft(self._Stage("self_repair"))
@@ -7121,11 +7107,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             finally:
                 self.observer.log_stage_end(run_id, name)
 
-            # record any text outputs
+            # capture any string output
             if isinstance(result, str) and result:
                 ctx.stage_outputs[name] = result
 
-            # special-case: execute_actions
+            # special-case: execute_actions must run plan items
             if name == "execute_actions":
                 ctx.tool_failures = {}
                 for call in getattr(ctx, "plan", []):
@@ -7136,19 +7122,19 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                         ctx.tool_failures[call] = str(e)
                         log_message(f"[{ctx.name}] tool execution failed for {call}: {e}", "ERROR")
                         break
+                # then enqueue whatever expand() says next
                 for nxt in self._expand(name, ctx):
                     queue.append(self._Stage(nxt))
                 continue
 
-            # regular expansion for all other stages
+            # regular expansion for everything else
             for nxt in self._expand(name, ctx):
                 queue.append(self._Stage(nxt))
 
-        # wrap up
+        # wrap-up
         self._save_workspace_memory(ctx.workspace_memory)
         self.observer.complete_run(run_id)
         return ctx.final_response or ""
-
 
 
 
@@ -7494,6 +7480,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         • Registers ctx.next_tool_call and forces the criteria → decomposition
           → validation branch so ctx.plan is always set.
         """
+        import re, inspect
 
         # 0️⃣ Compute and report incoming context size in tokens
         ctx_text   = ctx.ctx_txt or ""
@@ -7501,73 +7488,74 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         log_message(f"[Planning summary] context size: {ctx_tokens} tokens", "DEBUG")
         ctx.stage_outputs["planning_summary_ctx_tokens"] = ctx_tokens
 
-        # 1️⃣ Stream the tool decision, collecting tokens as strings
+        # 1️⃣ Stream the tool decision, collecting strings
         gathered: list[str] = []
-        for chunk, done in self._stream_tool(ctx):
+        for part in self._stream_tool(ctx):
+            # handle (chunk, done) or single value
+            if isinstance(part, tuple) and len(part) == 2:
+                chunk, done = part
+            else:
+                chunk, done = part, False
+
             if isinstance(chunk, str):
-                token_str = chunk
+                token = chunk
             elif isinstance(chunk, dict):
-                token_str = (
+                token = (
                     chunk.get("content")
                     or chunk.get("message", {}).get("content")
                     or ""
                 )
             else:
-                token_str = str(chunk)
-            gathered.append(token_str)
+                token = str(chunk)
+
+            gathered.append(token)
             if done:
                 break
 
-        # 2️⃣ Combine and strip any code fences
+        # 2️⃣ Combine and strip code fences
         combined = "".join(gathered)
-        raw = re.sub(
-            r"^```(?:tool_code|python|py)\s*|\s*```$",
-            "",
-            combined,
-            flags=re.DOTALL
-        ).strip().strip("`")
+        raw = re.sub(r"^```(?:tool_code|python|py)\s*|\s*```$", "",
+                     combined, flags=re.DOTALL).strip("`\n ")
 
-        # 3️⃣ Parse & register the tool call
+        # 3️⃣ Parse & register next tool call
         call = Tools.parse_tool_call(raw)
         ctx.next_tool_call = call
 
-        # 4️⃣ Detect if we need to improve the tool set
-        sig_funcs = {
+        # 4️⃣ Flag if tool‐work is needed
+        available = {
             name for name, fn in inspect.getmembers(Tools, inspect.isfunction)
             if not name.startswith("_")
         }
-        if isinstance(call, str):
-            fn_name = call.split("(", 1)[0]
-            ctx.needs_tool_work = fn_name not in sig_funcs
-        else:
-            ctx.needs_tool_work = False
+        ctx.needs_tool_work = isinstance(call, str) and call.split("(",1)[0] not in available
 
-        # 5️⃣ One-line explanation from secondary model (no TTS)
+        # 5️⃣ Get explanation and enqueue only the explanation
         plan_msg = ""
         if call:
-            system = "Explain one casual sentence what this upcoming tool call will do."
-            user   = f"We are about to run {call} for: {ctx.user_message}"
-            resp   = chat(
+            sys_p = "Explain one casual sentence what this upcoming tool call will do."
+            usr_p = f"We are about to run {call} for: {ctx.user_message}"
+            response = chat(
                 model=self.config_manager.config["secondary_model"],
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user}
-                ],
+                messages=[{"role":"system","content":sys_p},
+                          {"role":"user","content":usr_p}],
                 stream=False
             )
-            if isinstance(resp, dict) and isinstance(resp.get("message"), dict):
-                plan_msg = resp["message"].get("content", "").strip()
-            else:
-                plan_msg = str(resp).strip()
 
-        # 6️⃣ Record and force next stages
+            # pull out just the assistant’s content
+            msg = None
+            if isinstance(response, dict):
+                msg = response.get("message")
+            if isinstance(msg, dict):
+                plan_msg = msg.get("content", "").strip()
+            elif hasattr(msg, "content"):
+                plan_msg = getattr(msg, "content", "").strip()
+
+            if plan_msg and not getattr(ctx, "skip_tts", False):
+                self.tts_manager.enqueue(plan_msg)
+
+        # 6️⃣ Record narrative & schedule next stages
         ctx.ctx_txt += f"\n[Planning summary] {plan_msg or '(no tool)'}"
         ctx.stage_outputs["planning_summary"] = plan_msg
-        ctx._forced_next = [
-            "define_criteria",
-            "task_decomposition",
-            "plan_validation"
-        ]
+        ctx._forced_next = ["define_criteria", "task_decomposition", "plan_validation"]
 
         return plan_msg
 
@@ -7791,8 +7779,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             pass
 
         # 5) speak, unless muted
-        if not getattr(ctx, "skip_tts", True):
-            self.tts_manager.enqueue(cleaned)
+        self.tts_manager.enqueue(cleaned)
 
         # no return value → pipeline will automatically enqueue:
         #    output_review → adversarial_loop → notification_audit → flow_health_check
