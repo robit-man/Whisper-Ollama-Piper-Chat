@@ -920,19 +920,104 @@ class ConfigManager:
         self.config = config
         log_message("ConfigManager initialized with config.", "DEBUG")
 
-# This class manages the chat history, allowing entries to be added with timestamps.
+# ──────────────────────────────────────────────────────────────────────
+#  HistoryManager  ·  safe, vector-indexed chat history
+# ──────────────────────────────────────────────────────────────────────
 class HistoryManager:
+    """In-memory history with fast similarity search."""
+    EMB_DIM = 384            # Utils.embed_text() default size
+
+    # ── init ──────────────────────────────────────────────────────────
     def __init__(self):
-        self.history = []
+        self.history     = []          # list[dict] – each has role/content/timestamp/vec
+        self._vec_matrix = []          # parallel 2-D list[ list[float] ]
+
         log_message("HistoryManager initialized.", "DEBUG")
-    def add_entry(self, role, content):
+        self._load_past_sessions()     # warm-start with previous logs
+
+    # ── public API ────────────────────────────────────────────────────
+    def add_entry(self, role: str, content):
+        """
+        Append a message to history, storing a *plain-text* copy and an
+        embedding vector (list[float]) for similarity search.
+        """
+        # 1) hard-sanitise content so it’s always a string
+        if not isinstance(content, str):
+            content = str(content)[:2000] + (" …" if len(str(content)) > 2000 else "")
+
+        # 2) embed once – force python list (never a NumPy ndarray)
+        vec_raw = Utils.embed_text(content)
+        vec = vec_raw.tolist() if hasattr(vec_raw, "tolist") else list(vec_raw)
+
         entry = {
-            "role": role,
-            "content": content,
-            "timestamp": datetime.now().isoformat()
+            "role":      role,
+            "content":   content,
+            "timestamp": datetime.now().isoformat(),
+            "vec":       vec,
         }
         self.history.append(entry)
+        self._vec_matrix.append(vec)
+
         log_message(f"History entry added for role '{role}'.", "INFO")
+
+    def search(self, query: str, top_n: int = 5,
+               since: datetime | None = None) -> list[dict]:
+        """Return the *top-n* records most similar to *query*."""
+        if not self.history:
+            return []
+
+        q_vec_raw = Utils.embed_text(query)
+        q_vec     = q_vec_raw.tolist() if hasattr(q_vec_raw, "tolist") else list(q_vec_raw)
+
+        scored = []
+        for idx, rec in enumerate(self.history):
+            if since and datetime.fromisoformat(rec["timestamp"]) < since:
+                continue
+            sim = Utils.cosine_similarity(q_vec, self._vec_matrix[idx])
+            scored.append((sim, rec))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [rec for sim, rec in scored[:top_n]]
+
+    # ── internals ─────────────────────────────────────────────────────
+    def _load_past_sessions(self):
+        """
+        Import any line-JSON logs at chat_sessions/*/session.txt, converting
+        legacy lines on the fly.  Silently skips malformed entries.
+        """
+        sess_root = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "chat_sessions")
+        if not os.path.isdir(sess_root):
+            return
+
+        for sub in os.listdir(sess_root):
+            log_path = os.path.join(sess_root, sub, "session.txt")
+            if not os.path.isfile(log_path):
+                continue
+
+            with open(log_path, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        e = json.loads(line)
+                        if {"timestamp", "role", "content"} <= e.keys():
+                            # 1) ensure content is str
+                            if not isinstance(e["content"], str):
+                                e["content"] = str(e["content"])[:2000] + " …"
+
+                            # 2) ensure vec exists & is list[float]
+                            if "vec" not in e:
+                                e["vec"] = Utils.embed_text(e["content"])
+                            if hasattr(e["vec"], "tolist"):
+                                e["vec"] = e["vec"].tolist()
+
+                            self.history.append(e)
+                            self._vec_matrix.append(e["vec"])
+                    except Exception:
+                        continue
+
+        log_message(f"Loaded {len(self.history)} historic messages "
+                    f"into in-memory index.", "SUCCESS")
+
 
 TTS_OUTPUT_DIR = os.path.join(os.getcwd(), "tts_output")
 os.makedirs(TTS_OUTPUT_DIR, exist_ok=True)
@@ -1223,16 +1308,31 @@ class Utils:
         return result
     
     @staticmethod
-    def convert_numbers_to_words(text):
-        def replace_num(match):
-            number_str = match.group(0)
+    def convert_numbers_to_words(text: str) -> str:
+        """
+        Replace every standalone integer or simple decimal in *text* with its
+        word-form (e.g. “42” → “forty-two”, “3.14” → “three point one four”).
+
+        Returns a **plain str** – never a NumPy/char array – so downstream boolean
+        checks (`if text:`) cannot raise the “truth value of an array” error.
+        """
+
+        def _to_words(match: re.Match) -> str:
+            num_txt = match.group(0)
             try:
-                return num2words(int(number_str))
-            except ValueError:
-                return number_str
-        converted = re.sub(r'\b\d+\b', replace_num, text)
+                # decimals → float, integers → int
+                value = float(num_txt) if "." in num_txt else int(num_txt)
+                return num2words(value)
+            except Exception:
+                # leave untouched on any conversion failure
+                return num_txt
+
+        # \b ensures we don’t mangle parts of IDs / URLs
+        converted: str = re.sub(r"\b\d+(?:\.\d+)?\b", _to_words, str(text))
+
         log_message("Numbers converted to words in text.", "DEBUG")
-        return converted
+        return converted  # always a str
+
     
     @staticmethod
     def get_current_time():
@@ -4564,135 +4664,145 @@ class ChatManager:
         def __repr__(self):
             return f"<Stage {self.name}>"
     
+    # ------------------------------------------------------------------ #
+    #  Dynamic stage selector                                            #
+    # ------------------------------------------------------------------ #
     def _expand(self, stage: str, ctx: Context) -> list[str]:
         """
-        Decide which stage(s) should run next after *stage*.
-        This version patches the “lost context / I don’t have tools” bug
-        by ensuring the post-action audit chain always executes.
+        Decide which stage(s) should run *next*.
+
+        Flow order:
+          0. Fatal-error recovery           → "self_repair"
+          1. Forced injections              → ctx._forced_next
+          2. One-shot micro-planning        → builds ctx._stage_queue
+          3. Tool-loop shortcuts            → execute_selected_tool / tool_chaining
+          4. Pop the next planned stage     → ctx._stage_queue.popleft()
+          5. Nothing left                   → []
         """
-        import re  # (local import keeps top-of-file tidy)
 
-        # ➡️ One-time dynamic pipeline adaptation, immediately after context_analysis
-        if stage == "context_analysis" and not getattr(ctx, "_pipeline_adapted", False):
-            base     = [name for name, _, _ in self.STAGES]
-            adapted  = self._assemble_stage_list(ctx.user_message, base)
-            ctx.overridden_stages   = adapted
-            ctx.pipeline_overridden = True
-            ctx._pipeline_adapted   = True
-            ctx.ctx_txt += f"\n[Pipeline adapted to: {adapted}]\n"
+        import re
+        from collections import deque
 
-        # 0️⃣  If any stage failed in the previous tick → self-repair first
+        # ─────────────────────── CONSTANTS ────────────────────────────
+        ALL_STAGES = [
+            # ── greeting / history helpers
+            "summary_request", "timeframe_history_query", "record_user_message",
+            # ── core reasoning
+            "context_analysis", "intent_clarification", "external_knowledge_retrieval",
+            "memory_summarization", "planning_summary",
+            "define_criteria", "task_decomposition", "plan_validation",
+            "review_tool_plan", "execute_actions", "verify_results",
+            "plan_completion_check", "checkpoint",
+            # ── tools & optimisation
+            "tool_self_improvement", "tool_chaining",
+            # ── reply fabrication
+            "assemble_prompt", "self_review", "final_inference",
+            "output_review", "chain_of_thought",
+            # ── safety / refinement
+            "adversarial_loop", "notification_audit", "flow_health_check",
+            # ── misc power-user stages
+            "drive_generation", "internal_adversarial", "creative_promotion",
+            "rl_experimentation", "first_error_patch", "state_reflection",
+        ]
+
+        # ─────────────────── 0. Error recovery ────────────────────────
         if getattr(ctx, "last_failure", None):
             return ["self_repair"]
 
-        # 1️⃣  Forced injections (set elsewhere via ctx._forced_next)
+        # ─────────────────── 1. Forced injections ─────────────────────
         forced = getattr(ctx, "_forced_next", [])
         if forced:
             nxt = forced.pop(0)
-            ctx._active_stage = nxt
             return [nxt]
 
-        # ────────────────────────────────────────────────────────────────
-        # 2️⃣  Tool-loop entry: once tool_decision fires we mark the loop
+        # ─────────────────── 2. Micro-plan build ──────────────────────
+        if stage == "context_analysis" and not hasattr(ctx, "_stage_queue"):
+
+            # ---------- quick heuristics over the user’s turn ----------
+            msg          = (ctx.user_message or "").lower().strip()
+            is_short     = len(msg.split()) < 3
+            asks_q       = "?" in msg
+            about_time   = re.search(r"\b(today|yesterday|last|this|past\s+\d+\s+days?)\b", msg)
+            wants_sum    = re.search(r"\b(summar(y|ise)|recap)\b", msg)
+            mentions_doc = re.search(r"\b(doc|file|sheet|slide|deck)\b", msg)
+            toolish      = re.search(r"\b(run|open|search|write|exec(ute)?)\b", msg)
+
+            plan: list[str] = []
+
+            # 2-line history record is always first
+            plan.append("record_user_message")
+
+            # --- History / summary helpers ---
+            if wants_sum:
+                plan.append("summary_request")
+            if about_time:
+                plan.append("timeframe_history_query")
+
+            # --- Clarification ---
+            if is_short:
+                plan.append("intent_clarification")
+
+            # --- Knowledge retrieval ---
+            if asks_q or mentions_doc:
+                plan += ["external_knowledge_retrieval", "memory_summarization"]
+
+            # --- Heavy tool workflow ---
+            if toolish or mentions_doc:
+                plan += [
+                    "planning_summary", "define_criteria", "task_decomposition",
+                    "plan_validation", "review_tool_plan", "execute_actions",
+                    "verify_results", "plan_completion_check", "checkpoint",
+                    "tool_chaining"
+                ]
+
+            # Fallback minimal answer path
+            if not plan or plan[-1] != "tool_chaining":
+                plan += ["assemble_prompt"]
+
+            # Always close with audits & safe-guards
+            plan += [
+                "self_review", "final_inference", "output_review",
+                "chain_of_thought", "adversarial_loop",
+                "notification_audit", "flow_health_check"
+            ]
+
+            # De-duplicate & keep declared order, ensure stage exists
+            dedup, seen = [], set()
+            for p in plan:
+                if p in ALL_STAGES and p not in seen:
+                    dedup.append(p); seen.add(p)
+
+            ctx._stage_queue = deque(dedup)
+
+            # Console / Telegram preview
+            preview = ", ".join(list(dedup)[:6]) + ("…" if len(dedup) > 6 else "")
+            if ctx.stage_callback:
+                try:
+                    ctx.stage_callback(f"🛠️ Plan: {preview}")
+                except Exception:
+                    pass
+            ctx.ctx_txt += f"\n[Dynamic plan ➜ {dedup}]\n"
+
+        # ─────────────────── 3. Tool-loop shortcuts ───────────────────
         if stage == "tool_decision":
             ctx._in_tool_loop = True
             if not getattr(ctx, "next_tool_call", None) or ctx.next_tool_call.upper() == "NO_TOOL":
                 return ["final_inference"]
 
-        # 3️⃣  Pending tool call?
         if getattr(ctx, "next_tool_call", None) and stage != "execute_selected_tool":
             return ["execute_selected_tool"]
 
-        # 4️⃣  After *selected* tool executes → back into chaining
         if stage == "execute_selected_tool":
             return ["tool_chaining"]
 
-        # ────────────────────────────────────────────────────────────────
-        # 5️⃣  Linear flow up to planning (only until tool loop begins)
-        if not getattr(ctx, "_in_tool_loop", False):
-            if stage == "context_analysis":
-                return ["intent_clarification"]
+        # ─────────────────── 4. Pop next from queue ───────────────────
+        if hasattr(ctx, "_stage_queue") and ctx._stage_queue:
+            nxt = ctx._stage_queue.popleft()
+            return [nxt]
 
-            if stage == "intent_clarification":
-                if ctx.get("review_status") == "waiting_for_user":
-                    return []
-                return ["external_knowledge_retrieval"]
-
-            if stage == "external_knowledge_retrieval":
-                return ["memory_summarization"]
-
-            if stage == "memory_summarization":
-                return ["planning_summary"]
-
-            if stage == "planning_summary":
-                return ["define_criteria"]
-
-            if stage == "define_criteria":
-                return ["task_decomposition"]
-
-            if stage == "task_decomposition":
-                return ["plan_validation"]
-
-        # ────────────────────────────────────────────────────────────────
-        # 6️⃣  plan_validation outcome branch
-        if stage == "plan_validation":
-            if getattr(ctx, "plan", None):
-                return ["review_tool_plan"]
-            return ["final_inference"]                      # no plan → fallback
-
-        # 7️⃣  execute_actions results
-        if stage == "execute_actions":
-            if getattr(ctx, "tool_failures", None):
-                return ["review_tool_plan"]                 # failed → fix plan
-            return ["verify_results"]                       # success → audit
-
-        # 8️⃣  Post-execution audit chain
-        if stage == "verify_results":
-            return ["plan_completion_check"]
-
-        if stage == "plan_completion_check":
-            return ["checkpoint"]
-
-        if stage == "checkpoint":
-            return ["tool_chaining"]
-
-        # ────────────────────────────────────────────────────────────────
-        # 9️⃣  Tool-chaining loop and remainder of reply pipeline
-        if stage == "tool_chaining":
-            return ["assemble_prompt"]
-
-        if stage == "assemble_prompt":
-            return ["self_review"]
-
-        if stage == "self_review":
-            if ctx.get("review_status") == "needs_clarification":
-                return ["intent_clarification"]
-            return ["final_inference"]
-
-        # ────────────────────────────────────────────────────────────────
-        # 🔟  Wrap-up & diagnostics
-        if stage == "final_inference":
-            return ["output_review"]
-
-        if stage == "output_review":
-            if ctx.get("review_status") == "needs_clarification":
-                return ["intent_clarification"]
-            return ["chain_of_thought"]
-
-        if stage == "chain_of_thought":
-            return ["adversarial_loop"]
-
-        if stage == "adversarial_loop":
-            return ["notification_audit"]
-
-        if stage == "notification_audit":
-            return ["flow_health_check"]
-
-        if stage == "flow_health_check":
-            return []
-
-        # Default: nothing more to do
+        # ─────────────────── 5. Nothing left ──────────────────────────
         return []
+
 
 
     # ------------------------------------------------------------------
@@ -5996,8 +6106,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         return None
 
 
-
-
     def _history_timeframe_query(self, user_message: str) -> str | None:
         """
         Detects time-based history queries like:
@@ -6668,13 +6776,16 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         return payload
 
     
-
+    # ------------------------------
+    # Safe streaming wrapper
+    # ------------------------------
     def chat_completion_stream(self, processed_text):
         """
-        Stream the primary‐model’s response to `processed_text` as a new user message,
-        emitting punctuation-delimited chunks to TTS rather than token-by-token.
+        Stream the primary model’s response, but *always* coerce each chunk
+        to a plain ``str`` so downstream code can concatenate / truth-test
+        without NumPy ambiguity errors.
         """
-        import re
+        import re, numpy as np
         from collections import deque
 
         log_message("Primary-model stream starting...", "DEBUG")
@@ -6683,11 +6794,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         cfg     = self.config_manager.config
         sys_msg = {"role": "system", "content": cfg.get("system", "")}
 
-        mem_content = ""  # or pull from your memory manager
-        override = [sys_msg]
-        if mem_content:
-            override.append({"role": "system", "content": f"Memory Context:\n{mem_content}\n\n"})
-        override.extend(self.history_manager.history)
+        override = [sys_msg] + self.history_manager.history
         override.append({"role": "user", "content": processed_text})
 
         # 2) Build the payload with our override_messages
@@ -6696,14 +6803,14 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             model_key="primary_model"
         )
 
-        # Prepare TTS buffering
-        sentence_pattern = re.compile(r'(?<=[\.!\?])\s+')
-        tts_buffer = ""
+        # Prepare sentence-level TTS buffering
+        sentence_re   = re.compile(r'(?<=[\.!\?])\s+')
+        tts_buffer    = ""
         recent_chunks = deque(maxlen=5)
 
         print("⟳ Reply: ", end="", flush=True)
 
-        # 3) Stream and watch for repetition
+        # 3) Stream and guard against run-away repetition
         for part in chat(model=payload["model"], messages=payload["messages"], stream=True):
             if self.stop_flag:
                 log_message("Primary-model stream aborted by stop_flag.", "WARNING")
@@ -6711,22 +6818,35 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 return
 
             tok = part["message"]["content"]
+
+            # ---- CORE FIX --------------------------------------------------
+            # If the model (or its client) delivers a non-string (e.g. NumPy),
+            # force-cast to plain str so all later truth / concat ops work.
+            if not isinstance(tok, (str, bytes)):
+                # special-case NumPy scalars / arrays
+                if isinstance(tok, np.ndarray):
+                    tok = tok.astype(str).item() if tok.shape == () else " ".join(tok.astype(str))
+                else:
+                    tok = str(tok)
+            # ----------------------------------------------------------------
+
+            tok = tok if isinstance(tok, str) else tok.decode("utf-8", errors="ignore")
             self.observer.log_stage_token(self.current_ctx.run_id, "final_inference", tok)
             print(tok, end="", flush=True)
 
-            # Accumulate into tts_buffer and flush complete sentences
+            # Accumulate into TTS buffer & flush complete sentences
             tts_buffer += tok
             while True:
-                m = sentence_pattern.search(tts_buffer)
+                m = sentence_re.search(tts_buffer)
                 if not m:
                     break
-                split_idx = m.end()
-                sentence = tts_buffer[:split_idx].strip()
+                end_i   = m.end()
+                sentence = tts_buffer[:end_i].strip()
+                tts_buffer = tts_buffer[end_i:]
                 if sentence:
                     self.tts_manager.enqueue(sentence)
-                tts_buffer = tts_buffer[split_idx:]
 
-            yield tok, part.get("done", False)
+            yield tok, bool(part.get("done", False))
 
             # repetition guard
             snippet = tok.strip()
@@ -6738,7 +6858,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                     yield "", True
                     return
 
-        # flush any remaining buffer
+        # flush whatever’s left
         if tts_buffer.strip():
             self.tts_manager.enqueue(tts_buffer.strip())
 
@@ -7619,24 +7739,30 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 print(f"{role}: {preview}")
 
     
+  
     def _run_fractal_pipeline(self, ctx: Context) -> str:
         """
-        Fractal, queue‐driven engine with tool‐plan critique & retry.
-        Ensures final_inference is always invoked.
+        Queue-driven executor.
+
+        * Starts with just “context_analysis”.
+        * After every stage we ask self._expand(…) what should come next.
+        That call will either return a forced stage (errors / tool-loop)
+        or pop the next item from ctx._stage_queue if the micro-plan
+        exists (see the new _expand).
+        * Guarantees that ‘final_inference’ eventually runs once.
         """
         import inspect
         from collections import deque
 
         run_id  = ctx.run_id
-        queue   = deque([ self._Stage("context_analysis") ])
+        queue   = deque([self._Stage("context_analysis")])
 
-        ctx.tool_failures  = {}
-        ctx.tool_summaries = getattr(ctx, "tool_summaries", [])
+        ctx.tool_failures   = {}
+        ctx.tool_summaries  = getattr(ctx, "tool_summaries", [])
 
         while queue:
-            stage_obj = queue.popleft()
-            name      = stage_obj.name
-
+            stage_obj      = queue.popleft()
+            name           = stage_obj.name
             ctx._active_stage = name
 
             # skip runaway repeats
@@ -7649,22 +7775,25 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             if not handler:
                 continue
 
-            # live‐update callback
+            # live progress ping (e.g. Telegram)
             if ctx.stage_callback:
                 try:
                     ctx.stage_callback(f"[Stage] {name} …")
-                except:
+                except Exception:
                     pass
 
+            # ── execute the stage ──────────────────────────────────────
             self.observer.log_stage_start(run_id, name)
-            sig    = inspect.signature(handler)
-            params = list(sig.parameters.keys())[1:]
-            args   = [ctx.stage_outputs.get(p) for p in params]
             try:
+                sig    = inspect.signature(handler)
+                params = list(sig.parameters.keys())[1:]
+                args   = [ctx.stage_outputs.get(p) for p in params]
                 result = handler(ctx, *args) if args else handler(ctx)
             except Exception as e:
-                # schedule self‐repair
-                ctx.last_failure = {"type":"exception","payload":str(e),"stage":name}
+                # push self-repair to the front of the queue
+                ctx.last_failure = {"type": "exception",
+                                    "payload": str(e),
+                                    "stage":   name}
                 log_message(f"[{ctx.name}] '{name}' exception: {e}", "ERROR")
                 queue.appendleft(self._Stage("self_repair"))
                 self.observer.log_stage_end(run_id, name)
@@ -7672,49 +7801,50 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             finally:
                 self.observer.log_stage_end(run_id, name)
 
-            # capture string result + callback
+            # capture text outputs
             if isinstance(result, str) and result:
                 ctx.stage_outputs[name] = result
                 if ctx.stage_callback:
                     try:
                         ctx.stage_callback(result)
-                    except:
+                    except Exception:
                         pass
                 if name == "final_inference":
                     ctx.final_response = result
 
-            # special case: execute_actions
+            # special-case: execute_actions executes the plan immediately
             if name == "execute_actions":
                 for call in getattr(ctx, "plan", []):
                     try:
                         res = Tools.run_tool_once(call)
-                        ctx.tool_summaries.append({"call":call,"result":res})
+                        ctx.tool_summaries.append({"call": call, "result": res})
                     except Exception as e:
                         ctx.tool_failures[call] = str(e)
-                        log_message(f"[{ctx.name}] tool exec failed {call}: {e}", "ERROR")
+                        log_message(f"[{ctx.name}] tool exec failed {call}: {e}",
+                                    "ERROR")
                         break
-                for nxt in self._expand(name, ctx):
-                    queue.append(self._Stage(nxt))
-                continue
 
-            # enqueue next
+            # enqueue whatever _expand tells us
             for nxt in self._expand(name, ctx):
                 queue.append(self._Stage(nxt))
 
-        # ── HERE’S THE NEW BIT ──
-        # If we never got a final_response, run final_inference now
+        # ------------------------------------------------------------------
+        # Safety net: if the queue emptied without a final answer, run it.
+        # ------------------------------------------------------------------
         if not getattr(ctx, "final_response", None):
-            log_message(f"[{ctx.name}] No final_inference in pipeline; forcing fallback.", "WARNING")
-            # directly invoke the final stage
+            log_message(f"[{ctx.name}] No final_inference in pipeline; "
+                        f"forcing fallback.", "WARNING")
             try:
                 self._stage_final_inference(ctx)
             except Exception as e:
-                log_message(f"[{ctx.name}] fallback final_inference error: {e}", "ERROR")
+                log_message(f"[{ctx.name}] fallback final_inference error: {e}",
+                            "ERROR")
 
-        # wrap up
+        # wrap-up bookkeeping
         self._save_workspace_memory(ctx.workspace_memory)
         self.observer.complete_run(run_id)
         return ctx.final_response or ""
+
 
 
     # ------------------------------------------------------------------ #
@@ -7859,90 +7989,112 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         self.history_manager.add_entry(role, um)
         _ = Utils.embed_text(um)
         return None
-
+    
+    # -------------------------------------------------------------- #
+    # Stage: context_analysis                                        #
+    # -------------------------------------------------------------- #
     def _stage_context_analysis(self, ctx: Context,
                                 prev_output: str | None = None) -> str:
         """
-        Strict 2-sentence meta-analysis of the user turn, with recent chat history.
-        Never answers the question; if it tries, we retry once,
-        then blank out to protect downstream stages.
+        Two-sentence meta summary of the user turn.
+
+        1. If the user asks a time-frame history question (yesterday / last week …)
+        we answer from local logs and skip the LLM.
+        2. We pull semantic-similar history *only when it helps* (longer turns,
+        not greetings).
+        3. We guarantee **no answer leaks**: one retry, then a safe placeholder.
         """
 
         import re, textwrap, time
 
-        def _looks_like_answer(txt: str) -> bool:
-            if "http" in txt.lower():                   return True
-            if re.search(r"\b°F\b|\b°C\b", txt):        return True
-            if re.search(r"\bwind\b|\brain\b", txt):    return True
-            if re.search(r"\d{4}-\d{2}-\d{2}", txt):     return True
-            return False
+        # ── local anti-leak helper (kept INSIDE the stage) ──────────────────
+        def _leaks_answer(txt: str) -> bool:
+            patterns = [
+                r"http[s]?://",                 # links
+                r"\b(?:°f|°c|wind|rain)\b",     # weather units
+                r"\d{4}-\d{2}-\d{2}",           # ISO date
+            ]
+            return any(re.search(p, txt, re.I) for p in patterns)
 
+        # ── tunables ────────────────────────────────────────────────────────
+        MIN_SIM, MAX_HITS, SHORT_TURN_LEN = 0.30, 3, 4
+
+        # ── 1. direct time-frame query? ─────────────────────────────────────
+        digest = self._history_timeframe_query(ctx.user_message)
+        if digest:
+            ctx.stage_outputs["history_digest"] = digest  # stash for downstream
+
+        # ── 2. decide on semantic recall ────────────────────────────────────
+        msg_tokens   = ctx.user_message.strip().split()
+        want_sem_rec = (
+            digest is None and
+            len(msg_tokens) >= SHORT_TURN_LEN and
+            not re.match(r"^(hi|hey|hello|thanks|ok)[\s!,.]*$", ctx.user_message, re.I)
+        )
+
+        recent   = ctx.history_manager.history[-5:]
+        semantic = []
+        if want_sem_rec and ctx.history_manager.history:
+            q_vec = Utils.embed_text(ctx.user_message)
+            for rec in ctx.history_manager.search(ctx.user_message,
+                                                top_n=MAX_HITS + len(recent)):
+                if rec in recent:
+                    continue
+                if Utils.cosine_similarity(q_vec, rec["vec"]) >= MIN_SIM:
+                    semantic.append(rec)
+                if len(semantic) >= MAX_HITS:
+                    break
+
+        history   = recent + semantic
+        hist_msgs = [{"role": r["role"], "content": r["content"]} for r in history]
+
+        # ── 3. assemble LLM prompt ──────────────────────────────────────────
         SYS_PROMPT = textwrap.dedent("""
             You are the CONTEXT-ANALYSIS AGENT.
 
-            • Output **exactly two sentences** that describe:
+            • Produce **exactly two sentences** summarising:
                 – the user’s intent
-                – the key entities / constraints
-                – any follow-up info the assistant will need.
-
-            • DO **NOT** answer the user, cite facts, give links,
-              or include JSON / code fences.
-
-            • If you start to answer, instead write:
-                "NOTE: attempted answer suppressed."
+                – key entities or constraints
+            • DO NOT answer the user, cite facts, add links, JSON, or code fences.
+            • If you start to answer, instead output:
+            "NOTE: attempted answer suppressed."
         """).strip()
 
-        def _query_model(msgs):
-            return chat(
-                model=payload["model"],
-                messages=msgs,
-                stream=False
-            )["message"]["content"].strip()
-
-        # ——— Gather last 5 turns for context ———
-        history = ctx.history_manager.history[-5:]
-        hist_msgs = [
-            {"role": m["role"], "content": m["content"]}
-            for m in history
-        ]
-
-        # ——— Build override messages with system, history, then new user_msg ———
         override = [{"role": "system", "content": SYS_PROMPT}]
-        override += hist_msgs
+        if digest:
+            override.append({"role": "system",
+                            "content": f"History Digest (requested):\n{digest}"})
+        override.extend(hist_msgs)
         override.append({"role": "user", "content": ctx.user_message})
 
-        # ——— Build payload ———
-        payload = self.build_payload(
-            override_messages=override,
-            model_key="secondary_model"
-        )
+        payload = self.build_payload(override_messages=override,
+                                    model_key="secondary_model")
         payload["stream"] = False
 
-        # ——— First attempt ———
-        raw = _query_model(payload["messages"])
+        def _ask() -> str:
+            return chat(model=payload["model"],
+                        messages=payload["messages"],
+                        stream=False)["message"]["content"].strip()
 
-        # ——— Sanity check ———
-        if _looks_like_answer(raw):
-            log_message("[context_analysis] answer leak detected – retrying with harsher prompt", "WARNING")
+        # ── 4. call LLM + single anti-leak retry ────────────────────────────
+        raw = _ask()
+        if _leaks_answer(raw):
+            log_message("[context_analysis] answer leak – retry once", "WARNING")
+            payload["messages"][0]["content"] += (
+                "\n\n!!! WARNING: Answering is forbidden. Provide only the "
+                "two-sentence meta-analysis.")
+            time.sleep(0.15)
+            raw = _ask()
+            if _leaks_answer(raw):
+                log_message("[context_analysis] second leak – blanking", "ERROR")
+                raw = ("NOTE: context analysis unavailable due to policy "
+                    "violation.")
 
-            harsh = SYS_PROMPT + (
-                "\n\n!!! WARNING: You attempted to answer. That is forbidden. "
-                "Provide only the two-sentence meta-analysis."
-            )
-            payload["messages"][0]["content"] = harsh
-            time.sleep(0.2)
-            raw = _query_model(payload["messages"])
-
-            if _looks_like_answer(raw):
-                log_message("[context_analysis] second leak – blanking analysis", "ERROR")
-                raw = "NOTE: context analysis unavailable due to repeated policy violation."
-
-        # ——— Record & return ———
-        analysis = Utils.parse_context_analysis(raw)          # tiny helper you own
+        # ── 5. persist & return ─────────────────────────────────────────────
+        analysis = Utils.parse_context_analysis(raw)
         ctx.stage_outputs["context_analysis"] = analysis
         ctx.ctx_txt += raw + "\n"
-        return analysis        # still fulfils downstream needs
-
+        return analysis
 
 
     # ------------------------------------------------------------------ #
@@ -8237,32 +8389,40 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             executed.add(code)
             # ─────────────────────────────────────────────────────────
 
-            fn = code.split("(", 1)[0]
-            if fn in invoked:         # per-loop duplicate safety (old logic)
-                break
-            invoked.add(fn)
+            canonical = re.sub(r"\s+", "", code).lower()
+            if canonical in invoked:
+                log_message(f"Skipping duplicate tool invocation: {code}", "DEBUG")
+                continue            # <-- skip, don't break the whole loop
+            invoked.add(canonical)
 
+            # ── 2.  Invoke the tool ─────────────────────────────────────────
             log_message(f"Invoking via tool_chaining: {code}", "INFO")
             try:
                 out = self.run_tool(code)
             except Exception as e:
                 log_message(f"run_tool error on {code}: {e}", "ERROR")
-                break
+                break               # exit chaining on hard failure
 
-            # Summarize output
+            # ── 3.  Summarise the output for downstream context ────────────
             summary = None
             try:
                 data = json.loads(out)
-                if fn in ("search_internet"):
-                    lines = [f"- {r.get('title','')} ({r.get('url','')})"
-                             for r in data["web"]["results"][:3]]
+                if canonical.startswith("search_internet"):
+                    # compact one-liner list of top results
+                    lines = [
+                        f"- {r.get('title', '').strip()} ({r.get('url', '')})"
+                        for r in data.get("web", {}).get("results", [])[:3]
+                    ]
                     summary = "Top results:\n" + "\n".join(lines)
-                elif fn == "get_current_location":
+                elif canonical.startswith("get_current_location"):
                     summary = f"Location: {data.get('city')}, {data.get('regionName')}"
-            except:
-                pass
+            except Exception:
+                pass    # fall back to plain text
+
             if summary is None:
-                summary = f"{fn} → {out}"
+                # generic fallback: first 120 chars of raw output
+                short = out if isinstance(out, str) else str(out)
+                summary = f"{canonical.split('(')[0]} → {short[:120].strip()}"
 
             summaries.append(summary)
             tc += "\n" + summary
