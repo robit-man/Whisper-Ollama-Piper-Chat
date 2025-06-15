@@ -3133,49 +3133,61 @@ class Tools:
                     summary = snippet
                     page_content = ""
 
-                    # 6️⃣ Deep scrape in new tab
+                    # 6️⃣ Deep scrape in new tab  (hard 10-second cap)
                     if deep_scrape and href:
                         drv.switch_to.new_window("tab")
-                        drv.get(href)
 
-                        # track mutations
+                        # ── absolute timeout for *everything* in this tab ──
+                        TAB_DEADLINE = time.time() + 10        # 10 s wall-clock
+                        drv.set_page_load_timeout(10)          # network-level cut-off
+
+                        try:
+                            drv.get(href)
+                        except TimeoutException:
+                            log_message(f"[search_internet] page-load timeout for {href!r}", "WARNING")
+
+                        # track DOM mutation activity
                         drv.execute_script("""
                             window._lastMut = Date.now();
                             new MutationObserver(function() {
                                 window._lastMut = Date.now();
-                            }).observe(document, {
-                                childList: true, subtree: true, attributes: true
-                            });
+                            }).observe(document, {childList:true,subtree:true,attributes:true});
                         """)
 
-                        start_ms = time.time() * 1000
-                        stable_delta = 500
-                        max_wait = 5000
+                        # wait until DOM is stable *or* we hit the 10-s wall
+                        STABLE_MS   = 500                      # ms of silence to call it “done”
+                        POLL_DELAY  = 0.1
                         while True:
-                            last = drv.execute_script("return window._lastMut;")
-                            now = time.time() * 1000
-                            if now - last > stable_delta or now - start_ms > max_wait:
-                                if now - start_ms > max_wait:
-                                    log_message(
-                                        f"[search_internet] dynamic-load hard timeout for {href!r}",
-                                        "WARNING"
-                                    )
+                            if time.time() >= TAB_DEADLINE:
+                                log_message(f"[search_internet] hard 10-s deadline for {href!r}", "WARNING")
                                 break
-                            time.sleep(0.1)
+                            last = drv.execute_script("return window._lastMut;")
+                            if (time.time()*1000) - last > STABLE_MS:
+                                break
+                            time.sleep(POLL_DELAY)
 
-                        page_content = Tools.bs4_scrape(href)
-                        if page_content.startswith("Error"):
-                            page_content = drv.page_source
+                        # grab whatever is available and move on
+                        page_content = drv.page_source or ""
+                        if not page_content.startswith("<"):
+                            # fallback to bs4 helper if primary is empty / error
+                            maybe = Tools.bs4_scrape(href)
+                            if not maybe.startswith("Error"):
+                                page_content = maybe
 
-                        pg = BeautifulSoup(page_content, "html5lib")
-                        meta = pg.find("meta", attrs={"name": "description"})
-                        p_tag = pg.find("p")
-                        if meta and meta.get("content"):
-                            summary = meta["content"].strip()
-                        elif p_tag:
-                            summary = p_tag.get_text(strip=True)
+                        # quick summary extraction
+                        summary = snippet
+                        try:
+                            pg = BeautifulSoup(page_content, "html5lib")
+                            meta = pg.find("meta", attrs={"name":"description"})
+                            ptag = pg.find("p")
+                            if meta and meta.get("content"):
+                                summary = meta["content"].strip()
+                            elif ptag:
+                                summary = ptag.get_text(strip=True)
+                        except Exception:
+                            pass
 
-                        drv.close()
+                        drv.close()                               # always close the tab
                         drv.switch_to.window(main_handle)
 
                     clean_content = (
@@ -3531,7 +3543,7 @@ class Tools:
         prompt = (f"Given the user query: '{query}', and the context of the image at '{image_path}', "
                   "convert this query into a more precise information query related to the image content.")
         log_message(f"Converting user query for image using prompt: {prompt}", "PROCESS")
-        response = Tools.secondary_agent_tool(prompt, temperature=0.5)
+        response = Tools.auxiliary_inference(prompt, temperature=0.5)
         log_message("Image query conversion response: " + response, "SUCCESS")
         return response
 
@@ -3714,7 +3726,7 @@ class Tools:
     def summarize_search(topic: str, top_n: int = 3) -> str:
         """
         1) Call our search_internet() to open each result in a tab and deep-scrape.
-        2) For each page, feed the full-text snippet into the secondary_agent_tool().
+        2) For each page, feed the full-text snippet into the auxiliary_inference().
         3) Return a neat bullet-list of 2–3 sentence summaries.
         """
         try:
@@ -3741,7 +3753,7 @@ class Tools:
             )
 
             try:
-                summary = Tools.secondary_agent_tool(prompt, temperature=0.3)
+                summary = Tools.auxiliary_inference(prompt, temperature=0.3)
             except Exception as ex:
                 log_message(f"[summarize_search] summarisation failed for {url}: {ex}", "ERROR")
                 summary = "Failed to summarise that page."
@@ -3812,13 +3824,7 @@ class Tools:
 
     # This static method invokes the secondary LLM (for tool processing) with a user prompt and an optional temperature. It streams tokens to the console as they arrive and returns the full assistant message content as a string.
     @staticmethod
-    def secondary_agent_tool(
-        prompt: str,
-        *,
-        temperature: float = 0.7,
-        system: str | None = None,
-        context: object | None = None,
-    ) -> str:
+    def auxiliary_inference(prompt: str,*,temperature: float = 0.7,system: str | None = None,context: object | None = None,) -> str:
         """
         Invoke the secondary LLM (for tool processing) with a user prompt,
         optional temperature, and optional system instructions and context.
@@ -3837,10 +3843,10 @@ class Tools:
         Usage:
             ```python
             # simple use:
-            secondary_agent_tool("Summarize X for me")
+            auxiliary_inference("Summarize X for me")
 
             # with extra system instructions and context:
-            secondary_agent_tool(
+            auxiliary_inference(
                 prompt="What’s the bug here?",
                 system="You are a seasoned Python debugger.",
                 context=source_code_str
@@ -4429,6 +4435,7 @@ ALL_TOOLS  = Tools.load_agent_stack().get("tools", [])
 ALL_AGENTS = Tools.load_agent_stack().get("stages", [])
 
 Tools.load_external_tools()
+
 # ════════════════════════════════════════════════════════════════════
 #  Chat-session Context
 # ════════════════════════════════════════════════════════════════════
@@ -4525,6 +4532,10 @@ class ChatManager:
         self.memory_manager   = memory_manager
         self.mode_manager     = mode_manager
 
+        # ── new ---------------------------------------------------------------
+        # Used by _stage_assemble_prompt to count prompt tokens
+        self._tokenizer = tiktoken.get_encoding("cl100k_base")
+
         # ───────────────────────────────────────────────────────────────
         # Learning & observability singletons
         # ───────────────────────────────────────────────────────────────
@@ -4590,7 +4601,11 @@ class ChatManager:
 
         # Core user-turn analysis
         ("context_analysis",             "_stage_context_analysis",             "rl_experimentation"),
-        ("intent_clarification",         "_stage_intent_clarification",         "context_analysis"),
+
+        # dump the live helper list
+        ("dump_tool_catalogue",          "_stage_dump_tool_catalogue",          "context_analysis"),
+
+        ("intent_clarification",         "_stage_intent_clarification",         "dump_tool_catalogue"),
         ("external_knowledge_retrieval", "_stage_external_knowledge_retrieval", "intent_clarification"),
         ("planning_summary",             "_stage_planning_summary",             "external_knowledge_retrieval"),
 
@@ -4630,6 +4645,7 @@ class ChatManager:
         ("flow_health_check",       "_stage_flow_health_check",       "notification_audit"),
     ]
 
+
     def _slice_ctx(self, ctx: Context, *, lines: int = 40) -> str:
         """
         Return the last <lines> lines of ctx.ctx_txt – used by all
@@ -4638,9 +4654,32 @@ class ChatManager:
         return "\n".join(ctx.ctx_txt.strip().splitlines()[-lines:])
     
     def _summarise_tool_result(self, name: str, raw: str | dict) -> dict:
-        """Return a compact structured summary for later ranking."""
-        summary = Tools.quick_summarise(raw, max_chars=120)
+        """
+        Return a compact structured summary for later ranking.
+
+        • If Tools.quick_summarise() exists, use it.
+        • Otherwise fall back to an internal, regex-based truncator
+        so we never crash on missing helper.
+        """
+        try:
+            if hasattr(Tools, "quick_summarise") and callable(Tools.quick_summarise):
+                summary = Tools.quick_summarise(raw, max_chars=120)
+            else:
+                summary = self._fallback_quick_summarise(raw, max_chars=120)
+        except Exception:
+            summary = self._fallback_quick_summarise(raw, max_chars=120)
+
         return {"tool": name, "summary": summary, "raw": raw}
+
+    @staticmethod
+    def _fallback_quick_summarise(raw, max_chars: int = 120) -> str:
+        import json, re
+        try:
+            txt = raw if isinstance(raw, str) else json.dumps(raw)
+        except Exception:
+            txt = str(raw)
+        txt = re.sub(r"\s+", " ", txt).strip()
+        return txt[:max_chars] + ("…" if len(txt) > max_chars else "")
     
 
     def _prompt_context_analysis(self, ctx: Context, hist_tail: str) -> list[dict]:
@@ -4663,145 +4702,251 @@ class ChatManager:
             self.name = name
         def __repr__(self):
             return f"<Stage {self.name}>"
-    
-    # ------------------------------------------------------------------ #
-    #  Dynamic stage selector                                            #
-    # ------------------------------------------------------------------ #
+        
+    # ------------------------------------------------------------------
+    #  Simplified _expand with per-intent routing (“slim” flow)
+    # ------------------------------------------------------------------
     def _expand(self, stage: str, ctx: Context) -> list[str]:
         """
-        Decide which stage(s) should run *next*.
+        Decide exactly which **one** next stage to enqueue based on:
+          1. self-repair or forced injections
+          2. core linear flow (context → planning → execution → reply)
+          3. minimal tool-loop insertion
+          4. tail audits/health check
 
-        Flow order:
-          0. Fatal-error recovery           → "self_repair"
-          1. Forced injections              → ctx._forced_next
-          2. One-shot micro-planning        → builds ctx._stage_queue
-          3. Tool-loop shortcuts            → execute_selected_tool / tool_chaining
-          4. Pop the next planned stage     → ctx._stage_queue.popleft()
-          5. Nothing left                   → []
+        Also prints the last 50 lines of ctx.ctx_txt for debugging.
         """
+        import logging, pprint
 
-        import re
-        from collections import deque
+        # ── debug dump ─────────────────────────────────────────────
+        # show last 50 lines of the narrative
+        snippet = "\n".join(ctx.ctx_txt.strip().splitlines()[-50:])
+        logging.debug(f"[_expand:{stage}] last-ctx-lines:\n{snippet}")
 
-        # ─────────────────────── CONSTANTS ────────────────────────────
-        ALL_STAGES = [
-            # ── greeting / history helpers
-            "summary_request", "timeframe_history_query", "record_user_message",
-            # ── core reasoning
-            "context_analysis", "intent_clarification", "external_knowledge_retrieval",
-            "memory_summarization", "planning_summary",
-            "define_criteria", "task_decomposition", "plan_validation",
-            "review_tool_plan", "execute_actions", "verify_results",
-            "plan_completion_check", "checkpoint",
-            # ── tools & optimisation
-            "tool_self_improvement", "tool_chaining",
-            # ── reply fabrication
-            "assemble_prompt", "self_review", "final_inference",
-            "output_review", "chain_of_thought",
-            # ── safety / refinement
-            "adversarial_loop", "notification_audit", "flow_health_check",
-            # ── misc power-user stages
-            "drive_generation", "internal_adversarial", "creative_promotion",
-            "rl_experimentation", "first_error_patch", "state_reflection",
-        ]
-
-        # ─────────────────── 0. Error recovery ────────────────────────
+        # ── 1. fatal error → self-repair
         if getattr(ctx, "last_failure", None):
             return ["self_repair"]
 
-        # ─────────────────── 1. Forced injections ─────────────────────
-        forced = getattr(ctx, "_forced_next", [])
-        if forced:
-            nxt = forced.pop(0)
-            return [nxt]
+        # ── 2. forced injections
+        if getattr(ctx, "_forced_next", []):
+            return [ctx._forced_next.pop(0)]
 
-        # ─────────────────── 2. Micro-plan build ──────────────────────
-        if stage == "context_analysis" and not hasattr(ctx, "_stage_queue"):
-
-            # ---------- quick heuristics over the user’s turn ----------
-            msg          = (ctx.user_message or "").lower().strip()
-            is_short     = len(msg.split()) < 3
-            asks_q       = "?" in msg
-            about_time   = re.search(r"\b(today|yesterday|last|this|past\s+\d+\s+days?)\b", msg)
-            wants_sum    = re.search(r"\b(summar(y|ise)|recap)\b", msg)
-            mentions_doc = re.search(r"\b(doc|file|sheet|slide|deck)\b", msg)
-            toolish      = re.search(r"\b(run|open|search|write|exec(ute)?)\b", msg)
-
-            plan: list[str] = []
-
-            # 2-line history record is always first
-            plan.append("record_user_message")
-
-            # --- History / summary helpers ---
-            if wants_sum:
-                plan.append("summary_request")
-            if about_time:
-                plan.append("timeframe_history_query")
-
-            # --- Clarification ---
-            if is_short:
-                plan.append("intent_clarification")
-
-            # --- Knowledge retrieval ---
-            if asks_q or mentions_doc:
-                plan += ["external_knowledge_retrieval", "memory_summarization"]
-
-            # --- Heavy tool workflow ---
-            if toolish or mentions_doc:
-                plan += [
-                    "planning_summary", "define_criteria", "task_decomposition",
-                    "plan_validation", "review_tool_plan", "execute_actions",
-                    "verify_results", "plan_completion_check", "checkpoint",
-                    "tool_chaining"
-                ]
-
-            # Fallback minimal answer path
-            if not plan or plan[-1] != "tool_chaining":
-                plan += ["assemble_prompt"]
-
-            # Always close with audits & safe-guards
-            plan += [
-                "self_review", "final_inference", "output_review",
-                "chain_of_thought", "adversarial_loop",
-                "notification_audit", "flow_health_check"
-            ]
-
-            # De-duplicate & keep declared order, ensure stage exists
-            dedup, seen = [], set()
-            for p in plan:
-                if p in ALL_STAGES and p not in seen:
-                    dedup.append(p); seen.add(p)
-
-            ctx._stage_queue = deque(dedup)
-
-            # Console / Telegram preview
-            preview = ", ".join(list(dedup)[:6]) + ("…" if len(dedup) > 6 else "")
-            if ctx.stage_callback:
-                try:
-                    ctx.stage_callback(f"🛠️ Plan: {preview}")
-                except Exception:
-                    pass
-            ctx.ctx_txt += f"\n[Dynamic plan ➜ {dedup}]\n"
-
-        # ─────────────────── 3. Tool-loop shortcuts ───────────────────
+        # ── 3. tool-loop bookkeeping
         if stage == "tool_decision":
             ctx._in_tool_loop = True
-            if not getattr(ctx, "next_tool_call", None) or ctx.next_tool_call.upper() == "NO_TOOL":
+            if not ctx.next_tool_call or ctx.next_tool_call.upper() == "NO_TOOL":
                 return ["final_inference"]
-
-        if getattr(ctx, "next_tool_call", None) and stage != "execute_selected_tool":
+        if getattr(ctx, "_in_tool_loop", False) \
+           and ctx.next_tool_call \
+           and stage != "execute_selected_tool":
             return ["execute_selected_tool"]
-
         if stage == "execute_selected_tool":
             return ["tool_chaining"]
 
-        # ─────────────────── 4. Pop next from queue ───────────────────
-        if hasattr(ctx, "_stage_queue") and ctx._stage_queue:
-            nxt = ctx._stage_queue.popleft()
-            return [nxt]
+        # ── 4. linear pass BEFORE tool-loop
+        if not getattr(ctx, "_in_tool_loop", False):
+            if stage == "context_analysis":
+                return ["intent_clarification"]
 
-        # ─────────────────── 5. Nothing left ──────────────────────────
+            if stage == "intent_clarification":
+                if ctx.get("review_status") == "waiting_for_user":
+                    return []
+                return ["dump_tool_catalogue"]
+
+            if stage == "dump_tool_catalogue":
+                return ["task_decomposition"]
+
+            if stage == "task_decomposition":
+                return ["plan_validation"]
+
+            if stage == "plan_validation":
+                return ["execute_actions"] if getattr(ctx, "plan", None) else ["final_inference"]
+
+            if stage == "execute_actions":
+                if getattr(ctx, "tool_failures", None):
+                    return ["review_tool_plan"]
+                return ["verify_results"]
+
+            if stage == "review_tool_plan":
+                return ["execute_actions"]
+
+            if stage == "verify_results":
+                return ["assemble_prompt"]
+
+            if stage == "assemble_prompt":
+                return ["final_inference"]
+
+            if stage == "final_inference":
+                return ["output_review"]
+
+            if stage == "output_review":
+                return ["flow_health_check"]
+
+            if stage == "flow_health_check":
+                return []
+
+        # ── 5. inside the tool-loop & reply tail
+        if stage == "tool_chaining":
+            return ["assemble_prompt"]
+        if stage == "assemble_prompt":
+            return ["final_inference"]
+        if stage == "final_inference":
+            return ["output_review"]
+        if stage == "output_review":
+            return ["flow_health_check"]
+        if stage == "flow_health_check":
+            return []
+
+        # ── 6. fallback: end here
         return []
+
+
+    # ------------------------------------------------------------------
+    #  Stage: dump_tool_catalogue   – fixed signature, ultra-compact
+    # ------------------------------------------------------------------
+    def _stage_dump_tool_catalogue(self, ctx: Context):
+        """
+        Append a *highly* compact helper catalogue to ctx.ctx_txt:
+          • Only the first 20 public tools
+          • name and comma-separated arg-names
+        """
+        import inspect, logging
+
+        # print context for debug
+        snippet = "\n".join(ctx.ctx_txt.strip().splitlines()[-20:])
+        logging.debug(f"[dump_tool_catalogue] context-snippet:\n{snippet}")
+
+        # reload in case external tools changed
+        Tools.load_external_tools()
+
+        lines = []
+        count = 0
+        for name, fn in inspect.getmembers(Tools, inspect.isfunction):
+            if name.startswith("_"):
+                continue
+            sig = inspect.signature(fn)
+            params = [p.name for p in sig.parameters.values()
+                      if p.kind in (
+                          p.POSITIONAL_ONLY,
+                          p.POSITIONAL_OR_KEYWORD,
+                          p.KEYWORD_ONLY
+                      )]
+            lines.append(f"• {name}({', '.join(params)})")
+            count += 1
+            if count >= 100:
+                break
+
+        block = "[AVAILABLE_TOOLS]\n" + "\n".join(lines)
+        ctx.ctx_txt += "\n" + block + "\n"
+        logging.debug(f"[dump_tool_catalogue] appended:\n{block}")
+
+        # keep for dashboard
+        ctx.stage_outputs["tool_catalogue"] = block
+    # ------------------------------------------------------------------
+    #  _run_fractal_pipeline with debug prints of ctx.ctx_txt each stage
+    # ------------------------------------------------------------------
+    def _run_fractal_pipeline(self, ctx: Context) -> str:
+        """
+        Queue-driven executor.
+
+        * Starts with just “context_analysis”.
+        * After every stage we ask self._expand(…) what should come next.
+        * Prints ctx.ctx_txt before executing each stage.
+        * Guarantees that ‘final_inference’ eventually runs once.
+        """
+        import inspect
+        from collections import deque
+
+        run_id = ctx.run_id
+        queue = deque([self._Stage("context_analysis")])
+
+        ctx.tool_failures  = {}
+        ctx.tool_summaries = getattr(ctx, "tool_summaries", [])
+
+        while queue:
+            stage_obj = queue.popleft()
+            name = stage_obj.name
+            ctx._active_stage = name
+
+            # ── DEBUG: print ctx before this stage ────────────────────────
+            print(f"\n=== DEBUG: BEFORE STAGE '{name}' ===\n{ctx.ctx_txt}\n=== END DEBUG ===")
+
+            # skip runaway repeats
+            cnt = ctx.stage_counts.get(name, 0) + 1
+            ctx.stage_counts[name] = cnt
+            if cnt > 3:
+                continue
+
+            handler = getattr(self, f"_stage_{name}", None)
+            if not handler:
+                continue
+
+            # live progress ping (e.g. Telegram)
+            if ctx.stage_callback:
+                try:
+                    ctx.stage_callback(f"[Stage] {name} …")
+                except Exception:
+                    pass
+
+            # ── execute the stage ───────────────────────────────────────
+            self.observer.log_stage_start(run_id, name)
+            try:
+                sig    = inspect.signature(handler)
+                params = list(sig.parameters.keys())[1:]
+                args   = [ctx.stage_outputs.get(p) for p in params]
+                result = handler(ctx, *args) if args else handler(ctx)
+            except Exception as e:
+                # push self-repair to the front of the queue
+                ctx.last_failure = {"type": "exception",
+                                    "payload": str(e),
+                                    "stage":   name}
+                log_message(f"[{ctx.name}] '{name}' exception: {e}", "ERROR")
+                queue.appendleft(self._Stage("self_repair"))
+                self.observer.log_stage_end(run_id, name)
+                continue
+            finally:
+                self.observer.log_stage_end(run_id, name)
+
+            # capture text outputs
+            if isinstance(result, str) and result:
+                ctx.stage_outputs[name] = result
+                if ctx.stage_callback:
+                    try:
+                        ctx.stage_callback(result)
+                    except Exception:
+                        pass
+                if name == "final_inference":
+                    ctx.final_response = result
+
+            # special-case: execute_actions executes the plan immediately
+            if name == "execute_actions":
+                for call in getattr(ctx, "plan", []):
+                    try:
+                        res = Tools.run_tool_once(call)
+                        ctx.tool_summaries.append({"call": call, "result": res})
+                    except Exception as e:
+                        ctx.tool_failures[call] = str(e)
+                        log_message(f"[{ctx.name}] tool exec failed {call}: {e}", "ERROR")
+                        break
+
+            # enqueue whatever _expand tells us
+            for nxt in self._expand(name, ctx):
+                queue.append(self._Stage(nxt))
+
+        # ------------------------------------------------------------------
+        # Safety net: if the queue emptied without a final answer, run it.
+        # ------------------------------------------------------------------
+        if not getattr(ctx, "final_response", None):
+            log_message(f"[{ctx.name}] No final_inference in pipeline; forcing fallback.", "WARNING")
+            try:
+                self._stage_final_inference(ctx)
+            except Exception as e:
+                log_message(f"[{ctx.name}] fallback final_inference error: {e}", "ERROR")
+
+        # wrap-up bookkeeping
+        self._save_workspace_memory(ctx.workspace_memory)
+        self.observer.complete_run(run_id)
+        return ctx.final_response or ""
 
 
 
@@ -5607,6 +5752,12 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
     tools from the list below that are strictly necessary to fulfill it.
     Do NOT invent new helpers, do NOT bias toward any particular tool,
     and do NOT include any example calls.
+    Please take into account the following:
+    1.  The user’s request
+    2.  The available tools and their signatures
+    3.  The tools’ one-line descriptions
+    4.  The tools’ docstrings (if any)
+    5.  If you notice words or phrases that correspond to a given tool
 
     Available helpers (name, signature, one-line description):
     {metadata}
@@ -5676,7 +5827,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ctx.ctx_txt += f"\n[Task-Decomposition] {cleaned}"
         log_message(f"Task plan accepted: {cleaned}", "INFO")
         return cleaned
-
     # ---------------------------------------------------------------
     # Stage : plan_validation   (cursor initialisation added)
     # ---------------------------------------------------------------
@@ -5691,8 +5841,26 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             • plan_idx  (cursor → execution progress)
             • plan_done (boolean → all steps completed successfully)
         """
-        import re, inspect, textwrap, json, logging
+        import re, inspect, textwrap, json, logging, pprint
 
+        # 🔃 Hot-reload helpers so the validator “sees” the latest catalogue
+        Tools.load_external_tools()
+
+        # ════════════════════════════════════════════════════════════════
+        # 0️⃣  DEBUG  ▸  dump the incoming ctx (minus huge / unserialisable parts)
+        # ════════════════════════════════════════════════════════════════
+        try:
+            lite_ctx = {
+                k: v for k, v in ctx.__dict__.items()
+                if k not in ("history_manager", "tts_manager",
+                             "workspace_memory", "frame")
+            }
+            logging.debug("[plan_validation] Incoming ctx →\n%s",
+                          pprint.pformat(lite_ctx, depth=2, compact=True))
+        except Exception as ex:
+            logging.warning("[plan_validation] ctx snapshot failed: %s", ex)
+
+        # ----------------------------------------------------------------
         plan: list[str] = getattr(ctx, "plan", [])
         if not plan:
             ctx.plan_validated = False
@@ -5702,12 +5870,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             ctx.plan_done = False
             return
 
-        # ── helper: LLM semantic guard for *each* call ─────────────────────
+        # ── helper: LLM semantic guard for *each* call ──────────────────
         def _llm_check(call: str) -> tuple[bool, str, str]:
             """
             Returns (ok: bool, reason: str, suggestion: str|NO_TOOL)
             """
-            # gather available tools + signatures
             tools_meta = [
                 f"{name}{inspect.signature(fn)}"
                 for name, fn in inspect.getmembers(Tools, inspect.isfunction)
@@ -5740,15 +5907,14 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 stream=False
             )
             content = resp["message"]["content"]
-            # drop any fences
             raw = re.sub(r"```(?:json)?|```", "", content, flags=re.I).strip()
             try:
                 o = json.loads(raw)
-                return bool(o.get("valid")), o.get("reason","").strip(), o.get("suggest","NO_TOOL").strip()
+                return bool(o.get("valid")), o.get("reason", "").strip(), o.get("suggest", "NO_TOOL").strip()
             except Exception as e:
                 return False, f"Invalid JSON from validator: {e}", "NO_TOOL"
 
-        # ── pass-1: syntax & availability ─────────────────────────────────
+        # ── pass-1 : syntax & availability ──────────────────────────────
         valid_calls = []
         tool_names = {
             name for name, _ in inspect.getmembers(Tools, inspect.isfunction)
@@ -5757,14 +5923,13 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ctx.needs_tool_work = False
 
         for raw in plan:
-            # strip fences & whitespace
             call = re.sub(r"^```tool_code\s*|\s*```$", "", raw, flags=re.I).strip()
             parsed = Tools.parse_tool_call(call)
             if not parsed:
                 logging.error(f"[plan_validation] Dropped invalid syntax: {raw!r}")
                 continue
 
-            name = parsed.split("(",1)[0]
+            name = parsed.split("(", 1)[0]
             if name not in tool_names:
                 ctx.needs_tool_work = True
                 logging.info(f"[plan_validation] Unknown tool `{name}` – will trigger tool_self_improvement.")
@@ -5777,7 +5942,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             ctx.plan_done = False
             return
 
-        # ── pass-2: semantic LLM check ────────────────────────────────────
+        # ── pass-2 : semantic LLM guard ────────────────────────────────
         final_plan = []
         for call in valid_calls:
             ok, reason, suggest = _llm_check(call)
@@ -5786,12 +5951,12 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 logging.info(f"[plan_validation] ✅ {call} – {reason}")
             else:
                 logging.warning(f"[plan_validation] ❌ {call} – {reason}")
-                # if LLM suggests a replacement, validate & use it
-                if suggest.upper() != "NO_TOOL" and Tools.parse_tool_call(suggest):
+                # ⤴️  ALWAYS add the suggested call (review_tool_plan will sanity-check)
+                if suggest.upper() != "NO_TOOL":
                     final_plan.append(suggest)
-                    logging.info(f"[plan_validation]   ↳ Replaced with {suggest}")
+                    logging.info(f"[plan_validation]   ↳ Added suggested call {suggest}")
 
-        # ── pass-3: commit results ────────────────────────────────────────
+        # ── pass-3 : commit results ────────────────────────────────────
         if final_plan:
             ctx.plan_validated = (len(final_plan) == len(valid_calls))
             ctx.plan = final_plan
@@ -5804,23 +5969,39 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             ctx.validation_note = "All candidate steps were rejected."
             ctx.plan = []
 
-        ctx.ctx_txt += f"\n[Plan validation] {ctx.validation_note}"
+        # 📝  Log the outcome + final plan directly into the narrative
+        ctx.ctx_txt += (
+            f"\n[Plan validation] {ctx.validation_note}"
+            f"\n[Final plan] {ctx.plan}\n"
+        )
+
         ctx.plan_idx = 0
         ctx.plan_done = False
 
         if not getattr(ctx, "skip_tts", True):
             self.tts_manager.enqueue(ctx.validation_note)
+
+
     # ------------------------------------------------------------------
-    #  Stage: execute_actions
+    #  Stage : execute_actions   (now pushes summaries downstream)
     # ------------------------------------------------------------------
     def _stage_execute_actions(self, ctx):
         """
         Execute the *validated* plan stored in `ctx.plan`, one step at a time.
-        Pulls calls from ctx.plan based on ctx.plan_idx, records results,
-        and stops on first error (unless best_effort is set).
-        """
 
-        # ── 0️⃣  Pre-flight checks ────────────────────────────────────────
+        NEW 2025-06-14
+        ──────────────
+        • After every tool call we append a compact summary to
+          `ctx.tool_summaries` via `_summarise_tool_result()` so the data
+          becomes part of the prompt that `assemble_prompt` feeds into the
+          final LLM inference.
+
+        Sets / updates:
+            ctx.action_results  – list[ (call, output) ]
+            ctx.plan_idx        – execution cursor
+            ctx.plan_done       – boolean, all steps completed
+        """
+        # ── 0️⃣  Preconditions ────────────────────────────────────────────
         if not getattr(ctx, "plan_validated", False):
             ctx.ctx_txt += "\n[Execute Actions] skipped – plan not validated."
             ctx.action_results = []
@@ -5832,7 +6013,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             ctx.action_results = []
             return
 
-        # initialize plan_idx if first time
+        # initialise cursor on first entry
         if not hasattr(ctx, "plan_idx"):
             ctx.plan_idx = 0
 
@@ -5848,15 +6029,21 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 out = f"Error: {e}\n{traceback.format_exc(limit=1)}"
 
             results.append((step, str(out)))
+
+            # 🔎 Summarise & expose the result immediately
+            fn_name = step.split("(", 1)[0]
+            summary = self._summarise_tool_result(fn_name, out)
+            ctx.tool_summaries.append(summary)
+
             ctx.plan_idx = i + 1
             ctx.plan_done = (ctx.plan_idx >= len(plan))
 
-            # fail-fast on first error
+            # fail-fast on first error unless best_effort
             if str(out).lower().startswith("error") and not best_effort:
                 ctx.ctx_txt += f"\n[Execute Actions] ❌ {step} → {out} — aborting."
                 break
 
-        # ── 2️⃣  Persist & annotate ───────────────────────────────────────
+        # ── 2️⃣  Persist log & narrative ─────────────────────────────────
         ctx.action_results = results
         pretty = "\n".join(f"{c} → {o}" for c, o in results)
         ctx.ctx_txt += f"\n[Executed Actions]\n{pretty}"
@@ -6769,10 +6956,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             payload["options"] = cfg["options"]
 
         # ─────────────────────── debug-context snapshot ──────────────────────
-        if cfg.get("debug_context") and ctx is not None:
+        if ctx is not None:
             stage = getattr(ctx, "_active_stage", "<unknown>")
-            ctx.frame.setdefault("debug", {})[stage] = [m.copy() for m in messages]
-
+            ctx.frame.setdefault("debug", {}).setdefault(stage, []).append(
+                [m.copy() for m in messages]
+            )
         return payload
 
     
@@ -7738,115 +7926,6 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 preview  = (content[:200] + " …") if len(content) > 200 else content
                 print(f"{role}: {preview}")
 
-    
-  
-    def _run_fractal_pipeline(self, ctx: Context) -> str:
-        """
-        Queue-driven executor.
-
-        * Starts with just “context_analysis”.
-        * After every stage we ask self._expand(…) what should come next.
-        That call will either return a forced stage (errors / tool-loop)
-        or pop the next item from ctx._stage_queue if the micro-plan
-        exists (see the new _expand).
-        * Guarantees that ‘final_inference’ eventually runs once.
-        """
-        import inspect
-        from collections import deque
-
-        run_id  = ctx.run_id
-        queue   = deque([self._Stage("context_analysis")])
-
-        ctx.tool_failures   = {}
-        ctx.tool_summaries  = getattr(ctx, "tool_summaries", [])
-
-        while queue:
-            stage_obj      = queue.popleft()
-            name           = stage_obj.name
-            ctx._active_stage = name
-
-            # skip runaway repeats
-            cnt = ctx.stage_counts.get(name, 0) + 1
-            ctx.stage_counts[name] = cnt
-            if cnt > 3:
-                continue
-
-            handler = getattr(self, f"_stage_{name}", None)
-            if not handler:
-                continue
-
-            # live progress ping (e.g. Telegram)
-            if ctx.stage_callback:
-                try:
-                    ctx.stage_callback(f"[Stage] {name} …")
-                except Exception:
-                    pass
-
-            # ── execute the stage ──────────────────────────────────────
-            self.observer.log_stage_start(run_id, name)
-            try:
-                sig    = inspect.signature(handler)
-                params = list(sig.parameters.keys())[1:]
-                args   = [ctx.stage_outputs.get(p) for p in params]
-                result = handler(ctx, *args) if args else handler(ctx)
-            except Exception as e:
-                # push self-repair to the front of the queue
-                ctx.last_failure = {"type": "exception",
-                                    "payload": str(e),
-                                    "stage":   name}
-                log_message(f"[{ctx.name}] '{name}' exception: {e}", "ERROR")
-                queue.appendleft(self._Stage("self_repair"))
-                self.observer.log_stage_end(run_id, name)
-                continue
-            finally:
-                self.observer.log_stage_end(run_id, name)
-
-            # capture text outputs
-            if isinstance(result, str) and result:
-                ctx.stage_outputs[name] = result
-                if ctx.stage_callback:
-                    try:
-                        ctx.stage_callback(result)
-                    except Exception:
-                        pass
-                if name == "final_inference":
-                    ctx.final_response = result
-
-            # special-case: execute_actions executes the plan immediately
-            if name == "execute_actions":
-                for call in getattr(ctx, "plan", []):
-                    try:
-                        res = Tools.run_tool_once(call)
-                        ctx.tool_summaries.append({"call": call, "result": res})
-                    except Exception as e:
-                        ctx.tool_failures[call] = str(e)
-                        log_message(f"[{ctx.name}] tool exec failed {call}: {e}",
-                                    "ERROR")
-                        break
-
-            # enqueue whatever _expand tells us
-            for nxt in self._expand(name, ctx):
-                queue.append(self._Stage(nxt))
-
-        # ------------------------------------------------------------------
-        # Safety net: if the queue emptied without a final answer, run it.
-        # ------------------------------------------------------------------
-        if not getattr(ctx, "final_response", None):
-            log_message(f"[{ctx.name}] No final_inference in pipeline; "
-                        f"forcing fallback.", "WARNING")
-            try:
-                self._stage_final_inference(ctx)
-            except Exception as e:
-                log_message(f"[{ctx.name}] fallback final_inference error: {e}",
-                            "ERROR")
-
-        # wrap-up bookkeeping
-        self._save_workspace_memory(ctx.workspace_memory)
-        self.observer.complete_run(run_id)
-        return ctx.final_response or ""
-
-
-
     # ------------------------------------------------------------------ #
     #  Linear pipeline engine                                            #
     # ------------------------------------------------------------------ #
@@ -7926,7 +8005,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
                 f"{lines}\n\n"
                 "Please provide a brief, high-level summary of what we discussed."
             )
-            summary = Tools.secondary_agent_tool(prompt, temperature=0.5).strip()
+            summary = Tools.auxiliary_inference(prompt, temperature=0.5).strip()
             # short-circuit: set final_response too
             ctx.final_response = summary
             return summary
@@ -7990,111 +8069,84 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         _ = Utils.embed_text(um)
         return None
     
-    # -------------------------------------------------------------- #
-    # Stage: context_analysis                                        #
-    # -------------------------------------------------------------- #
+    # ------------------------------------------------------------------
+    #  Stage: context_analysis – verbose intent + tool-recommendation
+    # ------------------------------------------------------------------
     def _stage_context_analysis(self, ctx: Context,
                                 prev_output: str | None = None) -> str:
         """
-        Two-sentence meta summary of the user turn.
-
-        1. If the user asks a time-frame history question (yesterday / last week …)
-        we answer from local logs and skip the LLM.
-        2. We pull semantic-similar history *only when it helps* (longer turns,
-        not greetings).
-        3. We guarantee **no answer leaks**: one retry, then a safe placeholder.
+        1. Debug-print the last 20 lines of ctx.ctx_txt.
+        2. Build a compact AVAILABLE_TOOLS list (name + signature).
+        3. Send the last 5 turns + new user message.
+        4. Ask for exactly two sentences summarising intent/entities
+           AND a JSON list of recommended tools.
+        5. Record and return the LLM’s raw response.
         """
 
-        import re, textwrap, time
+        # ── 1️⃣ debug-print last-20 lines of ctx.ctx_txt ────────────────
+        snippet = "\n".join(ctx.ctx_txt.strip().splitlines()[-20:])
+        logging.debug(f"[context_analysis] context-snippet:\n{snippet}")
 
-        # ── local anti-leak helper (kept INSIDE the stage) ──────────────────
-        def _leaks_answer(txt: str) -> bool:
-            patterns = [
-                r"http[s]?://",                 # links
-                r"\b(?:°f|°c|wind|rain)\b",     # weather units
-                r"\d{4}-\d{2}-\d{2}",           # ISO date
-            ]
-            return any(re.search(p, txt, re.I) for p in patterns)
+        # ── 2️⃣ gather available tools ──────────────────────────────────
+        try:
+            Tools.load_external_tools()
+        except Exception as e:
+            logging.warning(f"[context_analysis] tool reload failed: {e}")
+        tool_entries = []
+        for name, fn in inspect.getmembers(Tools, inspect.isfunction):
+            if name.startswith("_"):
+                continue
+            try:
+                sig = inspect.signature(fn)
+                tool_entries.append(f"{name}{sig}")
+            except (ValueError, TypeError):
+                tool_entries.append(f"{name}(…)")
+        # limit to first 40
+        tool_block = "AVAILABLE_TOOLS:\n" + "\n".join(tool_entries[:40])
 
-        # ── tunables ────────────────────────────────────────────────────────
-        MIN_SIM, MAX_HITS, SHORT_TURN_LEN = 0.30, 3, 4
-
-        # ── 1. direct time-frame query? ─────────────────────────────────────
-        digest = self._history_timeframe_query(ctx.user_message)
-        if digest:
-            ctx.stage_outputs["history_digest"] = digest  # stash for downstream
-
-        # ── 2. decide on semantic recall ────────────────────────────────────
-        msg_tokens   = ctx.user_message.strip().split()
-        want_sem_rec = (
-            digest is None and
-            len(msg_tokens) >= SHORT_TURN_LEN and
-            not re.match(r"^(hi|hey|hello|thanks|ok)[\s!,.]*$", ctx.user_message, re.I)
-        )
-
-        recent   = ctx.history_manager.history[-5:]
-        semantic = []
-        if want_sem_rec and ctx.history_manager.history:
-            q_vec = Utils.embed_text(ctx.user_message)
-            for rec in ctx.history_manager.search(ctx.user_message,
-                                                top_n=MAX_HITS + len(recent)):
-                if rec in recent:
-                    continue
-                if Utils.cosine_similarity(q_vec, rec["vec"]) >= MIN_SIM:
-                    semantic.append(rec)
-                if len(semantic) >= MAX_HITS:
-                    break
-
-        history   = recent + semantic
-        hist_msgs = [{"role": r["role"], "content": r["content"]} for r in history]
-
-        # ── 3. assemble LLM prompt ──────────────────────────────────────────
-        SYS_PROMPT = textwrap.dedent("""
+        # ── 3️⃣ assemble the LLM messages ───────────────────────────────
+        system_prompt = textwrap.dedent("""
             You are the CONTEXT-ANALYSIS AGENT.
-
-            • Produce **exactly two sentences** summarising:
-                – the user’s intent
-                – key entities or constraints
-            • DO NOT answer the user, cite facts, add links, JSON, or code fences.
-            • If you start to answer, instead output:
-            "NOTE: attempted answer suppressed."
+            Given the user's request and the available tools, produce:
+              1. Exactly TWO sentences summarising the user’s intent
+                 and any key entities or constraints.
+              2. A JSON array of the names of your top 3 recommended tools
+                 to fulfill this request (no arguments, just names).
+            Do NOT return any other text or formatting.
         """).strip()
 
-        override = [{"role": "system", "content": SYS_PROMPT}]
-        if digest:
-            override.append({"role": "system",
-                            "content": f"History Digest (requested):\n{digest}"})
-        override.extend(hist_msgs)
-        override.append({"role": "user", "content": ctx.user_message})
+        msgs = [
+            {"role": "system",    "content": system_prompt},
+            {"role": "system",    "content": tool_block},
+        ]
+        # last 5 conversation turns
+        for entry in ctx.history_manager.history[-5:]:
+            msgs.append({"role": entry["role"], "content": entry["content"]})
+        # finally the new user message
+        msgs.append({"role": "user", "content": ctx.user_message})
 
-        payload = self.build_payload(override_messages=override,
-                                    model_key="secondary_model")
+        payload = self.build_payload(
+            override_messages=msgs,
+            model_key="secondary_model"
+        )
         payload["stream"] = False
 
-        def _ask() -> str:
-            return chat(model=payload["model"],
-                        messages=payload["messages"],
-                        stream=False)["message"]["content"].strip()
+        # ── 4️⃣ call the LLM ────────────────────────────────────────────
+        try:
+            resp = chat(
+                model=payload["model"],
+                messages=payload["messages"],
+                stream=False
+            )
+            raw = resp.get("message", {}).get("content", "").strip()
+        except Exception as e:
+            logging.error(f"[context_analysis] LLM error: {e}")
+            raw = "NOTE: context analysis unavailable."
 
-        # ── 4. call LLM + single anti-leak retry ────────────────────────────
-        raw = _ask()
-        if _leaks_answer(raw):
-            log_message("[context_analysis] answer leak – retry once", "WARNING")
-            payload["messages"][0]["content"] += (
-                "\n\n!!! WARNING: Answering is forbidden. Provide only the "
-                "two-sentence meta-analysis.")
-            time.sleep(0.15)
-            raw = _ask()
-            if _leaks_answer(raw):
-                log_message("[context_analysis] second leak – blanking", "ERROR")
-                raw = ("NOTE: context analysis unavailable due to policy "
-                    "violation.")
-
-        # ── 5. persist & return ─────────────────────────────────────────────
-        analysis = Utils.parse_context_analysis(raw)
-        ctx.stage_outputs["context_analysis"] = analysis
+        # ── 5️⃣ record & return ─────────────────────────────────────────
+        ctx.stage_outputs["context_analysis"] = raw
         ctx.ctx_txt += raw + "\n"
-        return analysis
+        return raw
 
 
     # ------------------------------------------------------------------ #
@@ -8339,6 +8391,15 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ctx_text = ctx.ctx_txt or ""
         initial_tokens = len(ctx_text.split())
         log_message(f"[Tool chaining] initial context size: {initial_tokens} tokens", "DEBUG")
+
+        # NEW ▶ snapshot & log the last 60 lines of context so we can see exactly
+        #       what the tool-decision model is reading.
+        context_window = "\n".join(ctx_text.strip().splitlines()[-60:])
+        log_message("[Tool chaining] CONTEXT WINDOW ▼▼▼\n" + context_window + "\n▲▲▲", "DEBUG")
+        ctx.frame.setdefault("debug", {}).setdefault("tool_chaining_ctx", []).append(
+            {"iter": 0, "window": context_window}
+        )
+
         ctx.stage_outputs["tool_chaining_ctx_tokens"] = initial_tokens
 
         run_id = ctx.get("run_id")
@@ -8364,6 +8425,27 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         for i in range(5):
             # Report token count at each iteration
             iter_tokens = len(tc.split())
+            # 🔍 VERBOSE – keep a live window of what the model is reading
+            context_window = "\n".join(tc.strip().splitlines()[-60:])
+            log_message(
+                f"[Tool chaining]  ctx window after iter {i+1} ▼▼▼\n"
+                + context_window + "\n▲▲▲",
+                "DEBUG"
+            )
+            ctx.frame.setdefault("debug", {}).setdefault("tool_chaining_ctx", []).append(
+                {"iter": i + 1, "tokens": iter_tokens, "window": context_window}
+            )
+
+            # 🔍  Snapshot the context after each iteration for verbose inspection
+            context_window = "\n".join(tc.strip().splitlines()[-60:])
+            log_message(
+                f"[Tool chaining] after iter {i+1} context window ▼▼▼\n"
+                + context_window + "\n▲▲▲",
+                "DEBUG"
+            )
+            ctx.frame["debug"]["tool_chaining_ctx"].append(
+                {"iter": i + 1, "window": context_window}
+            )
             log_message(f"[Tool chaining] iteration {i+1}, context size: {iter_tokens} tokens", "DEBUG")
             ctx.stage_outputs.setdefault("tool_chaining_iter_tokens", []).append(iter_tokens)
 
@@ -8437,30 +8519,29 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
     # ------------------------------
     # Stage 9: assemble_prompt
     # ------------------------------
-    def _stage_assemble_prompt(self, ctx):
-        import json
+    def _stage_assemble_prompt(self, ctx: Context) -> str:
+        """
+        Concatenate user message, running context text, and **all** helper
+        summaries into a single prompt stored in `ctx.assembled`.
+        """
 
-        # 1) Context narrative block
-        assembled = f"```context_analysis\n{ctx['ctx_txt'].strip()}\n```"
+        # 1️⃣  Flatten helper returns into readable text
+        summaries_txt = ""
+        if ctx.tool_summaries:
+            pretty = textwrap.indent(
+                json.dumps(ctx.tool_summaries, indent=2, ensure_ascii=False),
+                prefix="    "
+            )
+            summaries_txt = f"\n\n[TOOL OUTPUTS]\n{pretty}"
 
-        # 2) Tool output block  (coerce every item to str)
-        if ctx["tool_summaries"]:
-            to_str = [
-                s if isinstance(s, str) else json.dumps(s, indent=2)
-                for s in ctx["tool_summaries"]
-            ]
-            assembled += "\n```tool_output\n" + "\n\n".join(to_str) + "\n```"
+        # 2️⃣  Write the assembled prompt
+        ctx.assembled = f"{ctx.ctx_txt}{summaries_txt}".strip()
 
-        # 3) Current user message
-        assembled += "\n" + ctx["user_message"]
+        # 3️⃣  DEBUG – show size so we know we’re passing it downstream
+        logging.debug("[assemble_prompt] assembled_tokens=%d",
+                    len(self._tokenizer.encode(ctx.assembled)))
 
-        # 4) Book-keep & embed
-        self.history_manager.add_entry("user", assembled)
-        _ = Utils.embed_text(assembled)
-
-        log_message("Final prompt prepared", "DEBUG")
-        ctx["assembled"] = assembled
-        return None
+        return ctx.assembled  # some callers use the return value
     
     # ------------------------------
     # Stage: output_review

@@ -4,6 +4,7 @@ external_tools
 tts_output
 workspace
 history
+stable_tool_calling.py
 chat_sessions
 .setup_complete
 glados_piper_medium.onnx
