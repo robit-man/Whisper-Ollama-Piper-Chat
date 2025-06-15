@@ -5702,14 +5702,14 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         # ── 6) Register and expose source for diagnostics ───────────────
         ctx.next_tool_call = selected_call   # may be None
 
-        if selected_call:
-            fn_name = selected_call.split("(", 1)[0]
-            try:
-                src = Tools.get_tool_source(fn_name)
-                ctx.ctx_txt += f"\n[TOOL SOURCE – {fn_name}]\n```python\n{src}\n```"
-                ctx.stage_outputs[f"tool_source_{fn_name}"] = src
-            except Exception as e:
-                log_message(f"[stream_tool] unable to fetch source for {fn_name}: {e}", "WARNING")
+        #if selected_call:
+        #    fn_name = selected_call.split("(", 1)[0]
+        #    try:
+        #        src = Tools.get_tool_source(fn_name)
+        #        ctx.ctx_txt += f"\n[TOOL SOURCE – {fn_name}]\n```python\n{src}\n```"
+        #        ctx.stage_outputs[f"tool_source_{fn_name}"] = src
+        #    except Exception as e:
+        #        log_message(f"[stream_tool] unable to fetch source for {fn_name}: {e}", "WARNING")
 
         self.observer.log_stage_end(ctx.run_id, "tool_decision")
         yield "", True
@@ -5718,77 +5718,61 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         """
         Build a list of tool calls that will achieve the user request.
 
-        – Shows every helper’s signature + doc.  
-        – Instructs the model to pick *only* the tools strictly needed.  
+        – Shows every helper’s signature + doc.
+        – Instructs the model to pick *only* the tools strictly needed.
         – Returns a JSON array of calls, one per item, stored on ctx.plan.
         """
-        Tools.load_external_tools()        # ← guarantees an up-to-date registry
+        import inspect, json, ast, re, textwrap
+
+        # ← guarantee an up-to-date registry
+        Tools.load_external_tools()
 
         # 1️⃣ Gather metadata for every public tool
         tool_infos = []
         for name, fn in inspect.getmembers(Tools, predicate=callable):
             if name.startswith("_"):
                 continue
-            # signature
             try:
                 sig = inspect.signature(fn)
             except (ValueError, TypeError):
                 sig = "(…)"
-            # one-line doc (guard against empty)
+            # guard against missing docstring
             doc_lines = (fn.__doc__ or "").strip().splitlines()
             doc = doc_lines[0] if doc_lines else ""
             tool_infos.append({
                 "name": name,
                 "signature": str(sig),
-                "doc": textwrap.shorten(doc, width=100)
+                "doc": textwrap.shorten(doc, width=80)
             })
-
-        # 2️⃣ Serialize metadata
         metadata = json.dumps(tool_infos, indent=2)
 
-        # 3️⃣ Build unbiased prompt
-        prompt = f"""
-    You are a Task-Decomposer. Given the user’s request, select *only* the
-    tools from the list below that are strictly necessary to fulfill it.
-    Do NOT invent new helpers, do NOT bias toward any particular tool,
-    and do NOT include any example calls.
-    Please take into account the following:
-    1.  The user’s request
-    2.  The available tools and their signatures
-    3.  The tools’ one-line descriptions
-    4.  The tools’ docstrings (if any)
-    5.  If you notice words or phrases that correspond to a given tool
+        # 2️⃣ Ultra-strict system prompt
+        system = textwrap.dedent(f"""
+            You are a Task-Decomposer.  The user’s request is:
+            {ctx.user_message!r}
 
-    Available helpers (name, signature, one-line description):
-    {metadata}
+            **You must choose exactly the minimal helper(s) needed and NOTHING else.**
 
-    User request:
-    \"\"\"{ctx.user_message}\"\"\"
+            If they ask for their current location, use only:
+              get_current_location()
 
-    Return exactly a JSON array of calls—one string per item—e.g.:
+            Available helpers (name, signature, one-line doc):
+            {metadata}
 
-    [
-        "tool_one(arg1, arg2)",
-        "another_tool()"
-    ]
+            **Output** exactly a JSON array of strings, e.g.
+              ["get_current_location()"]
+            and nothing else.
+        """).strip()
 
-    Nothing else.
-    """.strip()
-
-        # 4️⃣ Invoke secondary LLM
+        # 3️⃣ Invoke the secondary LLM
         resp = chat(
             model=self.config_manager.config["secondary_model"],
-            messages=[{"role": "system", "content": prompt}],
+            messages=[{"role": "system", "content": system}],
             stream=False
         )["message"]["content"]
 
-        # 5️⃣ Clean fences and annotations
-        raw = re.sub(r"```(?:json|tool_code)?", "", resp, flags=re.I).strip("` \n")
-        raw = re.sub(r"\s*#.*", "", raw)
-        raw = re.sub(r":\s*\w+\s*(?==)", "", raw)
-        raw = re.sub(r":\s*\w+\s*\)", ")", raw)
-
-        # 6️⃣ Parse to list
+        # 4️⃣ Clean up and parse
+        raw = re.sub(r"```(?:json|tool_code)?", "", resp, flags=re.I).strip("`\n ")
         try:
             plan = json.loads(raw)
         except Exception:
@@ -5799,25 +5783,22 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         if not isinstance(plan, list):
             plan = []
 
-        # 7️⃣ Validate & normalize calls
+        # 5️⃣ Validate & normalize
         valid_names = {info["name"] for info in tool_infos}
-        call_re = re.compile(r'^[A-Za-z_]\w*\s*\(')
+        call_re = re.compile(r'^[A-Za-z_]\w*\s*\([^)]*\)$')
         cleaned = []
         for item in plan:
             if not isinstance(item, str):
                 continue
-            call = item.strip().rstrip(",")
+            call = item.strip()
             # bare name → no-arg call
             if call in valid_names:
                 call = f"{call}()"
-            fn = call.split("(", 1)[0]
-            if fn not in valid_names:
-                continue
-            if not call_re.match(call):
-                continue
-            cleaned.append(call)
+            name = call.split("(", 1)[0]
+            if name in valid_names and call_re.match(call):
+                cleaned.append(call)
 
-        # 8️⃣ Store result or error
+        # 6️⃣ Store or fail
         if not cleaned:
             ctx.ctx_txt += "\n[Task-Decomposition FAILED] no valid tool calls"
             log_message("Task decomposition failed – no valid tool calls", "ERROR")
@@ -5827,159 +5808,78 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
         ctx.ctx_txt += f"\n[Task-Decomposition] {cleaned}"
         log_message(f"Task plan accepted: {cleaned}", "INFO")
         return cleaned
+
     # ---------------------------------------------------------------
-    # Stage : plan_validation   (cursor initialisation added)
+    # Stage : plan_validation
     # ---------------------------------------------------------------
     def _stage_plan_validation(self, ctx):
         """
-        Validate -- and, if needed, *refine* -- ctx.plan (list[str] tool calls).
+        Validate — and, if needed, prune — ctx.plan (list[str] tool calls).
 
-        Sets / updates on ctx:
-            • plan_validated : bool
-            • needs_tool_work : bool
-            • validation_note : str
-            • plan_idx  (cursor → execution progress)
-            • plan_done (boolean → all steps completed successfully)
+        After this stage:
+          • ctx.plan_validated : bool
+          • ctx.validation_note : str
+          • ctx.plan          : filtered list
         """
-        import re, inspect, textwrap, json, logging, pprint
+        import inspect, json, re, textwrap, logging
 
-        # 🔃 Hot-reload helpers so the validator “sees” the latest catalogue
+        # ← reload so we see any new tools
         Tools.load_external_tools()
 
-        # ════════════════════════════════════════════════════════════════
-        # 0️⃣  DEBUG  ▸  dump the incoming ctx (minus huge / unserialisable parts)
-        # ════════════════════════════════════════════════════════════════
-        try:
-            lite_ctx = {
-                k: v for k, v in ctx.__dict__.items()
-                if k not in ("history_manager", "tts_manager",
-                             "workspace_memory", "frame")
-            }
-            logging.debug("[plan_validation] Incoming ctx →\n%s",
-                          pprint.pformat(lite_ctx, depth=2, compact=True))
-        except Exception as ex:
-            logging.warning("[plan_validation] ctx snapshot failed: %s", ex)
-
-        # ----------------------------------------------------------------
-        plan: list[str] = getattr(ctx, "plan", [])
+        plan = getattr(ctx, "plan", []) or []
         if not plan:
             ctx.plan_validated = False
             ctx.validation_note = "No plan generated."
-            logging.warning("[plan_validation] Empty plan – nothing to validate.")
             ctx.plan_idx = 0
             ctx.plan_done = False
             return
 
-        # ── helper: LLM semantic guard for *each* call ──────────────────
-        def _llm_check(call: str) -> tuple[bool, str, str]:
-            """
-            Returns (ok: bool, reason: str, suggestion: str|NO_TOOL)
-            """
-            tools_meta = [
-                f"{name}{inspect.signature(fn)}"
-                for name, fn in inspect.getmembers(Tools, inspect.isfunction)
-                if not name.startswith("_")
-            ]
-            prompt = textwrap.dedent(f"""
-                USER REQUEST:
-                «{ctx.user_message}»
+        # 1️⃣ Build a minimal validator prompt
+        system = textwrap.dedent(f"""
+            You are a strict Tool-Call Validator.
+            The user’s request: {ctx.user_message!r}
 
-                FULL PLAN:
-                {json.dumps(plan, indent=2)}
+            Candidate plan: {plan!r}
 
-                CANDIDATE CALL:
-                ```tool_code
-                {call}
-                ```
+            Return exactly a JSON object with:
+              "valid_calls": [ ... ]
+            where valid_calls contains only the calls that truly satisfy the request.
+            Do NOT suggest new calls, only filter out any that do not match.
+        """).strip()
 
-                AVAILABLE TOOLS:
-                {"; ".join(tools_meta)}
+        resp = chat(
+            model=self.config_manager.config["secondary_model"],
+            messages=[{"role": "system", "content": system}],
+            stream=False
+        )["message"]["content"]
 
-                Reply in ONE line of valid JSON:
-                {{ "valid": true|false,
-                   "reason": "...",
-                   "suggest": "<alternative_call>|NO_TOOL" }}
-            """).strip()
+        raw = re.sub(r"```(?:json)?", "", resp, flags=re.I).strip("`\n ")
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
 
-            resp = chat(
-                model=self.config_manager.config["secondary_model"],
-                messages=[{"role": "user", "content": prompt}],
-                stream=False
-            )
-            content = resp["message"]["content"]
-            raw = re.sub(r"```(?:json)?|```", "", content, flags=re.I).strip()
-            try:
-                o = json.loads(raw)
-                return bool(o.get("valid")), o.get("reason", "").strip(), o.get("suggest", "NO_TOOL").strip()
-            except Exception as e:
-                return False, f"Invalid JSON from validator: {e}", "NO_TOOL"
+        valid_calls = data.get("valid_calls", [])
+        if not isinstance(valid_calls, list):
+            valid_calls = []
 
-        # ── pass-1 : syntax & availability ──────────────────────────────
-        valid_calls = []
-        tool_names = {
-            name for name, _ in inspect.getmembers(Tools, inspect.isfunction)
-            if not name.startswith("_")
-        }
-        ctx.needs_tool_work = False
-
-        for raw in plan:
-            call = re.sub(r"^```tool_code\s*|\s*```$", "", raw, flags=re.I).strip()
-            parsed = Tools.parse_tool_call(call)
-            if not parsed:
-                logging.error(f"[plan_validation] Dropped invalid syntax: {raw!r}")
-                continue
-
-            name = parsed.split("(", 1)[0]
-            if name not in tool_names:
-                ctx.needs_tool_work = True
-                logging.info(f"[plan_validation] Unknown tool `{name}` – will trigger tool_self_improvement.")
-            valid_calls.append(parsed)
-
-        if not valid_calls:
-            ctx.plan_validated = False
-            ctx.validation_note = "All candidate steps failed basic syntax."
-            ctx.plan_idx = 0
-            ctx.plan_done = False
-            return
-
-        # ── pass-2 : semantic LLM guard ────────────────────────────────
-        final_plan = []
-        for call in valid_calls:
-            ok, reason, suggest = _llm_check(call)
-            if ok:
-                final_plan.append(call)
-                logging.info(f"[plan_validation] ✅ {call} – {reason}")
-            else:
-                logging.warning(f"[plan_validation] ❌ {call} – {reason}")
-                # ⤴️  ALWAYS add the suggested call (review_tool_plan will sanity-check)
-                if suggest.upper() != "NO_TOOL":
-                    final_plan.append(suggest)
-                    logging.info(f"[plan_validation]   ↳ Added suggested call {suggest}")
-
-        # ── pass-3 : commit results ────────────────────────────────────
-        if final_plan:
-            ctx.plan_validated = (len(final_plan) == len(valid_calls))
-            ctx.plan = final_plan
-            ctx.validation_note = (
-                "Plan approved." if ctx.plan_validated
-                else "Plan partially revised during validation."
-            )
+        # 2️⃣ Commit
+        ctx.plan_validated = bool(valid_calls)
+        ctx.plan = valid_calls
+        if ctx.plan_validated:
+            ctx.validation_note = f"Plan validated: {len(valid_calls)}/{len(plan)} calls kept."
         else:
-            ctx.plan_validated = False
-            ctx.validation_note = "All candidate steps were rejected."
-            ctx.plan = []
-
-        # 📝  Log the outcome + final plan directly into the narrative
-        ctx.ctx_txt += (
-            f"\n[Plan validation] {ctx.validation_note}"
-            f"\n[Final plan] {ctx.plan}\n"
-        )
-
+            ctx.validation_note = "All candidate calls were rejected."
         ctx.plan_idx = 0
         ctx.plan_done = False
 
+        ctx.ctx_txt += (
+            f"\n[Plan validation] {ctx.validation_note}"
+            f"\n[Final plan] {ctx.plan}"
+        )
         if not getattr(ctx, "skip_tts", True):
             self.tts_manager.enqueue(ctx.validation_note)
+
 
 
     # ------------------------------------------------------------------
@@ -7880,6 +7780,7 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
             self.dump_debug_context(ctx)
 
         # (TTS for the final response happens inside _stage_final_inference)
+        ctx.ctx_txt = f"User: {ctx.user_message}\nAssistant: {ctx.final_response}\n"
         return resp
 
     def _record_stage_debug(self,
@@ -8479,11 +8380,11 @@ Do NOT include any extra commentary or markdown—just the bare JSON list.
 
             # ── 2.  Invoke the tool ─────────────────────────────────────────
             log_message(f"Invoking via tool_chaining: {code}", "INFO")
-            try:
-                out = self.run_tool(code)
-            except Exception as e:
-                log_message(f"run_tool error on {code}: {e}", "ERROR")
-                break               # exit chaining on hard failure
+            #try:
+            #    out = self.run_tool(code)
+            #except Exception as e:
+            #    log_message(f"run_tool error on {code}: {e}", "ERROR")
+            #    break               # exit chaining on hard failure
 
             # ── 3.  Summarise the output for downstream context ────────────
             summary = None
